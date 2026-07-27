@@ -22,6 +22,10 @@ cpp/maincuda
 cpp/mainopencl
 cpp/katago
 cpp/configs
+!cpp/configs/
+cpp/configs/*
+!cpp/configs/risk_score/
+!cpp/configs/risk_score/**
 cpp/evalsgf
 cpp/run*.sh
 cpp/tests/scratch
@@ -33,6 +37,7 @@ cpp/tests/results/matchsgfs2/games.sgfs
 cpp/data/
 versions/
 cpp/build
+cpp/build-*/
 cpp/out
 
 export_model_cuda.sh

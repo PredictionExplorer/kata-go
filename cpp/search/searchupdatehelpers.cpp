@@ -118,8 +118,10 @@ double Search::computeWeightFromNNOutput(const NNOutput* nnOutput) const {
     return 1.0;
 
   double scoreMean = (double)nnOutput->whiteScoreMean;
-  double utilityUncertaintyWL = searchParams.winLossUtilityFactor * nnOutput->shorttermWinlossError;
-  double utilityUncertaintyScore = getApproxScoreUtilityDerivative(scoreMean) * nnOutput->shorttermScoreError;
+  double utilityUncertaintyWL = getEffectiveWinLossUtilityFactor() * nnOutput->shorttermWinlossError;
+  double utilityUncertaintyScore =
+    getApproxScoreUtilityDerivative(scoreMean,(double)nnOutput->whiteScoreMeanSq) *
+    nnOutput->shorttermScoreError;
   double utilityUncertainty = utilityUncertaintyWL + utilityUncertaintyScore;
 
   double poweredUncertainty;

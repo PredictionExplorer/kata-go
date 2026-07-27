@@ -254,17 +254,65 @@ std::shared_ptr<NNOutput>* Search::maybeAddPolicyNoiseAndTemp(SearchThread& thre
 
 
 
+double Search::getEffectiveWinLossUtilityFactor() const {
+  return searchParams.useScoreMaximizingUtility ? searchParams.winWeight : searchParams.winLossUtilityFactor;
+}
+
+void Search::updateUtilityBounds() {
+  if(!searchParams.useScoreMaximizingUtility) {
+    double utilityRangeRadius =
+      searchParams.winLossUtilityFactor +
+      searchParams.staticScoreUtilityFactor +
+      searchParams.dynamicScoreUtilityFactor;
+    minUtilityForCurrentSearch = -utilityRangeRadius;
+    maxUtilityForCurrentSearch = utilityRangeRadius;
+    return;
+  }
+
+  double lowerScoreBound;
+  double upperScoreBound;
+  ScoreValue::getScoreMaximizingUtilityLegalBounds(rootBoard,rootHistory,lowerScoreBound,upperScoreBound);
+  double minScoreUtility = ScoreValue::scoreMaximizingUtility(
+    lowerScoreBound,searchParams.scorePower,searchParams.scoreScale
+  );
+  double maxScoreUtility = ScoreValue::scoreMaximizingUtility(
+    upperScoreBound,searchParams.scorePower,searchParams.scoreScale
+  );
+  double minResultUtility = std::min(
+    -searchParams.winWeight,
+    std::min(searchParams.winWeight,searchParams.noResultUtilityForWhite)
+  );
+  double maxResultUtility = std::max(
+    -searchParams.winWeight,
+    std::max(searchParams.winWeight,searchParams.noResultUtilityForWhite)
+  );
+  minUtilityForCurrentSearch = minResultUtility + minScoreUtility;
+  maxUtilityForCurrentSearch = maxResultUtility + maxScoreUtility;
+}
+
+void Search::getUtilityBounds(double& minUtility, double& maxUtility) const {
+  minUtility = minUtilityForCurrentSearch;
+  maxUtility = maxUtilityForCurrentSearch;
+}
+
+double Search::getUtilityRangeRadius() const {
+  double minUtility;
+  double maxUtility;
+  getUtilityBounds(minUtility,maxUtility);
+  return 0.5 * (maxUtility-minUtility);
+}
+
 double Search::getResultUtility(double winLossValue, double noResultValue) const {
   return (
-    winLossValue * searchParams.winLossUtilityFactor +
+    winLossValue * getEffectiveWinLossUtilityFactor() +
     noResultValue * searchParams.noResultUtilityForWhite
   );
 }
 
 double Search::getResultUtilityFromNN(const NNOutput& nnOutput) const {
-  return (
-    (nnOutput.whiteWinProb - nnOutput.whiteLossProb) * searchParams.winLossUtilityFactor +
-    nnOutput.whiteNoResultProb * searchParams.noResultUtilityForWhite
+  return getResultUtility(
+    nnOutput.whiteWinProb - nnOutput.whiteLossProb,
+    nnOutput.whiteNoResultProb
   );
 }
 
@@ -272,6 +320,19 @@ double Search::getScoreUtility(double scoreMeanAvg, double scoreMeanSqAvg) const
   double scoreMean = scoreMeanAvg;
   double scoreMeanSq = scoreMeanSqAvg;
   double scoreStdev = ScoreValue::getScoreStdev(scoreMean, scoreMeanSq);
+  if(searchParams.useScoreMaximizingUtility) {
+    double lowerScoreBound;
+    double upperScoreBound;
+    ScoreValue::getScoreMaximizingUtilityLegalBounds(rootBoard,rootHistory,lowerScoreBound,upperScoreBound);
+    return ScoreValue::expectedScoreMaximizingUtility(
+      scoreMean,
+      scoreStdev,
+      searchParams.scorePower,
+      searchParams.scoreScale,
+      lowerScoreBound,
+      upperScoreBound
+    );
+  }
   double sqrtBoardArea = rootBoard.sqrtBoardArea();
   double staticScoreValue = ScoreValue::expectedWhiteScoreValue(scoreMean,scoreStdev,0.0,2.0, sqrtBoardArea);
   double dynamicScoreValue = ScoreValue::expectedWhiteScoreValue(scoreMean,scoreStdev,recentScoreCenter,searchParams.dynamicScoreCenterScale, sqrtBoardArea);
@@ -282,6 +343,28 @@ double Search::getScoreUtilityDiff(double scoreMeanAvg, double scoreMeanSqAvg, d
   double scoreMean = scoreMeanAvg;
   double scoreMeanSq = scoreMeanSqAvg;
   double scoreStdev = ScoreValue::getScoreStdev(scoreMean, scoreMeanSq);
+  if(searchParams.useScoreMaximizingUtility) {
+    double lowerScoreBound;
+    double upperScoreBound;
+    ScoreValue::getScoreMaximizingUtilityLegalBounds(rootBoard,rootHistory,lowerScoreBound,upperScoreBound);
+    double utilityBefore = ScoreValue::expectedScoreMaximizingUtility(
+      scoreMean,
+      scoreStdev,
+      searchParams.scorePower,
+      searchParams.scoreScale,
+      lowerScoreBound,
+      upperScoreBound
+    );
+    double utilityAfter = ScoreValue::expectedScoreMaximizingUtility(
+      scoreMean + delta,
+      scoreStdev,
+      searchParams.scorePower,
+      searchParams.scoreScale,
+      lowerScoreBound,
+      upperScoreBound
+    );
+    return utilityAfter-utilityBefore;
+  }
   double sqrtBoardArea = rootBoard.sqrtBoardArea();
   double staticScoreValueDiff =
     ScoreValue::expectedWhiteScoreValue(scoreMean + delta,scoreStdev,0.0,2.0, sqrtBoardArea)
@@ -292,8 +375,32 @@ double Search::getScoreUtilityDiff(double scoreMeanAvg, double scoreMeanSqAvg, d
   return staticScoreValueDiff * searchParams.staticScoreUtilityFactor + dynamicScoreValueDiff * searchParams.dynamicScoreUtilityFactor;
 }
 
-//Ignores scoreMeanSq's effect on the utility, since that's complicated
-double Search::getApproxScoreUtilityDerivative(double scoreMean) const {
+double Search::getApproxScoreUtilityDerivative(double scoreMean, double scoreMeanSq) const {
+  if(searchParams.useScoreMaximizingUtility) {
+    double lowerScoreBound;
+    double upperScoreBound;
+    ScoreValue::getScoreMaximizingUtilityLegalBounds(rootBoard,rootHistory,lowerScoreBound,upperScoreBound);
+    double scoreStdev = ScoreValue::getScoreStdev(scoreMean,scoreMeanSq);
+    double epsilon = std::max(0.25,searchParams.scoreScale / 64.0);
+    double utilityLower = ScoreValue::expectedScoreMaximizingUtility(
+      scoreMean-epsilon,
+      scoreStdev,
+      searchParams.scorePower,
+      searchParams.scoreScale,
+      lowerScoreBound,
+      upperScoreBound
+    );
+    double utilityUpper = ScoreValue::expectedScoreMaximizingUtility(
+      scoreMean+epsilon,
+      scoreStdev,
+      searchParams.scorePower,
+      searchParams.scoreScale,
+      lowerScoreBound,
+      upperScoreBound
+    );
+    return (utilityUpper-utilityLower) / (2.0*epsilon);
+  }
+  //The standard score utility historically ignores scoreMeanSq here.
   double sqrtBoardArea = rootBoard.sqrtBoardArea();
   double staticScoreValueDerivative = ScoreValue::whiteDScoreValueDScoreSmoothNoDrawAdjust(scoreMean,0.0,2.0, sqrtBoardArea);
   double dynamicScoreValueDerivative = ScoreValue::whiteDScoreValueDScoreSmoothNoDrawAdjust(scoreMean,recentScoreCenter,searchParams.dynamicScoreCenterScale, sqrtBoardArea);
@@ -546,7 +653,7 @@ double Search::interpolateEarly(double halflife, double earlyValue, double value
 
 void Search::getSelfUtilityLCBAndRadiusZeroVisits(double& lcbBuf, double& radiusBuf) const {
   // Max radius of the entire utility range
-  double utilityRangeRadius = searchParams.winLossUtilityFactor + searchParams.staticScoreUtilityFactor + searchParams.dynamicScoreUtilityFactor;
+  double utilityRangeRadius = getUtilityRangeRadius();
   radiusBuf = 2.0 * utilityRangeRadius * searchParams.lcbStdevs;
   lcbBuf = -radiusBuf;
   return;
@@ -562,7 +669,7 @@ void Search::getSelfUtilityLCBAndRadius(const SearchNode& parent, const SearchNo
   double weightSqSum = child->stats.getChildWeightSq(edgeVisits,childVisits);
 
   // Max radius of the entire utility range
-  double utilityRangeRadius = searchParams.winLossUtilityFactor + searchParams.staticScoreUtilityFactor + searchParams.dynamicScoreUtilityFactor;
+  double utilityRangeRadius = getUtilityRangeRadius();
   radiusBuf = 2.0 * utilityRangeRadius * searchParams.lcbStdevs;
   lcbBuf = -radiusBuf;
   if(childVisits <= 0 || weightSum <= 0.0 || weightSqSum <= 0.0)

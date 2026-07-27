@@ -918,14 +918,19 @@ AnalysisData Search::getAnalysisDataOfSingleChild(
   if(childVisits <= 0 || childWeightSum <= 1e-30) {
     data.utility = fpuValue;
     data.scoreUtility = getScoreUtility(parentScoreMean,parentScoreMean*parentScoreMean+parentScoreStdev*parentScoreStdev);
-    data.resultUtility = fpuValue - data.scoreUtility;
-    data.winLossValue = searchParams.winLossUtilityFactor == 1.0 ? parentWinLossValue + (fpuValue - parentUtility) : 0.0;
+    double winLossUtilityFactor = getEffectiveWinLossUtilityFactor();
+    data.winLossValue =
+      winLossUtilityFactor > 0.0 ?
+      parentWinLossValue + (fpuValue-parentUtility) / winLossUtilityFactor :
+      parentWinLossValue;
     data.noResultValue = 0.0;
     // Make sure winloss values due to FPU don't go out of bounds for purposes of reporting to UI
     if(data.winLossValue < -1.0)
       data.winLossValue = -1.0;
     if(data.winLossValue > 1.0)
       data.winLossValue = 1.0;
+    data.resultUtility = data.winLossValue * winLossUtilityFactor;
+    data.scoreUtility = fpuValue - data.resultUtility;
     data.scoreMean = parentScoreMean;
     data.scoreStdev = parentScoreStdev;
     data.lead = parentLead;
@@ -2022,21 +2027,44 @@ bool Search::getAnalysisJson(
 
   // Stats for all the individual moves
   json moveInfos = json::array();
+  double scoreUtilityLowerBound = 0.0;
+  double scoreUtilityUpperBound = 0.0;
+  if(searchParams.useScoreMaximizingUtility) {
+    ScoreValue::getScoreMaximizingUtilityLegalBounds(
+      rootBoard,rootHistory,scoreUtilityLowerBound,scoreUtilityUpperBound
+    );
+  }
   for(int i = 0; i < buf.size(); i++) {
     const AnalysisData& data = buf[i];
     double winrate = 0.5 * (1.0 + data.winLossValue);
     double utility = data.utility;
+    double resultUtility = data.resultUtility;
+    double scoreUtility = data.scoreUtility;
+    double otherUtility = data.utility - data.resultUtility - data.scoreUtility;
     double lcb = PlayUtils::getHackedLCBForWinrate(this, data, rootPla);
     double utilityLcb = data.lcb;
     double scoreMean = data.scoreMean;
     double lead = data.lead;
+    double lowerScoreTailProb = 0.0;
+    double upperScoreTailProb = 0.0;
+    if(searchParams.useScoreMaximizingUtility) {
+      ScoreValue::getScoreMaximizingUtilityTailProbabilities(
+        data.scoreMean,data.scoreStdev,
+        scoreUtilityLowerBound,scoreUtilityUpperBound,
+        lowerScoreTailProb,upperScoreTailProb
+      );
+    }
     if(perspective == P_BLACK || (perspective != P_BLACK && perspective != P_WHITE && rootPla == P_BLACK)) {
       winrate = 1.0 - winrate;
       lcb = 1.0 - lcb;
       utility = -utility;
+      resultUtility = -resultUtility;
+      scoreUtility = -scoreUtility;
+      otherUtility = -otherUtility;
       scoreMean = -scoreMean;
       lead = -lead;
       utilityLcb = -utilityLcb;
+      std::swap(lowerScoreTailProb,upperScoreTailProb);
     }
 
     json moveInfo;
@@ -2044,6 +2072,9 @@ bool Search::getAnalysisJson(
     moveInfo["visits"] = data.childVisits;
     moveInfo["weight"] = Global::roundDynamic(data.childWeightSum,OUTPUT_PRECISION);
     moveInfo["utility"] = Global::roundDynamic(utility,OUTPUT_PRECISION);
+    moveInfo["resultUtility"] = Global::roundDynamic(resultUtility,OUTPUT_PRECISION);
+    moveInfo["scoreUtility"] = Global::roundDynamic(scoreUtility,OUTPUT_PRECISION);
+    moveInfo["otherUtility"] = Global::roundDynamic(otherUtility,OUTPUT_PRECISION);
     moveInfo["winrate"] = Global::roundDynamic(winrate,OUTPUT_PRECISION);
     // We report lead for scoreMean here so that a bunch of legacy tools that use KataGo use lead instead, which
     // is usually a better field for user applications. We report scoreMean instead as scoreSelfplay
@@ -2051,6 +2082,10 @@ bool Search::getAnalysisJson(
     moveInfo["scoreSelfplay"] = Global::roundDynamic(scoreMean,OUTPUT_PRECISION);
     moveInfo["scoreLead"] = Global::roundDynamic(lead,OUTPUT_PRECISION);
     moveInfo["scoreStdev"] = Global::roundDynamic(data.scoreStdev,OUTPUT_PRECISION);
+    if(searchParams.useScoreMaximizingUtility) {
+      moveInfo["lowerScoreTailProb"] = Global::roundDynamic(lowerScoreTailProb,OUTPUT_PRECISION);
+      moveInfo["upperScoreTailProb"] = Global::roundDynamic(upperScoreTailProb,OUTPUT_PRECISION);
+    }
     if(includeNoResultValue)
       moveInfo["noResultValue"] = Global::roundDynamic(data.noResultValue,OUTPUT_PRECISION);
     moveInfo["prior"] = Global::roundDynamic(data.policyPrior,OUTPUT_PRECISION);
@@ -2124,6 +2159,19 @@ bool Search::getAnalysisJson(
     rootInfo["scoreLead"] = Global::roundDynamic(lead*flipFactor,OUTPUT_PRECISION);
     rootInfo["scoreStdev"] = Global::roundDynamic(rootVals.expectedScoreStdev,OUTPUT_PRECISION);
     rootInfo["utility"] = Global::roundDynamic(utility*flipFactor,OUTPUT_PRECISION);
+    rootInfo["resultUtility"] = Global::roundDynamic(rootVals.resultUtility*flipFactor,OUTPUT_PRECISION);
+    rootInfo["scoreUtility"] = Global::roundDynamic(rootVals.scoreUtility*flipFactor,OUTPUT_PRECISION);
+    rootInfo["otherUtility"] = Global::roundDynamic(rootVals.otherUtility*flipFactor,OUTPUT_PRECISION);
+    if(searchParams.useScoreMaximizingUtility) {
+      rootInfo["lowerScoreTailProb"] = Global::roundDynamic(
+        flipFactor > 0.0 ? rootVals.lowerScoreTailProb : rootVals.upperScoreTailProb,
+        OUTPUT_PRECISION
+      );
+      rootInfo["upperScoreTailProb"] = Global::roundDynamic(
+        flipFactor > 0.0 ? rootVals.upperScoreTailProb : rootVals.lowerScoreTailProb,
+        OUTPUT_PRECISION
+      );
+    }
 
     if(nnOutput != NULL) {
       rootInfo["rawWinrate"] = Global::roundDynamic(0.5 + 0.5*(nnOutput->whiteWinProb - nnOutput->whiteLossProb)*flipFactor,OUTPUT_PRECISION);

@@ -37,6 +37,23 @@ ReportedSearchValues::ReportedSearchValues(
   if(noResultValue < 0.0) noResultValue = 0.0;
   if(noResultValue > 1.0-std::fabs(winLossValue)) noResultValue = 1.0-std::fabs(winLossValue);
 
+  resultUtility = search.getResultUtility(winLossValue,noResultValue);
+  scoreUtility = search.getScoreUtility(scoreMean,scoreMeanSq);
+  otherUtility = utilityAvg - resultUtility - scoreUtility;
+  lowerScoreTailProb = 0.0;
+  upperScoreTailProb = 0.0;
+  if(search.searchParams.useScoreMaximizingUtility) {
+    double lowerScoreBound;
+    double upperScoreBound;
+    ScoreValue::getScoreMaximizingUtilityLegalBounds(
+      search.rootBoard,search.rootHistory,lowerScoreBound,upperScoreBound
+    );
+    ScoreValue::getScoreMaximizingUtilityTailProbabilities(
+      scoreMean,scoreStdev,lowerScoreBound,upperScoreBound,
+      lowerScoreTailProb,upperScoreTailProb
+    );
+  }
+
   winValue = 0.5 * (winLossValue + (1.0 - noResultValue));
   lossValue = 0.5 * (-winLossValue + (1.0 - noResultValue));
 
@@ -60,6 +77,11 @@ std::ostream& operator<<(std::ostream& out, const ReportedSearchValues& values) 
   out << "expectedScoreStdev " << values.expectedScoreStdev << "\n";
   out << "lead " << values.lead << "\n";
   out << "winLossValue " << values.winLossValue << "\n";
+  out << "resultUtility " << values.resultUtility << "\n";
+  out << "scoreUtility " << values.scoreUtility << "\n";
+  out << "otherUtility " << values.otherUtility << "\n";
+  out << "lowerScoreTailProb " << values.lowerScoreTailProb << "\n";
+  out << "upperScoreTailProb " << values.upperScoreTailProb << "\n";
   out << "utility " << values.utility << "\n";
   out << "weight " << values.weight << "\n";
   out << "visits " << values.visits << "\n";

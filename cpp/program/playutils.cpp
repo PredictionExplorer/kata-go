@@ -340,12 +340,18 @@ double PlayUtils::getHackedLCBForWinrate(const Search* search, const AnalysisDat
   //lz-analyze you probably don't know about utility and expect LCB to be about winrate. So we apply the LCB
   //radius to the winrate in order to get something reasonable to display, and also scale it proportionally
   //by how much winrate is supposed to matter relative to score.
-  double radiusScaleHackFactor = search->searchParams.winLossUtilityFactor / (
-    search->searchParams.winLossUtilityFactor +
-    search->searchParams.staticScoreUtilityFactor +
-    search->searchParams.dynamicScoreUtilityFactor +
-    1.0e-20 //avoid divide by 0
-  );
+  double utilityRangeRadius = search->getUtilityRangeRadius();
+  double radiusScaleHackFactor;
+  if(search->searchParams.useScoreMaximizingUtility) {
+    radiusScaleHackFactor =
+      search->getEffectiveWinLossUtilityFactor() /
+      (utilityRangeRadius * utilityRangeRadius + 1.0e-20);
+  }
+  else {
+    radiusScaleHackFactor =
+      search->getEffectiveWinLossUtilityFactor() /
+      (utilityRangeRadius + 1.0e-20);
+  }
   //Also another factor of 0.5 because winrate goes from only 0 to 1 instead of -1 to 1 when it's part of utility
   radiusScaleHackFactor *= 0.5;
   double lcb = pla == P_WHITE ? winrate - data.radius * radiusScaleHackFactor : winrate + data.radius * radiusScaleHackFactor;

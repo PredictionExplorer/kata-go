@@ -1,5 +1,10 @@
 #include "../neuralnet/nninputs.h"
 
+#include <atomic>
+#include <limits>
+#include <mutex>
+#include <tuple>
+
 #include "../core/test.h"
 
 using namespace std;
@@ -94,6 +99,82 @@ double ScoreValue::whiteScoreMeanSqOfScoreGridded(double finalWhiteMinusBlackSco
   return lowerSq + (upperSq - lowerSq) * drawEquivalentWinsForWhite;
 }
 
+namespace {
+  static void validateScoreMaximizingUtilityParams(double power, double scale) {
+    if(!std::isfinite(power) || power < 1.0 || power > 2.0)
+      throw StringError("scorePower must be finite and between 1.0 and 2.0");
+    if(!std::isfinite(scale) || scale < 5.0 || scale > 1000.0)
+      throw StringError("scoreScale must be finite and between 5.0 and 1000.0");
+  }
+
+  static double scoreMaximizingUtilityUnchecked(double score, double power, double scale) {
+    if(score == 0.0)
+      return 0.0;
+    double magnitude = pow(1.0 + std::fabs(score) / scale, power) - 1.0;
+    return score > 0.0 ? magnitude : -magnitude;
+  }
+
+  static double standardNormalCDF(double x) {
+    static const double sqrtTwo = 1.41421356237309504880;
+    return 0.5 * erfc(-x / sqrtTwo);
+  }
+
+  static double standardNormalSurvival(double x) {
+    static const double sqrtTwo = 1.41421356237309504880;
+    return 0.5 * erfc(x / sqrtTwo);
+  }
+
+  static double standardNormalProbabilityBetween(double lower, double upper) {
+    if(lower >= upper)
+      return 0.0;
+    double probability;
+    if(lower >= 0.0)
+      probability = standardNormalSurvival(lower) - standardNormalSurvival(upper);
+    else
+      probability = standardNormalCDF(upper) - standardNormalCDF(lower);
+    return std::max(0.0, probability);
+  }
+}
+
+double ScoreValue::scoreMaximizingUtility(double whiteScore, double power, double scale) {
+  validateScoreMaximizingUtilityParams(power,scale);
+  return scoreMaximizingUtilityUnchecked(whiteScore,power,scale);
+}
+
+double ScoreValue::scoreMaximizingUtilityDerivative(
+  double whiteScore,
+  double power,
+  double scale,
+  double lowerBound,
+  double upperBound
+) {
+  validateScoreMaximizingUtilityParams(power,scale);
+  if(!std::isfinite(lowerBound) || !std::isfinite(upperBound) || lowerBound >= upperBound)
+    throw StringError("Invalid legal score bounds for score-maximizing utility");
+  if(whiteScore <= lowerBound || whiteScore >= upperBound)
+    return 0.0;
+  return power / scale * pow(1.0 + std::fabs(whiteScore) / scale, power - 1.0);
+}
+
+void ScoreValue::getScoreMaximizingUtilityLegalBounds(
+  const Board& rootBoard,
+  const BoardHistory& rootHistory,
+  double& lowerBound,
+  double& upperBound
+) {
+  if(rootHistory.rules.scoringRule != Rules::SCORING_AREA)
+    throw StringError("useScoreMaximizingUtility currently supports area scoring only");
+
+  double boardArea = (double)rootBoard.x_size * rootBoard.y_size;
+  double fixedWhiteBonus =
+    rootHistory.whiteBonusScore +
+    rootHistory.whiteHandicapBonusScore +
+    rootHistory.rules.komi;
+  double possibleButtonAdjustment = rootHistory.hasButton ? 0.5 : 0.0;
+  lowerBound = -boardArea + fixedWhiteBonus - possibleButtonAdjustment;
+  upperBound = boardArea + fixedWhiteBonus + possibleButtonAdjustment;
+}
+
 
 static bool scoreValueTablesInitialized = false;
 static double* expectedSVTable = NULL;
@@ -102,7 +183,440 @@ static const int svTableMeanRadius = svTableAssumedBSize*svTableAssumedBSize + N
 static const int svTableMeanLen = svTableMeanRadius*2;
 static const int svTableStdevLen = svTableAssumedBSize*svTableAssumedBSize + NNPos::EXTRA_SCORE_DISTR_RADIUS;
 
+namespace {
+  struct ScoreMaximizingUtilityTable {
+    static constexpr int X_STEPS_PER_UNIT = 64;
+    static constexpr int OUTSIDE_UNITS = 8;
+    static constexpr int MAIN_T_STEPS = 256;
+    static constexpr int BOUNDARY_T_STEPS = 128;
+
+    double power;
+    double scale;
+    double lowerBound;
+    double upperBound;
+    double lowerUtility;
+    double upperUtility;
+    double lowerScoreCoord;
+    double upperScoreCoord;
+    int outsideXSteps;
+    int interiorXSteps;
+    int mainXLen;
+    int boundaryXLen;
+    double uniformInteriorUtility;
+    std::vector<double> mainConditionalUtility;
+    mutable std::once_flag lowerBoundaryTableOnce;
+    mutable std::once_flag upperBoundaryTableOnce;
+    mutable std::vector<double> lowerBoundaryExpectedUtility;
+    mutable std::vector<double> upperBoundaryExpectedUtility;
+
+    ScoreMaximizingUtilityTable(double p, double s, double lower, double upper)
+      :power(p),
+       scale(s),
+       lowerBound(lower),
+       upperBound(upper),
+       lowerUtility(scoreMaximizingUtilityUnchecked(lower,p,s)),
+       upperUtility(scoreMaximizingUtilityUnchecked(upper,p,s)),
+       lowerScoreCoord(scoreToCoord(lower)),
+       upperScoreCoord(scoreToCoord(upper)),
+       outsideXSteps(OUTSIDE_UNITS * X_STEPS_PER_UNIT),
+       interiorXSteps(std::max(1,(int)ceil((upperScoreCoord-lowerScoreCoord) * X_STEPS_PER_UNIT))),
+       mainXLen(outsideXSteps + interiorXSteps + outsideXSteps + 1),
+       boundaryXLen(2 * outsideXSteps + 1),
+       uniformInteriorUtility(computeUniformInteriorUtility()),
+       mainConditionalUtility((size_t)mainXLen * (MAIN_T_STEPS+1)),
+       lowerBoundaryTableOnce(),
+       upperBoundaryTableOnce(),
+       lowerBoundaryExpectedUtility(),
+       upperBoundaryExpectedUtility()
+    {
+      initializeMainTable();
+    }
+
+    double scoreToCoord(double score) const {
+      if(score == 0.0)
+        return 0.0;
+      double magnitude = power * log1p(std::fabs(score) / scale);
+      return score > 0.0 ? magnitude : -magnitude;
+    }
+
+    double coordToScore(double coord) const {
+      if(coord == 0.0)
+        return 0.0;
+      double magnitude = scale * expm1(std::fabs(coord) / power);
+      return coord > 0.0 ? magnitude : -magnitude;
+    }
+
+    double utilityIntegralFromZero(double score) const {
+      double absScore = std::fabs(score);
+      return
+        scale / (power+1.0) * (pow(1.0 + absScore / scale,power+1.0) - 1.0)
+        - absScore;
+    }
+
+    double computeUniformInteriorUtility() const {
+      double integral =
+        utilityIntegralFromZero(upperBound) -
+        utilityIntegralFromZero(lowerBound);
+      return integral / (upperBound-lowerBound);
+    }
+
+    double mainMeanAt(int xIdx, double scoreStdev) const {
+      if(xIdx <= outsideXSteps) {
+        double distance = (double)(xIdx-outsideXSteps) / X_STEPS_PER_UNIT;
+        return lowerBound + distance * (scale+scoreStdev);
+      }
+      if(xIdx <= outsideXSteps+interiorXSteps) {
+        double lambda = (double)(xIdx-outsideXSteps) / interiorXSteps;
+        double coord = lowerScoreCoord + lambda * (upperScoreCoord-lowerScoreCoord);
+        return coordToScore(coord);
+      }
+      double distance = (double)(xIdx-outsideXSteps-interiorXSteps) / X_STEPS_PER_UNIT;
+      return upperBound + distance * (scale+scoreStdev);
+    }
+
+    void getDirectUtilities(
+      double scoreMean,
+      double scoreStdev,
+      double& expectedUtility,
+      double& conditionalInteriorUtility
+    ) const {
+      if(scoreStdev <= 0.0) {
+        double clampedScore = std::min(upperBound,std::max(lowerBound,scoreMean));
+        expectedUtility = scoreMaximizingUtilityUnchecked(clampedScore,power,scale);
+        conditionalInteriorUtility = expectedUtility;
+        return;
+      }
+
+      double lowerZ = (lowerBound-scoreMean) / scoreStdev;
+      double upperZ = (upperBound-scoreMean) / scoreStdev;
+      double lowerTailProb = standardNormalCDF(lowerZ);
+      double upperTailProb = standardNormalSurvival(upperZ);
+      double interiorProb = standardNormalProbabilityBetween(lowerZ,upperZ);
+
+      double interiorUtilityIntegral = 0.0;
+      double omittedLowerUpper = std::min(upperZ,-12.0);
+      if(lowerZ < omittedLowerUpper) {
+        double omittedProb = standardNormalProbabilityBetween(lowerZ,omittedLowerUpper);
+        double score = std::min(upperBound,std::max(lowerBound,scoreMean + scoreStdev*omittedLowerUpper));
+        interiorUtilityIntegral += omittedProb * scoreMaximizingUtilityUnchecked(score,power,scale);
+      }
+      double omittedUpperLower = std::max(lowerZ,12.0);
+      if(omittedUpperLower < upperZ) {
+        double omittedProb = standardNormalProbabilityBetween(omittedUpperLower,upperZ);
+        double score = std::min(upperBound,std::max(lowerBound,scoreMean + scoreStdev*omittedUpperLower));
+        interiorUtilityIntegral += omittedProb * scoreMaximizingUtilityUnchecked(score,power,scale);
+      }
+
+      double integrationLower = std::max(lowerZ,-12.0);
+      double integrationUpper = std::min(upperZ,12.0);
+      if(integrationLower < integrationUpper) {
+        static const double nodes[4] = {
+          0.18343464249564980494,
+          0.52553240991632898582,
+          0.79666647741362673959,
+          0.96028985649753623168
+        };
+        static const double weights[4] = {
+          0.36268378337836198297,
+          0.31370664587788728734,
+          0.22238103445337447054,
+          0.10122853629037625915
+        };
+        static const double invSqrtTwoPi = 0.39894228040143267794;
+        double scoreZeroZ = -scoreMean / scoreStdev;
+        double segmentLower = integrationLower;
+        while(segmentLower < integrationUpper) {
+          double segmentUpper = std::min(integrationUpper,segmentLower+1.0);
+          if(scoreZeroZ > segmentLower+1e-14 && scoreZeroZ < segmentUpper-1e-14)
+            segmentUpper = scoreZeroZ;
+          double midpoint = 0.5 * (segmentLower+segmentUpper);
+          double halfWidth = 0.5 * (segmentUpper-segmentLower);
+          for(int i = 0; i<4; i++) {
+            double delta = halfWidth * nodes[i];
+            double z0 = midpoint-delta;
+            double z1 = midpoint+delta;
+            double score0 = std::min(upperBound,std::max(lowerBound,scoreMean + scoreStdev*z0));
+            double score1 = std::min(upperBound,std::max(lowerBound,scoreMean + scoreStdev*z1));
+            double weightedUtility =
+              scoreMaximizingUtilityUnchecked(score0,power,scale) * exp(-0.5*z0*z0) +
+              scoreMaximizingUtilityUnchecked(score1,power,scale) * exp(-0.5*z1*z1);
+            interiorUtilityIntegral += halfWidth * weights[i] * invSqrtTwoPi * weightedUtility;
+          }
+          segmentLower = segmentUpper;
+        }
+      }
+
+      if(interiorProb > 1e-100)
+        conditionalInteriorUtility = interiorUtilityIntegral / interiorProb;
+      else {
+        double clampedScore = std::min(upperBound,std::max(lowerBound,scoreMean));
+        conditionalInteriorUtility = scoreMaximizingUtilityUnchecked(clampedScore,power,scale);
+      }
+      expectedUtility =
+        lowerTailProb * lowerUtility +
+        interiorProb * conditionalInteriorUtility +
+        upperTailProb * upperUtility;
+    }
+
+    void initializeMainTable() {
+      for(int xIdx = 0; xIdx<mainXLen; xIdx++) {
+        for(int tIdx = 0; tIdx<=MAIN_T_STEPS; tIdx++) {
+          double conditionalUtility;
+          if(tIdx == MAIN_T_STEPS)
+            conditionalUtility = uniformInteriorUtility;
+          else {
+            double t = (double)tIdx / MAIN_T_STEPS;
+            double scoreStdev = scale * t / (1.0-t);
+            double scoreMean = mainMeanAt(xIdx,scoreStdev);
+            double expectedUtility;
+            getDirectUtilities(scoreMean,scoreStdev,expectedUtility,conditionalUtility);
+          }
+          mainConditionalUtility[(size_t)xIdx * (MAIN_T_STEPS+1) + tIdx] = conditionalUtility;
+        }
+      }
+    }
+
+    void initializeBoundaryTable(double bound, std::vector<double>& table) const {
+      table.resize((size_t)boundaryXLen * (BOUNDARY_T_STEPS+1));
+      for(int xIdx = 0; xIdx<boundaryXLen; xIdx++) {
+        double standardizedDistance = (double)(xIdx-outsideXSteps) / X_STEPS_PER_UNIT;
+        for(int tIdx = 0; tIdx<=BOUNDARY_T_STEPS; tIdx++) {
+          double t = 0.5 * tIdx / BOUNDARY_T_STEPS;
+          double scoreStdev = scale * t / (1.0-t);
+          double scoreMean = bound + standardizedDistance * (scale+scoreStdev);
+          double expectedUtility;
+          double conditionalUtility;
+          getDirectUtilities(scoreMean,scoreStdev,expectedUtility,conditionalUtility);
+          table[(size_t)xIdx * (BOUNDARY_T_STEPS+1) + tIdx] = expectedUtility;
+        }
+      }
+    }
+
+    double lookupBoundary(
+      double scoreMean,
+      double scoreStdev,
+      double bound,
+      const std::vector<double>& table
+    ) const {
+      double x = (scoreMean-bound) / (scale+scoreStdev);
+      double xPos = (x+OUTSIDE_UNITS) * X_STEPS_PER_UNIT;
+      xPos = std::min((double)(boundaryXLen-1),std::max(0.0,xPos));
+      int xIdx0 = std::min(boundaryXLen-2,(int)floor(xPos));
+      int xIdx1 = xIdx0+1;
+      double lambdaX = xPos-xIdx0;
+
+      double t = scoreStdev / (scale+scoreStdev);
+      double tPos = 2.0 * t * BOUNDARY_T_STEPS;
+      tPos = std::min((double)BOUNDARY_T_STEPS,std::max(0.0,tPos));
+      int tIdx0 = std::min(BOUNDARY_T_STEPS-1,(int)floor(tPos));
+      int tIdx1 = tIdx0+1;
+      double lambdaT = tPos-tIdx0;
+
+      double a00 = table[(size_t)xIdx0 * (BOUNDARY_T_STEPS+1) + tIdx0];
+      double a01 = table[(size_t)xIdx0 * (BOUNDARY_T_STEPS+1) + tIdx1];
+      double a10 = table[(size_t)xIdx1 * (BOUNDARY_T_STEPS+1) + tIdx0];
+      double a11 = table[(size_t)xIdx1 * (BOUNDARY_T_STEPS+1) + tIdx1];
+      double b0 = a00 + lambdaT * (a01-a00);
+      double b1 = a10 + lambdaT * (a11-a10);
+      return b0 + lambdaX * (b1-b0);
+    }
+
+    double lookupMainConditional(double scoreMean, double scoreStdev) const {
+      double xPos;
+      if(scoreMean < lowerBound)
+        xPos = outsideXSteps + (scoreMean-lowerBound) / (scale+scoreStdev) * X_STEPS_PER_UNIT;
+      else if(scoreMean > upperBound)
+        xPos = outsideXSteps + interiorXSteps + (scoreMean-upperBound) / (scale+scoreStdev) * X_STEPS_PER_UNIT;
+      else {
+        double coord = scoreToCoord(scoreMean);
+        xPos = outsideXSteps + (coord-lowerScoreCoord) / (upperScoreCoord-lowerScoreCoord) * interiorXSteps;
+      }
+      xPos = std::min((double)(mainXLen-1),std::max(0.0,xPos));
+      int xIdx0 = std::min(mainXLen-2,(int)floor(xPos));
+      int xIdx1 = xIdx0+1;
+      double lambdaX = xPos-xIdx0;
+
+      double t = std::isfinite(scoreStdev) ? scoreStdev / (scale+scoreStdev) : 1.0;
+      double tPos = std::min((double)MAIN_T_STEPS,std::max(0.0,t * MAIN_T_STEPS));
+      int tIdx0 = std::min(MAIN_T_STEPS-1,(int)floor(tPos));
+      int tIdx1 = tIdx0+1;
+      double lambdaT = tPos-tIdx0;
+
+      double a00 = mainConditionalUtility[(size_t)xIdx0 * (MAIN_T_STEPS+1) + tIdx0];
+      double a01 = mainConditionalUtility[(size_t)xIdx0 * (MAIN_T_STEPS+1) + tIdx1];
+      double a10 = mainConditionalUtility[(size_t)xIdx1 * (MAIN_T_STEPS+1) + tIdx0];
+      double a11 = mainConditionalUtility[(size_t)xIdx1 * (MAIN_T_STEPS+1) + tIdx1];
+      double b0 = a00 + lambdaT * (a01-a00);
+      double b1 = a10 + lambdaT * (a11-a10);
+      return b0 + lambdaX * (b1-b0);
+    }
+
+    double getExpectedUtility(double scoreMean, double scoreStdev) const {
+      if(scoreStdev <= 0.0) {
+        double clampedScore = std::min(upperBound,std::max(lowerBound,scoreMean));
+        return scoreMaximizingUtilityUnchecked(clampedScore,power,scale);
+      }
+
+      if(scoreStdev <= scale) {
+        double lowerDistance = std::fabs(scoreMean-lowerBound);
+        double upperDistance = std::fabs(scoreMean-upperBound);
+        if(std::min(lowerDistance,upperDistance) <= OUTSIDE_UNITS * (scale+scoreStdev)) {
+          if(lowerDistance <= upperDistance) {
+            std::call_once(lowerBoundaryTableOnce,[this]() {
+              initializeBoundaryTable(lowerBound,lowerBoundaryExpectedUtility);
+            });
+            return lookupBoundary(scoreMean,scoreStdev,lowerBound,lowerBoundaryExpectedUtility);
+          }
+          std::call_once(upperBoundaryTableOnce,[this]() {
+            initializeBoundaryTable(upperBound,upperBoundaryExpectedUtility);
+          });
+          return lookupBoundary(scoreMean,scoreStdev,upperBound,upperBoundaryExpectedUtility);
+        }
+      }
+
+      double conditionalUtility = lookupMainConditional(scoreMean,scoreStdev);
+      double lowerZ = (lowerBound-scoreMean) / scoreStdev;
+      double upperZ = (upperBound-scoreMean) / scoreStdev;
+      double lowerTailProb = standardNormalCDF(lowerZ);
+      double upperTailProb = standardNormalSurvival(upperZ);
+      double interiorProb = standardNormalProbabilityBetween(lowerZ,upperZ);
+      return
+        lowerTailProb * lowerUtility +
+        interiorProb * conditionalUtility +
+        upperTailProb * upperUtility;
+    }
+  };
+
+  struct ScoreMaximizingUtilityTableKey {
+    double power;
+    double scale;
+    double lowerBound;
+    double upperBound;
+
+    bool operator<(const ScoreMaximizingUtilityTableKey& other) const {
+      return std::tie(power,scale,lowerBound,upperBound) <
+        std::tie(other.power,other.scale,other.lowerBound,other.upperBound);
+    }
+    bool operator==(const ScoreMaximizingUtilityTableKey& other) const {
+      return
+        power == other.power &&
+        scale == other.scale &&
+        lowerBound == other.lowerBound &&
+        upperBound == other.upperBound;
+    }
+  };
+
+  static std::mutex scoreMaximizingUtilityTablesMutex;
+  static std::map<ScoreMaximizingUtilityTableKey,std::shared_ptr<const ScoreMaximizingUtilityTable>> scoreMaximizingUtilityTables;
+  static std::atomic<uint64_t> scoreMaximizingUtilityTablesGeneration(0);
+  static thread_local ScoreMaximizingUtilityTableKey lastScoreMaximizingUtilityTableKey {};
+  static thread_local std::shared_ptr<const ScoreMaximizingUtilityTable> lastScoreMaximizingUtilityTable;
+  static thread_local uint64_t lastScoreMaximizingUtilityTableGeneration = std::numeric_limits<uint64_t>::max();
+
+  static const ScoreMaximizingUtilityTable* getScoreMaximizingUtilityTable(
+    double power,
+    double scale,
+    double lowerBound,
+    double upperBound
+  ) {
+    ScoreMaximizingUtilityTableKey key {power,scale,lowerBound,upperBound};
+    uint64_t generation = scoreMaximizingUtilityTablesGeneration.load(std::memory_order_acquire);
+    if(
+      lastScoreMaximizingUtilityTable != NULL &&
+      lastScoreMaximizingUtilityTableGeneration == generation &&
+      lastScoreMaximizingUtilityTableKey == key
+    )
+      return lastScoreMaximizingUtilityTable.get();
+
+    {
+      std::lock_guard<std::mutex> lock(scoreMaximizingUtilityTablesMutex);
+      auto iter = scoreMaximizingUtilityTables.find(key);
+      if(iter != scoreMaximizingUtilityTables.end()) {
+        lastScoreMaximizingUtilityTableKey = key;
+        lastScoreMaximizingUtilityTable = iter->second;
+        lastScoreMaximizingUtilityTableGeneration =
+          scoreMaximizingUtilityTablesGeneration.load(std::memory_order_relaxed);
+        return lastScoreMaximizingUtilityTable.get();
+      }
+    }
+
+    //Table construction is intentionally outside the global cache lock so
+    //different bots or komi values do not serialize their startup work.
+    std::shared_ptr<const ScoreMaximizingUtilityTable> newTable =
+      std::make_shared<const ScoreMaximizingUtilityTable>(power,scale,lowerBound,upperBound);
+
+    {
+      std::lock_guard<std::mutex> lock(scoreMaximizingUtilityTablesMutex);
+      auto iter = scoreMaximizingUtilityTables.find(key);
+      if(iter == scoreMaximizingUtilityTables.end()) {
+        //Bound memory if callers repeatedly change komi or utility parameters.
+        //Thread-local shared pointers keep any table currently in use alive.
+        static const size_t maxCachedTables = 16;
+        if(scoreMaximizingUtilityTables.size() >= maxCachedTables) {
+          scoreMaximizingUtilityTables.clear();
+          scoreMaximizingUtilityTablesGeneration.fetch_add(1,std::memory_order_release);
+        }
+        iter = scoreMaximizingUtilityTables.insert(std::make_pair(key,newTable)).first;
+      }
+      lastScoreMaximizingUtilityTableKey = key;
+      lastScoreMaximizingUtilityTable = iter->second;
+      lastScoreMaximizingUtilityTableGeneration =
+        scoreMaximizingUtilityTablesGeneration.load(std::memory_order_relaxed);
+    }
+    return lastScoreMaximizingUtilityTable.get();
+  }
+}
+
+double ScoreValue::expectedScoreMaximizingUtility(
+  double whiteScoreMean,
+  double whiteScoreStdev,
+  double power,
+  double scale,
+  double lowerBound,
+  double upperBound
+) {
+  testAssert(scoreValueTablesInitialized);
+  validateScoreMaximizingUtilityParams(power,scale);
+  if(!std::isfinite(whiteScoreMean) || std::isnan(whiteScoreStdev) || whiteScoreStdev < 0.0)
+    throw StringError("Invalid normal score distribution for score-maximizing utility");
+  if(!std::isfinite(lowerBound) || !std::isfinite(upperBound) || lowerBound >= upperBound)
+    throw StringError("Invalid legal score bounds for score-maximizing utility");
+  if(whiteScoreStdev == 0.0) {
+    double clampedScore = std::min(upperBound,std::max(lowerBound,whiteScoreMean));
+    return scoreMaximizingUtilityUnchecked(clampedScore,power,scale);
+  }
+  return getScoreMaximizingUtilityTable(power,scale,lowerBound,upperBound)->getExpectedUtility(whiteScoreMean,whiteScoreStdev);
+}
+
+void ScoreValue::getScoreMaximizingUtilityTailProbabilities(
+  double whiteScoreMean,
+  double whiteScoreStdev,
+  double lowerBound,
+  double upperBound,
+  double& lowerTailProb,
+  double& upperTailProb
+) {
+  if(!std::isfinite(whiteScoreMean) || std::isnan(whiteScoreStdev) || whiteScoreStdev < 0.0)
+    throw StringError("Invalid normal score distribution for score-maximizing utility");
+  if(!std::isfinite(lowerBound) || !std::isfinite(upperBound) || lowerBound >= upperBound)
+    throw StringError("Invalid legal score bounds for score-maximizing utility");
+  if(whiteScoreStdev == 0.0) {
+    lowerTailProb = whiteScoreMean < lowerBound ? 1.0 : 0.0;
+    upperTailProb = whiteScoreMean > upperBound ? 1.0 : 0.0;
+    return;
+  }
+  lowerTailProb = standardNormalCDF((lowerBound-whiteScoreMean) / whiteScoreStdev);
+  upperTailProb = standardNormalSurvival((upperBound-whiteScoreMean) / whiteScoreStdev);
+}
+
 void ScoreValue::freeTables() {
+  {
+    std::lock_guard<std::mutex> lock(scoreMaximizingUtilityTablesMutex);
+    scoreMaximizingUtilityTables.clear();
+    scoreMaximizingUtilityTablesGeneration.fetch_add(1,std::memory_order_release);
+    lastScoreMaximizingUtilityTable.reset();
+    lastScoreMaximizingUtilityTableGeneration = std::numeric_limits<uint64_t>::max();
+  }
   if(scoreValueTablesInitialized) {
     delete[] expectedSVTable;
     expectedSVTable = NULL;

@@ -15,6 +15,11 @@ struct ReportedSearchValues {
   double expectedScoreStdev;
   double lead;
   double winLossValue;
+  double resultUtility;
+  double scoreUtility;
+  double otherUtility;
+  double lowerScoreTailProb;
+  double upperScoreTailProb;
   double utility;
   double weight;
   int64_t visits;

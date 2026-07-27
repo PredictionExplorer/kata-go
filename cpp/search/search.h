@@ -78,6 +78,8 @@ struct SearchThread {
 };
 
 struct Search {
+  friend struct ReportedSearchValues;
+
   //================================================================================================================
   // Constant/immutable during search
   //================================================================================================================
@@ -109,6 +111,11 @@ struct Search {
   Color* rootSafeArea;
   //Used to center for dynamic scorevalue
   double recentScoreCenter;
+  //Bounds for utility under the current root state and parameters, refreshed before search.
+  double minUtilityForCurrentSearch;
+  double maxUtilityForCurrentSearch;
+  //True when a preserved tree's stored utility stats no longer match current params or bounds.
+  bool utilityStatsDirty;
 
   //If the opponent is mirroring, then the color of that opponent, for countering mirroring
   Player mirroringPla;
@@ -442,12 +449,18 @@ private:
   // Computing basic utility and scores
   // searchhelpers.cpp
   //----------------------------------------------------------------------------------------
+public:
+  double getEffectiveWinLossUtilityFactor() const;
+  double getUtilityRangeRadius() const;
+private:
   double getResultUtility(double winlossValue, double noResultValue) const;
   double getResultUtilityFromNN(const NNOutput& nnOutput) const;
   double getScoreUtility(double scoreMeanAvg, double scoreMeanSqAvg) const;
   double getScoreUtilityDiff(double scoreMeanAvg, double scoreMeanSqAvg, double delta) const;
-  double getApproxScoreUtilityDerivative(double scoreMean) const;
+  double getApproxScoreUtilityDerivative(double scoreMean, double scoreMeanSq) const;
   double getUtilityFromNN(const NNOutput& nnOutput) const;
+  void updateUtilityBounds();
+  void getUtilityBounds(double& minUtility, double& maxUtility) const;
 
   //----------------------------------------------------------------------------------------
   // Miscellaneous search biasing helpers, root move selection, etc.

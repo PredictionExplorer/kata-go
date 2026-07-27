@@ -66,6 +66,39 @@ SearchThread::~SearchThread() {
 
 static const double VALUE_WEIGHT_DEGREES_OF_FREEDOM = 3.0;
 
+static void validateScoreMaximizingUtility(
+  const SearchParams& searchParams,
+  const BoardHistory& history
+) {
+  if(!searchParams.useScoreMaximizingUtility)
+    return;
+  if(history.rules.scoringRule != Rules::SCORING_AREA)
+    throw StringError("useScoreMaximizingUtility currently supports area scoring only");
+  if(!std::isfinite(searchParams.winWeight) || searchParams.winWeight < 0.0)
+    throw StringError("winWeight must be finite and nonnegative");
+  (void)ScoreValue::scoreMaximizingUtility(0.0,searchParams.scorePower,searchParams.scoreScale);
+}
+
+static bool utilityAffectingParamsDiffer(
+  const SearchParams& oldParams,
+  const SearchParams& newParams
+) {
+  return
+    oldParams.winLossUtilityFactor != newParams.winLossUtilityFactor ||
+    oldParams.staticScoreUtilityFactor != newParams.staticScoreUtilityFactor ||
+    oldParams.dynamicScoreUtilityFactor != newParams.dynamicScoreUtilityFactor ||
+    oldParams.useScoreMaximizingUtility != newParams.useScoreMaximizingUtility ||
+    oldParams.scorePower != newParams.scorePower ||
+    oldParams.scoreScale != newParams.scoreScale ||
+    oldParams.winWeight != newParams.winWeight ||
+    oldParams.dynamicScoreCenterZeroWeight != newParams.dynamicScoreCenterZeroWeight ||
+    oldParams.dynamicScoreCenterScale != newParams.dynamicScoreCenterScale ||
+    oldParams.noResultUtilityForWhite != newParams.noResultUtilityForWhite ||
+    oldParams.drawEquivalentWinsForWhite != newParams.drawEquivalentWinsForWhite ||
+    oldParams.subtreeValueBiasFactor != newParams.subtreeValueBiasFactor ||
+    oldParams.avoidRepeatedPatternUtility != newParams.avoidRepeatedPatternUtility;
+}
+
 Search::Search(const SearchParams& params, NNEvaluator* nnEval, Logger* lg, const string& rSeed)
   :Search(params,nnEval,NULL,lg,rSeed)
 {}
@@ -80,6 +113,9 @@ Search::Search(const SearchParams& params, NNEvaluator* nnEval, NNEvaluator* hum
    rootPruneOnlySymmetries(),
    rootSafeArea(NULL),
    recentScoreCenter(0.0),
+   minUtilityForCurrentSearch(0.0),
+   maxUtilityForCurrentSearch(0.0),
+   utilityStatsDirty(false),
    mirroringPla(C_EMPTY),
    mirrorAdvantage(0.0),
    mirrorCenterSymmetryError(1e10),
@@ -141,6 +177,8 @@ Search::Search(const SearchParams& params, NNEvaluator* nnEval, NNEvaluator* hum
   mutexPool = new MutexPool(nodeTable->mutexPool->getNumMutexes());
 
   rootHistory.clear(rootBoard,rootPla,Rules(),0);
+  validateScoreMaximizingUtility(searchParams,rootHistory);
+  updateUtilityBounds();
   rootKoHashTable->recompute(rootHistory);
 }
 
@@ -173,11 +211,13 @@ Player Search::getPlayoutDoublingAdvantagePla() const {
 }
 
 void Search::setPosition(Player pla, const Board& board, const BoardHistory& history) {
+  validateScoreMaximizingUtility(searchParams,history);
   clearSearch();
   rootPla = pla;
   plaThatSearchIsFor = C_EMPTY;
   rootBoard = board;
   rootHistory = history;
+  updateUtilityBounds();
   rootKoHashTable->recompute(rootHistory);
   avoidMoveUntilByLocBlack.clear();
   avoidMoveUntilByLocWhite.clear();
@@ -193,6 +233,7 @@ void Search::setPlayerAndClearHistory(Player pla) {
   bool assumeMultipleStartingBlackMovesAreHandicap = rootHistory.assumeMultipleStartingBlackMovesAreHandicap;
   rootHistory.clear(rootBoard,rootPla,rules,rootHistory.encorePhase);
   rootHistory.setAssumeMultipleStartingBlackMovesAreHandicap(assumeMultipleStartingBlackMovesAreHandicap);
+  updateUtilityBounds();
 
   rootKoHashTable->recompute(rootHistory);
 
@@ -212,6 +253,7 @@ void Search::setKomiIfNew(float newKomi) {
   if(rootHistory.rules.komi != newKomi) {
     clearSearch();
     rootHistory.setKomi(newKomi);
+    updateUtilityBounds();
   }
 }
 
@@ -250,12 +292,18 @@ void Search::setRootSymmetryPruningOnly(const std::vector<int>& v) {
 
 
 void Search::setParams(const SearchParams& params) {
+  validateScoreMaximizingUtility(params,rootHistory);
   clearSearch();
   searchParams = params;
+  updateUtilityBounds();
 }
 
 void Search::setParamsNoClearing(const SearchParams& params) {
+  validateScoreMaximizingUtility(params,rootHistory);
+  if(utilityAffectingParamsDiffer(searchParams,params))
+    utilityStatsDirty = true;
   searchParams = params;
+  updateUtilityBounds();
 }
 
 void Search::setExternalPatternBonusTable(std::unique_ptr<PatternBonusTable>&& table) {
@@ -305,6 +353,7 @@ void Search::clearSearch() {
   }
   clearOldNNOutputs();
   searchNodeAge = 0;
+  utilityStatsDirty = false;
 }
 
 bool Search::isLegalTolerant(Loc moveLoc, Player movePla) const {
@@ -329,11 +378,19 @@ bool Search::makeMove(Loc moveLoc, Player movePla, bool preventEncore) {
   //If the white handicap bonus changes due to the move, we will also need to recompute everything since this is
   //basically like a change to the komi.
   float oldWhiteHandicapBonusScore = rootHistory.whiteHandicapBonusScore;
+  double oldMinUtility = minUtilityForCurrentSearch;
+  double oldMaxUtility = maxUtilityForCurrentSearch;
 
   //Compute these first so we can know if we need to set forceNonTerminal below.
   rootHistory.makeBoardMoveAssumeLegal(rootBoard,moveLoc,rootPla,rootKoHashTable,preventEncore);
   rootPla = getOpp(rootPla);
   rootKoHashTable->recompute(rootHistory);
+  updateUtilityBounds();
+  if(
+    minUtilityForCurrentSearch != oldMinUtility ||
+    maxUtilityForCurrentSearch != oldMaxUtility
+  )
+    utilityStatsDirty = true;
 
   if(rootNode != NULL) {
     SearchNode* child = NULL;
@@ -627,6 +684,21 @@ void Search::beginSearch(bool pondering) {
                       " nnYLen = " + Global::intToString(nnYLen) + " but was asked to search board with larger x or y size");
 
   rootBoard.checkConsistency();
+  validateScoreMaximizingUtility(searchParams,rootHistory);
+  updateUtilityBounds();
+  if(searchParams.useScoreMaximizingUtility) {
+    double lowerScoreBound;
+    double upperScoreBound;
+    ScoreValue::getScoreMaximizingUtilityLegalBounds(rootBoard,rootHistory,lowerScoreBound,upperScoreBound);
+    (void)ScoreValue::expectedScoreMaximizingUtility(
+      0.5 * (lowerScoreBound+upperScoreBound),
+      searchParams.scoreScale,
+      searchParams.scorePower,
+      searchParams.scoreScale,
+      lowerScoreBound,
+      upperScoreBound
+    );
+  }
 
   numSearchesBegun++;
 
@@ -803,9 +875,14 @@ void Search::beginSearch(bool pondering) {
       }
     }
 
-    //Recursively update all stats in the tree if we have dynamic score values
+    //Recursively update all stats in the tree if utility changed or depends on root-level state
     //And also to clear out lastResponseBiasDeltaSum and lastResponseBiasWeight
-    if(searchParams.dynamicScoreUtilityFactor != 0 || searchParams.subtreeValueBiasFactor != 0 || patternBonusTable != NULL) {
+    if(
+      utilityStatsDirty ||
+      (!searchParams.useScoreMaximizingUtility && searchParams.dynamicScoreUtilityFactor != 0) ||
+      searchParams.subtreeValueBiasFactor != 0 ||
+      patternBonusTable != NULL
+    ) {
       recursivelyRecomputeStats(node);
       if(anyFiltered) {
         //Recursive stats recomputation resulted in us marking all nodes we have. Anything filtered is old now, delete it.
@@ -822,6 +899,7 @@ void Search::beginSearch(bool pondering) {
       }
     }
   }
+  utilityStatsDirty = false;
 
   //Clear unused stuff in value bias table since we may have pruned rootNode stuff
   if(searchParams.subtreeValueBiasFactor != 0 && subtreeValueBiasTable != NULL)

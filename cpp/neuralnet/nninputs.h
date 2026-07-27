@@ -254,6 +254,33 @@ namespace ScoreValue {
   //assuming roughly a normal distribution.
   double expectedWhiteScoreValue(double whiteScoreMean, double whiteScoreStdev, double center, double scale, double sqrtBoardArea);
 
+  //Risk-seeking score utility and its deterministic expectation under a normal score distribution.
+  //Samples outside the legal bounds are clamped to the corresponding endpoint.
+  double scoreMaximizingUtility(double whiteScore, double power, double scale);
+  double scoreMaximizingUtilityDerivative(double whiteScore, double power, double scale, double lowerBound, double upperBound);
+  double expectedScoreMaximizingUtility(
+    double whiteScoreMean,
+    double whiteScoreStdev,
+    double power,
+    double scale,
+    double lowerBound,
+    double upperBound
+  );
+  void getScoreMaximizingUtilityTailProbabilities(
+    double whiteScoreMean,
+    double whiteScoreStdev,
+    double lowerBound,
+    double upperBound,
+    double& lowerTailProb,
+    double& upperTailProb
+  );
+  void getScoreMaximizingUtilityLegalBounds(
+    const Board& rootBoard,
+    const BoardHistory& rootHistory,
+    double& lowerBound,
+    double& upperBound
+  );
+
   //Get the standard deviation of score given the E(score) and E(score^2)
   double getScoreStdev(double scoreMeanAvg, double scoreMeanSqAvg);
 }

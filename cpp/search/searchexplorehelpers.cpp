@@ -143,8 +143,10 @@ double Search::getExploreSelectionValueOfChild(
   if(childVirtualLosses > 0) {
     double virtualLossWeight = childVirtualLosses * searchParams.numVirtualLossesPerThread;
 
-    double utilityRadius = searchParams.winLossUtilityFactor + searchParams.staticScoreUtilityFactor + searchParams.dynamicScoreUtilityFactor;
-    double virtualLossUtility = (parent.nextPla == P_WHITE ? -utilityRadius : utilityRadius);
+    double minUtility;
+    double maxUtility;
+    getUtilityBounds(minUtility,maxUtility);
+    double virtualLossUtility = (parent.nextPla == P_WHITE ? minUtility : maxUtility);
     double virtualLossWeightFrac = (double)virtualLossWeight / (virtualLossWeight + std::max(0.25,childWeight));
     childUtility = childUtility + (virtualLossUtility - childUtility) * virtualLossWeightFrac;
     childWeight += virtualLossWeight;
@@ -309,11 +311,13 @@ double Search::getFpuValueForChildrenAssumeVisited(
   {
     double fpuReductionMax = isRoot ? searchParams.rootFpuReductionMax : searchParams.fpuReductionMax;
     double fpuLossProp = isRoot ? searchParams.rootFpuLossProp : searchParams.fpuLossProp;
-    double utilityRadius = searchParams.winLossUtilityFactor + searchParams.staticScoreUtilityFactor + searchParams.dynamicScoreUtilityFactor;
+    double minUtility;
+    double maxUtility;
+    getUtilityBounds(minUtility,maxUtility);
 
     double reduction = fpuReductionMax * sqrt(policyProbMassVisited);
     fpuValue = pla == P_WHITE ? parentUtilityForFPU - reduction : parentUtilityForFPU + reduction;
-    double lossValue = pla == P_WHITE ? -utilityRadius : utilityRadius;
+    double lossValue = pla == P_WHITE ? minUtility : maxUtility;
     fpuValue = fpuValue + (lossValue - fpuValue) * fpuLossProp;
   }
 

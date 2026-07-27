@@ -14,6 +14,10 @@ SearchParams::SearchParams()
   :winLossUtilityFactor(1.0),
    staticScoreUtilityFactor(0.3),
    dynamicScoreUtilityFactor(0.0),
+   useScoreMaximizingUtility(false),
+   scorePower(1.5),
+   scoreScale(20.0),
+   winWeight(2.0),
    dynamicScoreCenterZeroWeight(0.0),
    dynamicScoreCenterScale(1.0),
    noResultUtilityForWhite(0.0),
@@ -128,6 +132,10 @@ bool SearchParams::operator==(const SearchParams& other) const {
     winLossUtilityFactor == other.winLossUtilityFactor &&
     staticScoreUtilityFactor == other.staticScoreUtilityFactor &&
     dynamicScoreUtilityFactor == other.dynamicScoreUtilityFactor &&
+    useScoreMaximizingUtility == other.useScoreMaximizingUtility &&
+    scorePower == other.scorePower &&
+    scoreScale == other.scoreScale &&
+    winWeight == other.winWeight &&
     dynamicScoreCenterZeroWeight == other.dynamicScoreCenterZeroWeight &&
     dynamicScoreCenterScale == other.dynamicScoreCenterScale &&
     noResultUtilityForWhite == other.noResultUtilityForWhite &&
@@ -382,6 +390,10 @@ json SearchParams::changeableParametersToJson() const {
   ret["winLossUtilityFactor"] = winLossUtilityFactor;
   ret["staticScoreUtilityFactor"] = staticScoreUtilityFactor;
   ret["dynamicScoreUtilityFactor"] = dynamicScoreUtilityFactor;
+  ret["useScoreMaximizingUtility"] = useScoreMaximizingUtility;
+  ret["scorePower"] = scorePower;
+  ret["scoreScale"] = scoreScale;
+  ret["winWeight"] = winWeight;
   ret["dynamicScoreCenterZeroWeight"] = dynamicScoreCenterZeroWeight;
   ret["dynamicScoreCenterScale"] = dynamicScoreCenterScale;
   ret["noResultUtilityForWhite"] = noResultUtilityForWhite;
@@ -561,6 +573,10 @@ void SearchParams::printParams(std::ostream& out) const {
   PRINTPARAM(winLossUtilityFactor);
   PRINTPARAM(staticScoreUtilityFactor);
   PRINTPARAM(dynamicScoreUtilityFactor);
+  PRINTPARAM(useScoreMaximizingUtility);
+  PRINTPARAM(scorePower);
+  PRINTPARAM(scoreScale);
+  PRINTPARAM(winWeight);
   PRINTPARAM(dynamicScoreCenterZeroWeight);
   PRINTPARAM(dynamicScoreCenterScale);
   PRINTPARAM(noResultUtilityForWhite);
