@@ -115,6 +115,83 @@ function exportStuff() {
 
 function exportGatedStuffHardened() {
     FROMDIR="$1"
+    if [ -n "${KATAGO_PROMOTION_BACKPRESSURE_FILE:-}" ]
+    then
+        if [ -z "${KATAGO_PROMOTION_POLICY_HASH:-}" ]
+        then
+            echo "KATAGO_PROMOTION_POLICY_HASH is required with KATAGO_PROMOTION_BACKPRESSURE_FILE." >&2
+            return 1
+        fi
+        BACKPRESSURE_MAX_AGE="${KATAGO_PROMOTION_BACKPRESSURE_MAX_AGE_SECONDS:-120}"
+        if ! BACKPRESSURE_STATUS="$("$PYTHON" - \
+            "$KATAGO_PROMOTION_BACKPRESSURE_FILE" \
+            "$KATAGO_PROMOTION_POLICY_HASH" \
+            "$BACKPRESSURE_MAX_AGE" <<'PY'
+import datetime
+import json
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+expected_policy_hash = sys.argv[2]
+try:
+    maximum_age = float(sys.argv[3])
+except ValueError as exc:
+    raise SystemExit(f"invalid backpressure maximum age: {exc}")
+if maximum_age <= 0:
+    raise SystemExit("backpressure maximum age must be positive")
+if not re.fullmatch(r"[0-9a-f]{64}", expected_policy_hash):
+    raise SystemExit("promotion policy hash must be lowercase SHA-256")
+if path.is_symlink() or not path.is_file():
+    raise SystemExit(f"backpressure status is not a regular file: {path}")
+data = path.read_bytes()
+try:
+    value = json.loads(data)
+except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"invalid backpressure JSON: {exc}")
+canonical = (
+    json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    + "\n"
+).encode("utf-8")
+if data != canonical:
+    raise SystemExit("backpressure status is not canonical JSON")
+if (
+    not isinstance(value, dict)
+    or value.get("schema_version") != 1
+    or value.get("policy_hash") != expected_policy_hash
+    or type(value.get("allowExport")) is not bool
+):
+    raise SystemExit("backpressure status binding is invalid")
+timestamp = value.get("updated_at_utc")
+if not isinstance(timestamp, str):
+    raise SystemExit("backpressure status has no update timestamp")
+try:
+    updated = datetime.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+except ValueError as exc:
+    raise SystemExit(f"invalid backpressure timestamp: {exc}")
+now = datetime.datetime.now(datetime.timezone.utc)
+age = (now - updated).total_seconds()
+if age < -5 or age > maximum_age:
+    raise SystemExit(f"backpressure status is stale or future-dated: age={age:.3f}s")
+print("ALLOW" if value["allowExport"] else "PAUSE")
+PY
+        )"
+        then
+            echo "Cannot verify promotion export backpressure; failing closed." >&2
+            return 1
+        fi
+        if [ "$BACKPRESSURE_STATUS" = "PAUSE" ]
+        then
+            echo "Promotion export paused by controller backpressure."
+            return 0
+        fi
+        if [ "$BACKPRESSURE_STATUS" != "ALLOW" ]
+        then
+            echo "Unknown promotion export backpressure status: $BACKPRESSURE_STATUS" >&2
+            return 1
+        fi
+    fi
     HARDENED_EXPORTER="${KATAGO_HARDENED_EXPORTER:-$(dirname "$0")/../risk_score/hardened_exporter.py}"
     if [ ! -f "$HARDENED_EXPORTER" ]
     then

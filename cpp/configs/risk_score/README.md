@@ -138,6 +138,11 @@ powered-utility and predicted-score differences between the selected moves.
 
 ## Checkpoint promotion
 
+New promotion evaluation uses the immutable v2 policy while v1 remains
+available only for replaying historical evidence. V2 publishes separate
+cumulative look-1/look-2 schedule artifacts and requires one independent
+position cluster per risk-bearing pair.
+
 Promotion evaluation uses:
 
 - `promotion_powered_match.cfg`, where candidate and reference both use power
@@ -153,7 +158,13 @@ after every shard validates:
 ```sh
 cd python
 python3 -m risk_score.evaluation_runner --help
+python3 -m risk_score.promotion_evaluator --help
+python3 -m risk_score.promotion_evidence --help
 ```
+
+The promotion evaluator executes the exact manifest-bound cells; the evidence
+assembler then binds finalized runner output to paired statistics and the
+five-cell gate. An external PASS marker is not promotion evidence.
 
 `promotion_selfplay_worker_19x19.cfg` is the generation-pinned one-GPU
 self-play template. Launch seven separate workers through the promotion

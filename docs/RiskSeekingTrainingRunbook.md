@@ -935,6 +935,9 @@ the live `models` directory. Do not start the stock win-rate-only gatekeeper.
 export NAME_PREFIX="$RUN_ID"
 export KATAGO_MODEL_PROBE_COMMAND_JSON='SET_ME'
 test "$KATAGO_MODEL_PROBE_COMMAND_JSON" != SET_ME
+export KATAGO_PROMOTION_BACKPRESSURE_FILE="$TRAIN_BASE/promotion/operations/backpressure.json"
+export KATAGO_PROMOTION_POLICY_HASH="8562bcd7b835ae0cfcfe517a290748258da229b3fcf588dc99b3703c2b8f6023"
+export KATAGO_PROMOTION_BACKPRESSURE_MAX_AGE_SECONDS=120
 
 set +m
 setsid bash -c '
@@ -955,47 +958,50 @@ Set `KATAGO_MODEL_PROBE_COMMAND_JSON` to a reviewed JSON argv array that loads
 `{model_file}` with the production CUDA binary and checks finite output. The
 hardened gated exporter publishes through a unique `.partial` directory,
 places completed candidates in `modelstobetested`, and archives the intact
-source under `torchmodels_exported`.
+source under `torchmodels_exported`. The controller backpressure file pauses
+new gated exports when the evaluation queue is full; stale or malformed status
+fails closed.
 
-### 5. Evaluation and manual promotion
+### 5. Evaluation and controller promotion
 
 For every important candidate:
 
-1. stop or pause the process using the evaluation GPU;
+1. yield GPU 7 through the exclusive trainer/evaluator lease;
 2. hash the candidate directory;
-3. run the frozen deterministic ordinary, lead, search-scaling, and
+3. run the frozen v2 look-specific ordinary, Lead, tactical, and
    exploitability suites;
 4. compare against the original b40 and the current accepted champion;
-5. produce the multi-metric promotion report; and
-6. record an explicit accept or reject decision.
+5. execute the manifest-bound matrix with `risk_score.promotion_evaluator`,
+   which finalizes paired statistics through `risk_score.promotion_evidence`;
+   and
+6. let the versioned gate record PASS, FAIL, or a prespecified continuation.
 
 Required report fields include realized custom utility, score mean/median and
 tails, win rate, every catastrophic-loss definition, utility decomposition,
 endpoint-tail contribution, tactical stability, and exploitability results.
-Win rate alone is insufficient.
-
-On acceptance, pre-create self-play output directories and atomically rename the
-candidate directory on the same filesystem, matching the stock gatekeeper's
-safe move semantics:
-
-**TEMPLATE — NOT YET HOST-VERIFIED**
+Win rate alone is insufficient. Start with mutation disabled:
 
 ```bash
-export CANDIDATE_NAME='<exact candidate directory name>'
-export CANDIDATE_DIR="$TRAIN_BASE/modelstobetested/$CANDIDATE_NAME"
-test -d "$CANDIDATE_DIR"
-test -f "$CANDIDATE_DIR/model.bin.gz"
-test ! -e "$TRAIN_BASE/models/$CANDIDATE_NAME"
-mkdir -p "$TRAIN_BASE/selfplay/$CANDIDATE_NAME"/{sgfs,tdata,vadata}
-mv "$CANDIDATE_DIR" "$TRAIN_BASE/models/$CANDIDATE_NAME"
+cd "$REPO/python"
+python3 -m risk_score.promotion_controller \
+  --runtime-config "$RUN_DIR/configs/promotion-runtime.json" \
+  --mode reconcile \
+  --recommend-only
+python3 -m risk_score.promotion_controller \
+  --runtime-config "$RUN_DIR/configs/promotion-runtime.json" \
+  --mode once \
+  --recommend-only
 ```
 
-Do not copy a model file gradually into `models`: self-play scans recursively
-and selects the newest model file by modification time. A same-filesystem
-directory rename prevents it from seeing a partial candidate.
+Do not promote into the monolithic mtime-selected self-play process. Before
+enabling mutation, migrate to seven generation-pinned workers, complete the
+canary and rollback drills, and satisfy every repository-closure and live
+validation item in `RiskSeekingCheckpointPromotionPlan.md`.
 
-Rejected candidates are moved to a uniquely named directory under
-`rejectedmodels` only after their report and hashes are complete.
+The controller performs the accepted-model move, canary quarantine, worker
+acknowledgements, champion compare-and-swap, admission, and rollback
+transactions. Never manually copy a model into the live model directory or
+touch an old file to influence mtime.
 
 ## Monitoring
 

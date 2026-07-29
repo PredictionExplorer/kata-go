@@ -2,12 +2,35 @@ name: Build and Test
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, main ]
   pull_request:
-    branches: [ master ]
+    branches: [ master, main ]
   workflow_dispatch:
 
 jobs:
+  test-python:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install test dependency
+      run: python -m pip install pytest
+
+    - name: Run Python tests
+      working-directory: python
+      env:
+        PYTHONPATH: .
+      run: python -m pytest -p no:cacheprovider -c /dev/null tests -q
+
   build-linux:
     runs-on: ubuntu-latest
     permissions:

@@ -1,0 +1,285 @@
+{
+  "schema_version": 2,
+  "policy_version": "risk-seeking-checkpoint-promotion-v2",
+  "status": "frozen",
+  "supersedes": {
+    "policy_version": "risk-seeking-checkpoint-promotion-v1",
+    "policy_hash": "d3578dfdf99e4aace0461310b7225c1d42051fc4e87770e22d89b8545645d324"
+  },
+  "frozen_plan": {
+    "document": "docs/RiskSeekingCheckpointPromotionPlan.md",
+    "plan_date": "2026-07-28",
+    "source_revision": "a51c32967fdfb246923aebf12801812504cfbd40"
+  },
+  "objective": {
+    "name": "candidate_realized_powered_terminal_utility",
+    "candidate_perspective_outcomes": {
+      "win": 1.0,
+      "draw": 0.0,
+      "loss": -1.0,
+      "true_no_result": 0.0
+    },
+    "ordinary_win_score": {
+      "win": 1.0,
+      "draw": 0.5,
+      "loss": 0.0,
+      "true_no_result": 0.5
+    },
+    "win_weight": 4.0,
+    "score_power": 1.5,
+    "score_scale": 20.0,
+    "missing_numeric_score_term": 0.0,
+    "color_pair_aggregation": "arithmetic_mean_of_two_games",
+    "repeated_pair_aggregation": "arithmetic_mean_within_position_id"
+  },
+  "evaluation_stages": {
+    "stage_0_integrity_and_fixed_probes": {
+      "fixed_analysis_positions": 256,
+      "fixed_analysis_visits": 200,
+      "exploitability_sentinel_positions": 16,
+      "exploitability_sentinel_visits": 2000,
+      "required_checks": [
+        "architecture_compatibility",
+        "checkpoint_hash",
+        "cuda_load",
+        "endpoint_tail",
+        "finite_outputs",
+        "legal_bounds",
+        "model_hash",
+        "perspective",
+        "policy_distance",
+        "utility_decomposition"
+      ]
+    },
+    "stage_1_cheap_paired_screen": {
+      "ordinary_color_pairs": 32,
+      "visits": 400,
+      "maximum_evaluator_processes": 8,
+      "discovery_only": true,
+      "utility_futility_upper_bound": 0.0
+    },
+    "stage_2_finalist_selection": {
+      "ordinary_color_pairs": 128,
+      "ordinary_visits": 800,
+      "lead_40_color_pairs": 32,
+      "lead_80_color_pairs": 32,
+      "lead_visits": 800,
+      "maximum_survivors": 4,
+      "utility_tie_width": 0.1,
+      "confirmation_candidates": 1,
+      "independent_discovery_schedule": true
+    },
+    "stage_3_promotion_confirmation": {
+      "powered_visits": 2000,
+      "standard_visits": 800,
+      "full_move_diagnostics": true,
+      "look_data_relationship": "cumulative_prefix",
+      "independent_position_cluster_semantics": "one_color_pair_per_independent_position_cluster",
+      "color_pairs_per_independent_position_cluster": 1,
+      "looks": [
+        {
+          "look_number": 1,
+          "powered_ordinary_color_pairs_per_matchup": 512,
+          "standard_ordinary_color_pairs": 128,
+          "lead_40_color_pairs": 512,
+          "lead_80_color_pairs": 1024,
+          "minimum_independent_position_clusters": {
+            "powered_candidate_vs_champion": 512,
+            "powered_candidate_vs_original": 512,
+            "standard_candidate_vs_original": 128,
+            "lead_40": 512,
+            "lead_80": 1024
+          }
+        },
+        {
+          "look_number": 2,
+          "powered_ordinary_color_pairs_per_matchup": 1024,
+          "standard_ordinary_color_pairs": 128,
+          "lead_40_color_pairs": 1024,
+          "lead_80_color_pairs": 2048,
+          "minimum_independent_position_clusters": {
+            "powered_candidate_vs_champion": 1024,
+            "powered_candidate_vs_original": 1024,
+            "standard_candidate_vs_original": 128,
+            "lead_40": 1024,
+            "lead_80": 2048
+          }
+        }
+      ],
+      "powered_matchups": [
+        "candidate_vs_current_champion",
+        "candidate_vs_immutable_original"
+      ],
+      "standard_matchups": [
+        "candidate_vs_immutable_original"
+      ],
+      "low_conditional_power_stop_threshold": 0.1
+    },
+    "deep_audit": {
+      "promotion_interval": 5,
+      "ordinary_color_pairs": 1024,
+      "lead_40_color_pairs": 256,
+      "lead_80_color_pairs": 256,
+      "exploitability_positions": 128,
+      "visits": [
+        2000,
+        8000
+      ],
+      "controls": [
+        "candidate",
+        "champion",
+        "original",
+        "b28"
+      ],
+      "asynchronous": true,
+      "can_trigger_rollback": true
+    }
+  },
+  "confidence": {
+    "routine": {
+      "nominal_one_sided_confidence": 0.95,
+      "family_one_sided_alpha": 0.05
+    },
+    "catastrophe": {
+      "nominal_one_sided_confidence": 0.99,
+      "family_one_sided_alpha": 0.01
+    },
+    "small_cluster_correction": {
+      "name": "CR1_BESSEL_WITH_STUDENT_T",
+      "variance_multiplier": "G/(G-1)",
+      "degrees_of_freedom": "G-1",
+      "minimum_position_clusters": 2
+    },
+    "sequential_testing": {
+      "look_count": 2,
+      "allocation_method": "prespecified_bonferroni_alpha_spending",
+      "looks": [
+        {
+          "look_number": 1,
+          "routine_one_sided_alpha": 0.01,
+          "catastrophe_one_sided_alpha": 0.002
+        },
+        {
+          "look_number": 2,
+          "routine_one_sided_alpha": 0.04,
+          "catastrophe_one_sided_alpha": 0.008
+        }
+      ],
+      "intersection_union_all_hard_gates": true,
+      "data_dependent_thresholds_allowed": false
+    }
+  },
+  "bootstrap": {
+    "method": "stratified_wild_position_cluster_rademacher_centered_within_declared_strata",
+    "weights": "rademacher",
+    "replications": 9999,
+    "seed": 20260728,
+    "strata": [
+      "schedule_id",
+      "suite"
+    ],
+    "centering": "within_each_declared_stratum",
+    "report_as_sensitivity": true,
+    "zero_event_upper_bound": "one_sided_exact_no_event_bound_using_independent_position_clusters"
+  },
+  "promotion_thresholds": {
+    "powered_utility_vs_champion_lower_bound_strictly_above": 0.0,
+    "powered_utility_vs_original_lower_bound_strictly_above": 0.0,
+    "combined_lead_utility_lower_bound_strictly_above": -0.05,
+    "powered_win_rate_vs_champion_lower_bound_strictly_above": 0.47,
+    "powered_win_rate_vs_original_lower_bound_strictly_above": 0.47,
+    "standard_win_rate_vs_original_lower_bound_strictly_above": 0.45,
+    "candidate_minus_reference_risk_upper_bounds": {
+      "final_20": 0.02,
+      "final_50": 0.01,
+      "high_confidence_loss": 0.005,
+      "lead_40_loss": 0.005,
+      "lead_80_loss": 0.0025,
+      "targeted_lead_40_suite_loss": 0.03,
+      "targeted_lead_80_suite_loss": 0.02
+    },
+    "true_no_result_rate_strictly_below": 0.001,
+    "high_confidence_win_probability": 0.95,
+    "final_margin_threshold_points": [
+      20.0,
+      50.0
+    ],
+    "lead_threshold_points": [
+      40.0,
+      80.0
+    ]
+  },
+  "required_confirmation_matrix": {
+    "powered_candidate_vs_champion": {
+      "search_mode": "powered",
+      "reference": "champion"
+    },
+    "powered_candidate_vs_original": {
+      "search_mode": "powered",
+      "reference": "original"
+    },
+    "standard_candidate_vs_original": {
+      "search_mode": "standard",
+      "reference": "original"
+    },
+    "lead_40": {
+      "search_mode": "powered",
+      "reference": "champion",
+      "suite": "lead-40"
+    },
+    "lead_80": {
+      "search_mode": "powered",
+      "reference": "champion",
+      "suite": "lead-80"
+    }
+  },
+  "attempt_budget": {
+    "maximum_confirmation_attempts_per_generation": 2,
+    "maximum_promotions_per_generation": 1,
+    "fallback_requires_new_holdout_block": true,
+    "fallback_requires_new_alpha_allocation": true
+  },
+  "queue": {
+    "screen_interval_new_training_samples": 500000,
+    "confirmation_interval_new_training_samples": 1000000,
+    "maximum_active_evaluator_entries": 3,
+    "important_queue_warning_depth": 4,
+    "prepromotion_maximum_finalists": 4,
+    "coalesce_newer_before_screening": true,
+    "never_replace_started_candidate": true,
+    "projected_growth_warning_hours": 72
+  },
+  "retention": {
+    "evaluated_anchor_count": 5,
+    "trash_grace_period_days": 30,
+    "minimum_free_space_fraction": 0.1,
+    "minimum_free_space_growth_reserve_hours": 24,
+    "retain_immutable_original": true,
+    "retain_current_champion": true,
+    "retain_previous_champion": true,
+    "retain_rollback_trainer_checkpoint": true,
+    "retain_finalized_reports": true,
+    "retain_frozen_inputs": true,
+    "reference_aware_deletion": true
+  },
+  "rollout": {
+    "worker_count": 7,
+    "canary_workers": 1,
+    "canary_games": 2000,
+    "canary_fresh_audit_color_pairs": 1024,
+    "intermediate_workers": 3,
+    "full_workers": 7,
+    "games_per_worker_initial_threads": 100,
+    "switch_networks_mid_game": false,
+    "quarantine_canary_data_until_commit": true,
+    "worker_acknowledgement_timeout_seconds": 60,
+    "required_checks": [
+      "behavior",
+      "crash_error_rate",
+      "game_purity",
+      "model_identity",
+      "output_schema",
+      "throughput"
+    ]
+  }
+}

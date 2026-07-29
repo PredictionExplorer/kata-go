@@ -34,11 +34,16 @@ from risk_score.evaluation_runner import (
     canonical_sha256,
     file_sha256,
     load_schedule,
+    resolve_manifest_cell,
     shard_schedule,
     validate_move_jsonl,
     validate_result_jsonl,
 )
 from risk_score.generate_schedule import build_schedule, write_schedule
+
+LEGACY_POLICY_PATH = (
+    Path(__file__).parents[1] / "risk_score" / "promotion_policy_v1.json"
+)
 
 
 def position(index, label="ordinary"):
@@ -59,6 +64,68 @@ def write_labeled_positions(path, rows):
     path.write_text(
         "".join(suite_canonical_json(row) + "\n" for row in rows),
         encoding="utf-8",
+    )
+
+
+def write_small_v2_policy(path):
+    policy = json.loads(DEFAULT_POLICY_PATH.read_text(encoding="utf-8"))
+    policy["policy_version"] = "risk-seeking-checkpoint-promotion-v2-test"
+    stages = policy["evaluation_stages"]
+    stages["stage_1_cheap_paired_screen"]["ordinary_color_pairs"] = 1
+    stages["stage_2_finalist_selection"].update(
+        {
+            "ordinary_color_pairs": 2,
+            "lead_40_color_pairs": 1,
+            "lead_80_color_pairs": 1,
+        }
+    )
+    stages["deep_audit"].update(
+        {
+            "ordinary_color_pairs": 1,
+            "lead_40_color_pairs": 1,
+            "lead_80_color_pairs": 1,
+        }
+    )
+    quotas = (
+        {
+            "powered_candidate_vs_champion": 2,
+            "powered_candidate_vs_original": 2,
+            "standard_candidate_vs_original": 1,
+            "lead_40": 2,
+            "lead_80": 2,
+        },
+        {
+            "powered_candidate_vs_champion": 3,
+            "powered_candidate_vs_original": 3,
+            "standard_candidate_vs_original": 1,
+            "lead_40": 3,
+            "lead_80": 4,
+        },
+    )
+    for look, values in zip(stages["stage_3_promotion_confirmation"]["looks"], quotas):
+        look.update(
+            {
+                "powered_ordinary_color_pairs_per_matchup": values[
+                    "powered_candidate_vs_champion"
+                ],
+                "standard_ordinary_color_pairs": values[
+                    "standard_candidate_vs_original"
+                ],
+                "lead_40_color_pairs": values["lead_40"],
+                "lead_80_color_pairs": values["lead_80"],
+                "minimum_independent_position_clusters": dict(values),
+            }
+        )
+    path.write_text(suite_canonical_json(policy) + "\n", encoding="utf-8")
+    return policy
+
+
+def small_v2_suite_sources():
+    return (
+        [position(index, "ordinary") for index in range(6)]
+        + [position(100 + index, "lead-40") for index in range(5)]
+        + [position(200 + index, "lead-80") for index in range(6)]
+        + [position(300, "tactical"), position(301, "exploitability")]
     )
 
 
@@ -116,6 +183,8 @@ def moves_for(row, result):
                 "player": player,
                 "bot": result["blackBot"] if player == "B" else result["whiteBot"],
                 "move": "D4" if offset == 0 else "Q16",
+                "scoreLead": 0.0,
+                "winProbability": 0.5,
             }
         )
     return rows
@@ -243,6 +312,8 @@ class FakeMatchRunner:
                     moves[0] = dict(moves[0], player="W")
                 elif behavior == "wrong-move-bot":
                     moves[0] = dict(moves[0], bot="not-the-color-bot")
+                elif behavior == "missing-diagnostics":
+                    moves[0].pop("scoreLead")
                 write_jsonl(move_path, moves)
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         finally:
@@ -528,7 +599,13 @@ def test_malformed_result_output_is_retried(tmp_path, bad_output):
 
 @pytest.mark.parametrize(
     "bad_trace",
-    ["duplicate-move", "truncated-move", "wrong-player", "wrong-move-bot"],
+    [
+        "duplicate-move",
+        "truncated-move",
+        "wrong-player",
+        "wrong-move-bot",
+        "missing-diagnostics",
+    ],
 )
 def test_invalid_move_trace_is_retried(tmp_path, bad_trace):
     files = evaluation_files(tmp_path, pair_count=2)
@@ -549,7 +626,7 @@ def test_invalid_move_trace_is_retried(tmp_path, bad_trace):
     assert len(validate_move_jsonl(outcome.move_path, files["rows"], results)) == 8
 
 
-def test_incomplete_shards_never_publish_final_output(tmp_path):
+def test_evaluator_death_mid_pair_never_publishes_final_output(tmp_path):
     files = evaluation_files(tmp_path, pair_count=2)
     fake = FakeMatchRunner(["truncated", "truncated"])
     runner = make_runner(files, fake, shard_count=1, max_parallel=1, max_attempts=2)
@@ -721,22 +798,21 @@ def test_suite_splits_and_manifests_are_deterministic(tmp_path):
         tmp_path / "suites-a",
         seed="frozen-seed",
         pairs_per_position=2,
+        policy_path=LEGACY_POLICY_PATH,
     )
     second = build_evaluation_suites(
         [source],
         tmp_path / "suites-b",
         seed="frozen-seed",
         pairs_per_position=2,
+        policy_path=LEGACY_POLICY_PATH,
     )
     assert first.manifest == second.manifest
     assert first.manifest_sha256 == second.manifest_sha256
     assert first.manifest["sources"][0]["sha256"] == file_sha256(source)
-    policy = json.loads(DEFAULT_POLICY_PATH.read_text(encoding="utf-8"))
+    policy = json.loads(LEGACY_POLICY_PATH.read_text(encoding="utf-8"))
     assert first.manifest["policy_hash"] == suite_canonical_sha256(policy)
-    assert (
-        first.manifest["source_revision"]
-        == policy["frozen_plan"]["source_revision"]
-    )
+    assert first.manifest["source_revision"] == policy["frozen_plan"]["source_revision"]
 
     banks = {bank["name"]: bank for bank in first.manifest["banks"]}
     ordinary_hash_sets = [set(banks[name]["contentSha256s"]) for name in ORDINARY_BANKS]
@@ -785,6 +861,7 @@ def test_suite_splits_and_manifests_are_deterministic(tmp_path):
         first.output_dir,
         seed="frozen-seed",
         pairs_per_position=2,
+        policy_path=LEGACY_POLICY_PATH,
     )
     assert reused.reused is True
     with pytest.raises(FileExistsError, match="contradictory manifest"):
@@ -793,6 +870,7 @@ def test_suite_splits_and_manifests_are_deterministic(tmp_path):
             first.output_dir,
             seed="different-seed",
             pairs_per_position=2,
+            policy_path=LEGACY_POLICY_PATH,
         )
 
 
@@ -800,7 +878,10 @@ def test_runner_binds_suite_manifest_bank_and_schedule_metadata(tmp_path):
     source = tmp_path / "labeled.jsonl"
     write_labeled_positions(source, [position(index) for index in range(6)])
     suites = build_evaluation_suites(
-        [source], tmp_path / "suites", seed="confirmation-seed"
+        [source],
+        tmp_path / "suites",
+        seed="confirmation-seed",
+        policy_path=LEGACY_POLICY_PATH,
     )
     bank = next(
         bank for bank in suites.manifest["banks"] if bank["name"] == "confirmation"
@@ -854,6 +935,7 @@ def test_suite_builder_records_explicit_exclusions(tmp_path):
         tmp_path / "suites",
         seed="seed",
         exclude_content_hashes=[excluded_hash],
+        policy_path=LEGACY_POLICY_PATH,
     )
     assert result.manifest["includedRowCount"] == len(rows) - 1
     assert result.manifest["exclusions"] == [
@@ -906,3 +988,193 @@ def test_suite_builder_rejects_semantic_holdout_leakage(tmp_path):
             tmp_path / "leaky-suites",
             seed="seed",
         )
+
+
+def test_v2_policy_builds_exact_disjoint_holdouts_and_cumulative_prefixes(tmp_path):
+    policy_path = tmp_path / "policy-v2-test.json"
+    policy = write_small_v2_policy(policy_path)
+    source = tmp_path / "labeled.jsonl"
+    write_labeled_positions(source, small_v2_suite_sources())
+
+    first = build_evaluation_suites(
+        [source],
+        tmp_path / "suites-a",
+        seed="exact-v2-seed",
+        policy_path=policy_path,
+    )
+    second = build_evaluation_suites(
+        [source],
+        tmp_path / "suites-b",
+        seed="exact-v2-seed",
+        policy_path=policy_path,
+    )
+    assert first.manifest == second.manifest
+    assert first.manifest["policy_hash"] == suite_canonical_sha256(policy)
+    assert first.manifest["exactPolicyQuotas"] is True
+    assert len(first.manifest["cells"]) == 10
+
+    banks = {bank["qualifiedName"]: bank for bank in first.manifest["banks"]}
+    for label in ("ordinary", "lead-40", "lead-80"):
+        names = (
+            ORDINARY_BANKS
+            if label == "ordinary"
+            else tuple(f"{label}-{holdout}" for holdout in ORDINARY_BANKS)
+        )
+        semantic_sets = [set(banks[name]["semanticSha256s"]) for name in names]
+        assert all(semantic_sets)
+        assert not semantic_sets[0].intersection(semantic_sets[1])
+        assert not semantic_sets[0].intersection(semantic_sets[2])
+        assert not semantic_sets[1].intersection(semantic_sets[2])
+
+    for cell_name in (
+        "powered_candidate_vs_champion",
+        "lead_40",
+        "lead_80",
+    ):
+        comparison = next(
+            cell["comparison"]
+            for cell in first.manifest["cells"]
+            if cell["cell_name"] == cell_name
+        )
+        suite = (
+            "confirmation"
+            if cell_name == "powered_candidate_vs_champion"
+            else cell_name.replace("_", "-")
+        )
+        look_1 = resolve_manifest_cell(
+            first.manifest,
+            stage="stage-3",
+            look="look-1",
+            comparison=comparison,
+            suite=suite,
+        )
+        look_2 = resolve_manifest_cell(
+            first.manifest,
+            stage="stage-3",
+            look="look-2",
+            comparison=comparison,
+            suite=suite,
+        )
+        look_1_data = (first.output_dir / look_1["schedule_path"]).read_bytes()
+        look_2_data = (first.output_dir / look_2["schedule_path"]).read_bytes()
+        assert look_2_data.startswith(look_1_data)
+        assert look_1["schedule_id"] == look_2["schedule_id"]
+        assert (
+            look_1["independent_cluster_ids"]
+            == look_2["independent_cluster_ids"][: look_1["color_pairs"]]
+        )
+        assert look_1["color_pairs"] == len(look_1["independent_cluster_ids"])
+
+
+def test_v2_policy_rejects_insufficient_independent_positions(tmp_path):
+    policy_path = tmp_path / "policy-v2-test.json"
+    write_small_v2_policy(policy_path)
+    source = tmp_path / "labeled.jsonl"
+    rows = small_v2_suite_sources()
+    write_labeled_positions(
+        source,
+        [row for row in rows if row["metadata"] != "lead-80"][:],
+    )
+    with pytest.raises(ValueError, match="insufficient independent lead-80"):
+        build_evaluation_suites(
+            [source],
+            tmp_path / "suites",
+            seed="too-small",
+            policy_path=policy_path,
+        )
+
+
+def test_manifest_cell_resolution_and_cluster_hash_tamper_detection(tmp_path):
+    policy_path = tmp_path / "policy-v2-test.json"
+    write_small_v2_policy(policy_path)
+    source = tmp_path / "labeled.jsonl"
+    write_labeled_positions(source, small_v2_suite_sources())
+    suites = build_evaluation_suites(
+        [source], tmp_path / "suites", seed="resolve", policy_path=policy_path
+    )
+    cell = resolve_manifest_cell(
+        suites.manifest,
+        stage="stage-3",
+        look="look-1",
+        comparison="candidate-vs-champion-powered",
+        suite="confirmation",
+    )
+    assert cell["color_pairs"] == 2
+    assert (
+        file_sha256(suites.output_dir / cell["schedule_path"]) == cell["schedule_hash"]
+    )
+
+    tampered = json.loads(suite_canonical_json(suites.manifest))
+    target = next(
+        item for item in tampered["cells"] if item["cell_id"] == cell["cell_id"]
+    )
+    target["independent_cluster_ids_hash"] = "0" * 64
+    payload = dict(tampered)
+    payload.pop("manifestPayloadSha256")
+    tampered["manifestPayloadSha256"] = suite_canonical_sha256(payload)
+    with pytest.raises(EvaluationValidationError, match="cell_id|cluster_ids_hash"):
+        resolve_manifest_cell(
+            tampered,
+            stage="stage-3",
+            look="look-1",
+            comparison="candidate-vs-champion-powered",
+            suite="confirmation",
+        )
+
+
+def test_runner_resolves_exact_manifest_cell_and_records_provenance(tmp_path):
+    policy_path = tmp_path / "policy-v2-test.json"
+    policy = write_small_v2_policy(policy_path)
+    source = tmp_path / "labeled.jsonl"
+    write_labeled_positions(source, small_v2_suite_sources())
+    suites = build_evaluation_suites(
+        [source], tmp_path / "suites", seed="runner-cell", policy_path=policy_path
+    )
+    cell = resolve_manifest_cell(
+        suites.manifest,
+        stage="stage-3",
+        look="look-1",
+        comparison="candidate-vs-champion-powered",
+        suite="confirmation",
+    )
+
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    files = evaluation_files(inputs, pair_count=1)
+    files["policy"] = policy_path
+    files["schedule"] = suites.output_dir / cell["schedule_path"]
+    files["rows"] = load_schedule(files["schedule"])
+    files["suite_manifest"] = suites.manifest_path
+    files["spec"] = EvaluationSpec(
+        candidate_model_sha=file_sha256(files["candidate"]),
+        reference_model_sha=file_sha256(files["reference"]),
+        original_model_sha=file_sha256(files["original"]),
+        config_sha=file_sha256(files["config"]),
+        schedule_sha=cell["schedule_hash"],
+        policy_sha=suite_canonical_sha256(policy),
+        comparison=cell["comparison"],
+        suite=cell["suite"],
+        stage=cell["stage"],
+        look=cell["look"],
+        topology="2-processes",
+        suite_manifest_sha=suites.manifest_sha256,
+        suite_bank_sha=cell["bank_hash"],
+        schedule_id=cell["schedule_id"],
+    )
+    outcome = run_runner(
+        make_runner(
+            files,
+            FakeMatchRunner(),
+            include_move_traces=True,
+            shard_count=1,
+            max_parallel=1,
+        ),
+        files,
+    )
+    manifest = json.loads(outcome.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["schedule"]["manifestCell"] == cell
+    assert manifest["schedule"]["manifestCellSha256"] == canonical_sha256(cell)
+    results = validate_result_jsonl(outcome.result_path, files["rows"])
+    assert [results[index]["independentClusterId"] for index in range(0, 4, 2)] == cell[
+        "independent_cluster_ids"
+    ]

@@ -5,9 +5,13 @@ import math
 import pytest
 
 from risk_score.paired_stats import (
+    DEFAULT_POLICY_PATH,
     MatchValidationError,
+    V1_POLICY_PATH,
+    V2_POLICY_PATH,
     canonical_sha256,
     compute_paired_statistics,
+    exact_zero_event_upper_bound,
     finalize_statistics_artifact,
     load_policy,
     realized_utility,
@@ -158,6 +162,31 @@ def test_pair_then_position_averaging_does_not_double_pair_utility():
     assert metric["color_pairs"] == 3
     assert metric["position_clusters"] == 2
     assert report["aggregation_order"][0] == "game_to_color_pair_arithmetic_mean"
+
+
+def test_repeated_pairs_do_not_increase_exact_zero_event_cluster_count():
+    rows = []
+    rows += pair("a-1", "position-a")
+    rows += pair("a-2", "position-a")
+    rows += pair("b-1", "position-b")
+
+    report = compute_paired_statistics(
+        rows,
+        candidate_bot=CANDIDATE,
+        bootstrap_replications=19,
+    )
+    risk = report["risk_differences"]["final_50"]
+    alpha = report["look"]["catastrophe_one_sided_alpha"]
+
+    assert risk["color_pairs"] == 3
+    assert risk["position_clusters"] == 2
+    assert risk["zero_event_independent_position_clusters"] == 2
+    assert risk["zero_event_uncertainty_upper_bound"] == pytest.approx(
+        exact_zero_event_upper_bound(alpha, 2)
+    )
+    assert risk["zero_event_uncertainty_upper_bound"] > (
+        exact_zero_event_upper_bound(alpha, 3)
+    )
 
 
 def test_resolved_missing_score_retains_outcome_and_reports_zero_score_term():
@@ -370,7 +399,10 @@ def test_zero_catastrophe_events_have_nonzero_analytic_and_bootstrap_upper_bound
     assert risk["estimate"] == 0.0
     assert risk["candidate_events"] == 0
     assert risk["reference_events"] == 0
-    expected = 1.0 - report["look"]["catastrophe_one_sided_alpha"] ** (1.0 / 5)
+    expected = exact_zero_event_upper_bound(
+        report["look"]["catastrophe_one_sided_alpha"],
+        5,
+    )
     assert risk["zero_event_uncertainty_upper_bound"] == pytest.approx(expected)
     assert risk["zero_event_independent_position_clusters"] == 5
     assert risk["upper_bound"] > 0.0
@@ -569,6 +601,10 @@ def test_finalized_statistics_emit_hash_bound_artifact_manifest():
 
 def test_policy_objective_and_sequential_look_values_are_loaded_from_json():
     policy = load_policy()
+    assert DEFAULT_POLICY_PATH == V2_POLICY_PATH
+    assert V1_POLICY_PATH != V2_POLICY_PATH
+    assert policy["schema_version"] == 2
+    assert policy["policy_version"] == "risk-seeking-checkpoint-promotion-v2"
     assert policy["objective"] == {
         "name": "candidate_realized_powered_terminal_utility",
         "candidate_perspective_outcomes": {

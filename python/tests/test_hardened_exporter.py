@@ -1,4 +1,5 @@
 import dataclasses
+import datetime
 import gzip
 import hashlib
 import json
@@ -274,6 +275,79 @@ def test_gated_shell_requires_probe_before_publication(tmp_path):
 
     assert result.returncode != 0
     assert "KATAGO_MODEL_PROBE_COMMAND_JSON is required" in result.stderr
+    assert list((tmp_path / "modelstobetested").iterdir()) == []
+
+
+def test_gated_shell_honors_fresh_controller_export_backpressure(tmp_path):
+    python_root = Path(__file__).resolve().parents[1]
+    script = python_root / "selfplay" / "export_model_for_selfplay.sh"
+    policy_hash = "a" * 64
+    status_path = tmp_path / "backpressure.json"
+    status = {
+        "schema_version": 1,
+        "updated_at_utc": datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%S.%fZ"
+        ),
+        "controller_hash": "b" * 64,
+        "policy_hash": policy_hash,
+        "allowExport": False,
+    }
+    status_path.write_text(
+        json.dumps(status, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["KATAGO_PROMOTION_BACKPRESSURE_FILE"] = str(status_path)
+    env["KATAGO_PROMOTION_POLICY_HASH"] = policy_hash
+    env.pop("KATAGO_MODEL_PROBE_COMMAND_JSON", None)
+
+    result = subprocess.run(
+        ["bash", str(script), "test-run", str(tmp_path), "1"],
+        cwd=python_root,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "export paused by controller backpressure" in result.stdout
+    assert list((tmp_path / "modelstobetested").iterdir()) == []
+
+
+def test_gated_shell_rejects_stale_allow_export_status(tmp_path):
+    python_root = Path(__file__).resolve().parents[1]
+    script = python_root / "selfplay" / "export_model_for_selfplay.sh"
+    policy_hash = "a" * 64
+    status_path = tmp_path / "stale-backpressure.json"
+    status = {
+        "schema_version": 1,
+        "updated_at_utc": "2020-01-01T00:00:00.000000Z",
+        "policy_hash": policy_hash,
+        "allowExport": True,
+    }
+    status_path.write_text(
+        json.dumps(status, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["KATAGO_PROMOTION_BACKPRESSURE_FILE"] = str(status_path)
+    env["KATAGO_PROMOTION_POLICY_HASH"] = policy_hash
+    env["KATAGO_MODEL_PROBE_COMMAND_JSON"] = '["finite-model-probe"]'
+
+    result = subprocess.run(
+        ["bash", str(script), "test-run", str(tmp_path), "1"],
+        cwd=python_root,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "failing closed" in result.stderr
     assert list((tmp_path / "modelstobetested").iterdir()) == []
 
 

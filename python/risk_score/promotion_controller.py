@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fcntl
 import functools
 import json
+import math
 import os
 import re
 import shutil
@@ -22,6 +24,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -69,8 +72,8 @@ PROMOTION_FAILURE_STEPS = (
     "promotion-intermediate-passed",
     "promotion-all-workers-acknowledged",
     "promotion-champion-cas",
-    "promotion-generation-data-admitted",
     "promotion-active-event",
+    "promotion-generation-data-admitted",
 )
 
 
@@ -265,7 +268,14 @@ class RuntimeConfig:
         commands = _strict_object(
             root["commands"],
             "commands",
-            {"trainer", "evaluator", "selfplay", "drain", "rollback"},
+            {
+                "trainer",
+                "stage0Probe",
+                "evaluator",
+                "selfplay",
+                "drain",
+                "rollback",
+            },
         )
         command_values = {
             key: _argv(value, f"commands.{key}") for key, value in commands.items()
@@ -483,6 +493,13 @@ class EvaluationMatrixPlan:
     policy_hash: str
     selfplay_config_hash: str
     topology: str
+    stage: str
+    look: str
+    policy_path: str
+    policy_version: str
+    suite_manifest_path: str
+    suite_manifest_hash: str
+    schedule_artifacts: Mapping[str, Mapping[str, Any]]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -490,8 +507,18 @@ class EvaluationMatrixPlan:
             "configHash": self.config_hash,
             "scheduleHash": self.schedule_hash,
             "policyHash": self.policy_hash,
+            "policyPath": self.policy_path,
+            "policyVersion": self.policy_version,
             "selfplayConfigHash": self.selfplay_config_hash,
             "topology": self.topology,
+            "stage": self.stage,
+            "look": self.look,
+            "suiteManifestPath": self.suite_manifest_path,
+            "suiteManifestHash": self.suite_manifest_hash,
+            "scheduleArtifacts": {
+                key: dict(value)
+                for key, value in sorted(self.schedule_artifacts.items())
+            },
             "specs": [spec.to_dict() for spec in self.specs],
         }
 
@@ -519,6 +546,53 @@ def _hash(value: Any, name: str) -> str:
     if not isinstance(value, str) or _SHA_RE.fullmatch(value) is None:
         raise ConfigurationError(f"{name} must be a lowercase SHA-256")
     return value
+
+
+def _canonical_confirmation_look(look: str) -> str:
+    aliases = {
+        "1": "look-1",
+        "automatic": "look-1",
+        "final": "look-1",
+        "fresh": "look-1",
+        "look-1": "look-1",
+        "prespecified-first-look": "look-1",
+        "2": "look-2",
+        "look-2": "look-2",
+        "prespecified-second-look": "look-2",
+    }
+    try:
+        return aliases[look]
+    except (KeyError, TypeError) as exc:
+        raise SafetyHalt(
+            "confirmation look must be canonical look-1 or look-2"
+        ) from exc
+
+
+def _policy_get(
+    policy: Mapping[str, Any], *parts: str, default: Any = None
+) -> Any:
+    current: Any = policy
+    for part in parts:
+        if not isinstance(current, Mapping) or part not in current:
+            return default
+        current = current[part]
+    return current
+
+
+def _parse_utc_timestamp(value: str) -> datetime:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise ValueError("timestamp must be UTC and end in Z")
+    parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    if parsed.utcoffset() != timedelta(0):
+        raise ValueError("timestamp must be UTC")
+    return parsed.astimezone(timezone.utc)
+
+
+def _finite_number(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
 
 
 def _positive_number(value: Any, name: str) -> float:
@@ -1033,6 +1107,7 @@ class PromotionController:
         failure_hook: Optional[Callable[[str], None]] = None,
         disk_usage: Callable[[Path], Any] = shutil.disk_usage,
         held_controller_lock: Optional[ControllerLock] = None,
+        now: Optional[Callable[[], datetime]] = None,
     ):
         self.runtime = runtime
         self.automatic = bool(automatic and runtime.controller.mutation_enabled)
@@ -1043,7 +1118,9 @@ class PromotionController:
         self.process_identity_verifier = process_identity_verifier
         self.failure_hook = failure_hook or (lambda _step: None)
         self.disk_usage = disk_usage
+        self.now = now or (lambda: datetime.now(timezone.utc))
         self.registry = EventRegistry(runtime.promotion_root)
+        self._writer_lock_depth = 0
         if held_controller_lock is not None:
             if (
                 held_controller_lock.path != runtime.lock_path
@@ -1119,12 +1196,20 @@ class PromotionController:
     @contextlib.contextmanager
     def _writer_lock(self) -> Iterable[None]:
         if self.held_controller_lock is not None:
-            yield
+            self._writer_lock_depth += 1
+            try:
+                yield
+            finally:
+                self._writer_lock_depth -= 1
             return
         with ControllerLock(
             self.runtime.lock_path, owner=self.runtime.controller.actor
         ):
-            yield
+            self._writer_lock_depth += 1
+            try:
+                yield
+            finally:
+                self._writer_lock_depth -= 1
 
     def _provenance(self, config_hash: str, schedule_hash: str) -> EventProvenance:
         config = self.runtime.controller
@@ -1137,10 +1222,240 @@ class PromotionController:
             policy_hash=config.policy_hash,
         )
 
+    def _load_suite_manifest(self) -> Tuple[Mapping[str, Any], bytes]:
+        path = self.runtime.suites / "manifest.json"
+        try:
+            data = path.read_bytes()
+            value = json.loads(data)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SafetyHalt(f"cannot load frozen suite manifest: {exc}") from exc
+        if not isinstance(value, dict):
+            raise SafetyHalt("frozen suite manifest root must be an object")
+        if sha256_bytes(data) != self.runtime.controller.suite_manifest_hash:
+            raise SafetyHalt("frozen suite manifest byte hash changed")
+        payload = dict(value)
+        supplied_payload_hash = payload.pop("manifestPayloadSha256", None)
+        if (
+            supplied_payload_hash is not None
+            and supplied_payload_hash != canonical_sha256(payload)
+        ):
+            raise SafetyHalt("frozen suite manifest payload hash is invalid")
+        if (
+            value.get("policy_hash") != self.runtime.controller.policy_hash
+            or value.get("source_revision")
+            != _policy_get(
+                self.runtime.frozen_policy,
+                "frozen_plan",
+                "source_revision",
+            )
+        ):
+            raise SafetyHalt("frozen suite manifest policy/source binding changed")
+        return value, data
+
+    @staticmethod
+    def _manifest_cells(manifest: Mapping[str, Any]) -> Tuple[Mapping[str, Any], ...]:
+        cells = manifest.get("cells")
+        if isinstance(cells, list):
+            if not all(isinstance(cell, Mapping) for cell in cells):
+                raise SafetyHalt("frozen suite manifest contains malformed cells")
+            return tuple(dict(cell) for cell in cells)
+        if not isinstance(cells, Mapping):
+            return ()
+
+        flattened: List[Mapping[str, Any]] = []
+
+        def walk(value: Any, coordinates: Tuple[str, ...]) -> None:
+            if not isinstance(value, Mapping):
+                return
+            schedule = value.get("schedule")
+            if (
+                "schedule_path" in value
+                or "schedule_hash" in value
+                or isinstance(schedule, Mapping)
+            ):
+                row = dict(value)
+                row.setdefault("_coordinates", list(coordinates))
+                flattened.append(row)
+                return
+            for key, child in value.items():
+                if isinstance(child, Mapping):
+                    walk(child, coordinates + (str(key),))
+
+        walk(cells, ())
+        return tuple(flattened)
+
+    @staticmethod
+    def _cell_value(cell: Mapping[str, Any], *names: str) -> Any:
+        for name in names:
+            if name in cell:
+                return cell[name]
+        schedule = cell.get("schedule")
+        if isinstance(schedule, Mapping):
+            for name in names:
+                if name in schedule:
+                    return schedule[name]
+        return None
+
+    def _resolve_manifest_schedule(
+        self,
+        manifest: Mapping[str, Any],
+        *,
+        stage: str,
+        look: str,
+        cell_name: str,
+        comparison: str,
+    ) -> Optional[Mapping[str, Any]]:
+        cells = self._manifest_cells(manifest)
+        if not cells:
+            return None
+        expected_stages = {
+            stage,
+            "stage-3" if stage in {"confirmation", "stage-3"} else stage,
+        }
+        aliases = {
+            cell_name,
+            comparison,
+            cell_name.replace("_", "-"),
+        }
+        matches: List[Mapping[str, Any]] = []
+        for cell in cells:
+            coordinates = tuple(str(item) for item in cell.get("_coordinates", ()))
+            declared_stage = self._cell_value(
+                cell, "stage", "evaluation_stage", "controller_stage"
+            )
+            declared_look = self._cell_value(cell, "look", "look_id")
+            declared_name = self._cell_value(
+                cell, "cell", "cell_name", "name", "comparison"
+            )
+            coordinate_set = set(coordinates)
+            stage_matches = (
+                declared_stage in expected_stages
+                or bool(coordinate_set.intersection(expected_stages))
+            )
+            look_matches = (
+                declared_look == look or look in coordinate_set
+            )
+            name_matches = (
+                declared_name in aliases
+                or bool(coordinate_set.intersection(aliases))
+            )
+            if stage_matches and look_matches and name_matches:
+                matches.append(cell)
+        if len(matches) != 1:
+            raise SafetyHalt(
+                "authoritative suite manifest must identify exactly one "
+                f"{stage}/{look}/{cell_name} cell; found {len(matches)}"
+            )
+        cell = matches[0]
+        relative = self._cell_value(cell, "schedule_path", "path")
+        expected_hash = self._cell_value(
+            cell, "schedule_hash", "sha256", "schedule_sha256"
+        )
+        schedule_id = self._cell_value(
+            cell, "schedule_id", "scheduleId"
+        )
+        pair_count = self._cell_value(
+            cell, "pair_count", "pairCount", "color_pairs"
+        )
+        bank_hash = self._cell_value(
+            cell,
+            "suite_bank_hash",
+            "suiteBankSha256",
+            "bank_hash",
+        )
+        cluster_hash = self._cell_value(
+            cell,
+            "independent_cluster_ids_hash",
+            "independentClusterIdsSha256",
+            "position_ids_hash",
+        )
+        minimum_clusters = self._cell_value(
+            cell,
+            "minimum_independent_position_clusters",
+            "minimumIndependentPositionClusters",
+        )
+        if not isinstance(relative, str) or not relative:
+            raise SafetyHalt("authoritative manifest cell has no schedule path")
+        _hash(expected_hash, "authoritative manifest schedule hash")
+        _nonempty(schedule_id, "authoritative manifest schedule ID")
+        if type(pair_count) is not int or pair_count <= 0:
+            raise SafetyHalt(
+                "authoritative manifest cell has no positive pair count"
+            )
+        path = Path(relative)
+        if path.is_absolute() or ".." in path.parts:
+            raise SafetyHalt("authoritative manifest schedule path is unsafe")
+        path = self.runtime.suites / path
+        if path.is_symlink() or not path.is_file():
+            raise SafetyHalt(
+                f"authoritative manifest schedule is not a regular file: {path}"
+            )
+        if sha256_file(path) != expected_hash:
+            raise SafetyHalt(
+                f"authoritative manifest schedule hash changed: {path}"
+            )
+        if bank_hash is not None:
+            _hash(bank_hash, "authoritative manifest suite bank hash")
+        if cluster_hash is not None:
+            _hash(
+                cluster_hash,
+                "authoritative manifest independent cluster hash",
+            )
+        if minimum_clusters is not None and (
+            type(minimum_clusters) is not int
+            or minimum_clusters <= 0
+            or minimum_clusters > pair_count
+        ):
+            raise SafetyHalt(
+                "authoritative manifest independent cluster minimum is invalid"
+            )
+        for key, expected in (
+            ("policy_hash", self.runtime.controller.policy_hash),
+            (
+                "policy_version",
+                self.runtime.frozen_policy.get("policy_version"),
+            ),
+            (
+                "source_revision",
+                _policy_get(
+                    self.runtime.frozen_policy,
+                    "frozen_plan",
+                    "source_revision",
+                ),
+            ),
+        ):
+            if key in cell and cell.get(key) != expected:
+                raise SafetyHalt(
+                    f"authoritative manifest cell {key} changed"
+                )
+        declared_comparison = self._cell_value(cell, "comparison")
+        if (
+            declared_comparison is not None
+            and declared_comparison != comparison
+        ):
+            raise SafetyHalt(
+                "authoritative manifest cell comparison contradicts controller"
+            )
+        return {
+            "cell": cell_name,
+            "comparison": comparison,
+            "stage": stage,
+            "look": look,
+            "path": str(path),
+            "sha256": expected_hash,
+            "scheduleId": schedule_id,
+            "pairCount": pair_count,
+            "suiteBankSha256": bank_hash,
+            "independentClusterIdsSha256": cluster_hash,
+            "minimumIndependentPositionClusters": minimum_clusters,
+        }
+
     def validate_static_inputs(self) -> None:
         """Verify every configured immutable policy/model/config/schedule hash."""
 
-        byte_checks = (
+        manifest, _ = self._load_suite_manifest()
+        authoritative_cells = self._manifest_cells(manifest)
+        byte_checks: List[Tuple[Path, str, str]] = [
             (
                 self.runtime.original_model_path,
                 self.runtime.controller.original_hash,
@@ -1157,36 +1472,6 @@ class PromotionController:
                 "standard config",
             ),
             (
-                self.runtime.discovery_schedule_path,
-                self.runtime.controller.discovery_schedule_hash,
-                "discovery ordinary schedule",
-            ),
-            (
-                self.runtime.confirmation_schedule_path,
-                self.runtime.controller.confirmation_schedule_hash,
-                "confirmation ordinary schedule",
-            ),
-            (
-                self.runtime.audit_schedule_path,
-                self.runtime.controller.audit_schedule_hash,
-                "audit schedule",
-            ),
-            (
-                self.runtime.lead40_schedule_path,
-                self.runtime.controller.lead40_schedule_hash,
-                "Lead-40 schedule",
-            ),
-            (
-                self.runtime.lead80_schedule_path,
-                self.runtime.controller.lead80_schedule_hash,
-                "Lead-80 schedule",
-            ),
-            (
-                self.runtime.standard_confirmation_schedule_path,
-                self.runtime.controller.standard_confirmation_schedule_hash,
-                "standard confirmation schedule",
-            ),
-            (
                 self.runtime.selfplay_config_path,
                 self.runtime.controller.selfplay_config_hash,
                 "self-play config",
@@ -1201,7 +1486,42 @@ class PromotionController:
                 self.runtime.controller.suite_manifest_hash,
                 "evaluation suite manifest",
             ),
-        )
+        ]
+        if not authoritative_cells:
+            byte_checks.extend(
+                (
+                    (
+                        self.runtime.discovery_schedule_path,
+                        self.runtime.controller.discovery_schedule_hash,
+                        "discovery ordinary schedule",
+                    ),
+                    (
+                        self.runtime.confirmation_schedule_path,
+                        self.runtime.controller.confirmation_schedule_hash,
+                        "confirmation ordinary schedule",
+                    ),
+                    (
+                        self.runtime.audit_schedule_path,
+                        self.runtime.controller.audit_schedule_hash,
+                        "audit schedule",
+                    ),
+                    (
+                        self.runtime.lead40_schedule_path,
+                        self.runtime.controller.lead40_schedule_hash,
+                        "Lead-40 schedule",
+                    ),
+                    (
+                        self.runtime.lead80_schedule_path,
+                        self.runtime.controller.lead80_schedule_hash,
+                        "Lead-80 schedule",
+                    ),
+                    (
+                        self.runtime.standard_confirmation_schedule_path,
+                        self.runtime.controller.standard_confirmation_schedule_hash,
+                        "standard confirmation schedule",
+                    ),
+                )
+            )
         for path, expected, role in byte_checks:
             if path.is_symlink() or not path.is_file():
                 raise SafetyHalt(f"{role} is not a regular file: {path}")
@@ -1210,6 +1530,31 @@ class PromotionController:
                 raise SafetyHalt(
                     f"{role} hash mismatch: expected {expected}, found {actual}"
                 )
+        if authoritative_cells:
+            for index, cell in enumerate(authoritative_cells):
+                relative = self._cell_value(cell, "schedule_path", "path")
+                expected = self._cell_value(
+                    cell, "schedule_hash", "sha256", "schedule_sha256"
+                )
+                if not isinstance(relative, str) or not relative:
+                    raise SafetyHalt(
+                        f"authoritative manifest cell {index} has no schedule path"
+                    )
+                _hash(expected, f"authoritative manifest cell {index} schedule hash")
+                relative_path = Path(relative)
+                if relative_path.is_absolute() or ".." in relative_path.parts:
+                    raise SafetyHalt(
+                        f"authoritative manifest cell {index} path is unsafe"
+                    )
+                path = self.runtime.suites / relative_path
+                if (
+                    path.is_symlink()
+                    or not path.is_file()
+                    or sha256_file(path) != expected
+                ):
+                    raise SafetyHalt(
+                        f"authoritative manifest cell {index} schedule changed"
+                    )
         policy_path = self.runtime.policy_path
         if policy_path.is_symlink() or not policy_path.is_file():
             raise SafetyHalt(f"policy is not a regular file: {policy_path}")
@@ -1261,6 +1606,14 @@ class PromotionController:
             self.runtime.worker_ack_inbox,
             self.runtime.rollout_report_inbox,
             self.runtime.promotion_root / "transactions",
+            self.runtime.promotion_root / "operations",
+            self.runtime.promotion_root / "trash" / "intents",
+            self.runtime.promotion_root / "trash" / "manifests",
+            self.runtime.promotion_root / "trash" / "objects",
+            self.runtime.promotion_root / "trash" / "deleted",
+            self.runtime.promotion_root / "trash" / "deletion-intents",
+            self.runtime.promotion_root / "audits" / "queue",
+            self.runtime.promotion_root / "audits" / "reports",
         )
         for directory in directories:
             if directory.exists() and not directory.is_dir():
@@ -1300,6 +1653,8 @@ class PromotionController:
         """Build a content-addressed matrix without touching the filesystem."""
 
         self.validate_static_inputs()
+        _hash(candidate_hash, "candidate hash")
+        _hash(champion_hash, "champion hash")
         required_topology = "7-workers-100-threads"
         if topology != required_topology:
             raise SafetyHalt(
@@ -1309,21 +1664,8 @@ class PromotionController:
 
         config = self.runtime.controller
         manifest_path = self.runtime.suites / "manifest.json"
-        try:
-            manifest_bytes = manifest_path.read_bytes()
-            manifest = json.loads(manifest_bytes)
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise SafetyHalt(f"cannot load frozen suite manifest: {exc}") from exc
-        if not isinstance(manifest, dict):
-            raise SafetyHalt("frozen suite manifest root must be an object")
-        if sha256_bytes(manifest_bytes) != config.suite_manifest_hash:
-            raise SafetyHalt("frozen suite manifest byte hash changed")
-        if (
-            manifest.get("policy_hash") != config.policy_hash
-            or manifest.get("source_revision")
-            != self.runtime.frozen_policy["frozen_plan"]["source_revision"]
-        ):
-            raise SafetyHalt("frozen suite manifest policy/source binding changed")
+        manifest, _ = self._load_suite_manifest()
+        authoritative_cells = self._manifest_cells(manifest)
         banks = {
             bank.get("name"): bank
             for bank in manifest.get("banks", [])
@@ -1351,6 +1693,55 @@ class PromotionController:
             return bank_hash, schedule_id
 
         confirmation = stage in {"confirmation", "stage-3"}
+        canonical_stage = {
+            "integrity": "stage-0",
+            "stage-0": "stage-0",
+            "screen": "stage-1",
+            "stage-1": "stage-1",
+            "finalist": "stage-2",
+            "stage-2": "stage-2",
+            "confirmation": "stage-3",
+            "stage-3": "stage-3",
+        }.get(stage)
+        if canonical_stage is None:
+            raise SafetyHalt(f"unknown evaluation stage coordinate: {stage!r}")
+        canonical_look = (
+            _canonical_confirmation_look(look) if confirmation else look
+        )
+        policy_version = _nonempty(
+            self.runtime.frozen_policy.get("policy_version"),
+            "frozen policy version",
+        )
+        look_policy: Optional[Mapping[str, Any]] = None
+        if confirmation:
+            policy_looks = _policy_get(
+                self.runtime.frozen_policy,
+                "evaluation_stages",
+                "stage_3_promotion_confirmation",
+                "looks",
+                default=[],
+            )
+            look_number = int(canonical_look.rsplit("-", 1)[1])
+            if isinstance(policy_looks, list):
+                look_policy = next(
+                    (
+                        item
+                        for item in policy_looks
+                        if isinstance(item, Mapping)
+                        and item.get("look_number") == look_number
+                    ),
+                    None,
+                )
+            if (
+                (authoritative_cells or policy_looks)
+                and (
+                    not isinstance(policy_looks, list)
+                    or look_policy is None
+                )
+            ):
+                raise SafetyHalt(
+                    f"frozen policy does not define {canonical_look}"
+                )
         ordinary_bank_name = (
             "confirmation"
             if confirmation
@@ -1365,11 +1756,169 @@ class PromotionController:
             if stage == "integrity"
             else config.discovery_schedule_hash
         )
-        ordinary_bank_hash, ordinary_schedule_id = bank_binding(
-            ordinary_bank_name, ordinary_schedule_hash
-        )
+        schedule_artifacts: Dict[str, Mapping[str, Any]] = {}
         matrix_kwargs: Dict[str, Any] = {}
-        if confirmation:
+        if confirmation and authoritative_cells:
+            cell_coordinates = {
+                "powered_candidate_vs_champion":
+                    "candidate-vs-champion-powered",
+                "powered_candidate_vs_original":
+                    "candidate-vs-original-powered",
+                "standard_candidate_vs_original":
+                    "candidate-vs-original-standard",
+                "lead_40": "candidate-vs-champion-powered-lead-40",
+                "lead_80": "candidate-vs-champion-powered-lead-80",
+            }
+            for cell_name, comparison in cell_coordinates.items():
+                artifact = self._resolve_manifest_schedule(
+                    manifest,
+                    stage=canonical_stage,
+                    look=canonical_look,
+                    cell_name=cell_name,
+                    comparison=comparison,
+                )
+                if artifact is None:
+                    raise SafetyHalt(
+                        "authoritative suite manifest unexpectedly has no cells"
+                    )
+                schedule_artifacts[cell_name] = artifact
+            powered_cells = (
+                schedule_artifacts["powered_candidate_vs_champion"],
+                schedule_artifacts["powered_candidate_vs_original"],
+            )
+            for field in (
+                "path",
+                "sha256",
+                "scheduleId",
+                "pairCount",
+                "suiteBankSha256",
+                "independentClusterIdsSha256",
+                "minimumIndependentPositionClusters",
+            ):
+                if powered_cells[0].get(field) != powered_cells[1].get(field):
+                    raise SafetyHalt(
+                        "powered ordinary confirmation cells must share the "
+                        f"exact cumulative schedule ({field})"
+                    )
+            powered = powered_cells[0]
+            standard = schedule_artifacts["standard_candidate_vs_original"]
+            lead40 = schedule_artifacts["lead_40"]
+            lead80 = schedule_artifacts["lead_80"]
+            ordinary_schedule_hash = str(powered["sha256"])
+            ordinary_bank_hash = str(powered["suiteBankSha256"])
+            ordinary_schedule_id = str(powered["scheduleId"])
+            for name, artifact in schedule_artifacts.items():
+                _hash(
+                    artifact.get("suiteBankSha256"),
+                    f"authoritative {name} suite bank hash",
+                )
+                _hash(
+                    artifact.get("independentClusterIdsSha256"),
+                    f"authoritative {name} independent cluster hash",
+                )
+                if look_policy is not None:
+                    pair_key = {
+                        "powered_candidate_vs_champion":
+                            "powered_ordinary_color_pairs_per_matchup",
+                        "powered_candidate_vs_original":
+                            "powered_ordinary_color_pairs_per_matchup",
+                        "standard_candidate_vs_original":
+                            "standard_ordinary_color_pairs",
+                        "lead_40": "lead_40_color_pairs",
+                        "lead_80": "lead_80_color_pairs",
+                    }[name]
+                    expected_pairs = look_policy.get(pair_key)
+                    if (
+                        expected_pairs is not None
+                        and artifact.get("pairCount") != expected_pairs
+                    ):
+                        raise SafetyHalt(
+                            f"authoritative {name} pair count contradicts policy"
+                        )
+                    minima = look_policy.get(
+                        "minimum_independent_position_clusters"
+                    )
+                    expected_minimum = (
+                        minima.get(name)
+                        if isinstance(minima, Mapping)
+                        else None
+                    )
+                    if (
+                        expected_minimum is not None
+                        and artifact.get(
+                            "minimumIndependentPositionClusters"
+                        )
+                        != expected_minimum
+                    ):
+                        raise SafetyHalt(
+                            f"authoritative {name} cluster minimum "
+                            "contradicts policy"
+                        )
+            matrix_kwargs.update(
+                {
+                    "lead_40_schedule_sha": lead40["sha256"],
+                    "lead_80_schedule_sha": lead80["sha256"],
+                    "lead_40_suite_bank_sha": lead40["suiteBankSha256"],
+                    "lead_80_suite_bank_sha": lead80["suiteBankSha256"],
+                    "lead_40_schedule_id": lead40["scheduleId"],
+                    "lead_80_schedule_id": lead80["scheduleId"],
+                }
+            )
+            standard_schedule_hash = str(standard["sha256"])
+            standard_schedule_id = str(standard["scheduleId"])
+        else:
+            ordinary_bank_hash, ordinary_schedule_id = bank_binding(
+                ordinary_bank_name, ordinary_schedule_hash
+            )
+            standard_schedule_hash = (
+                config.standard_confirmation_schedule_hash
+                if confirmation
+                else ordinary_schedule_hash
+            )
+            standard_schedule_id = ordinary_schedule_id
+            ordinary_path = (
+                self.runtime.confirmation_schedule_path
+                if confirmation
+                else self.runtime.audit_schedule_path
+                if stage in {"integrity", "stage-0"}
+                else self.runtime.discovery_schedule_path
+            )
+            standard_path = (
+                self.runtime.standard_confirmation_schedule_path
+                if confirmation
+                else ordinary_path
+            )
+            base_artifact = {
+                "stage": canonical_stage,
+                "look": canonical_look,
+                "path": str(ordinary_path),
+                "sha256": ordinary_schedule_hash,
+                "scheduleId": ordinary_schedule_id,
+                "suiteBankSha256": ordinary_bank_hash,
+            }
+            for name, comparison in (
+                (
+                    "powered_candidate_vs_champion",
+                    "candidate-vs-champion-powered",
+                ),
+                (
+                    "powered_candidate_vs_original",
+                    "candidate-vs-original-powered",
+                ),
+            ):
+                schedule_artifacts[name] = {
+                    **base_artifact,
+                    "cell": name,
+                    "comparison": comparison,
+                }
+            schedule_artifacts["standard_candidate_vs_original"] = {
+                **base_artifact,
+                "cell": "standard_candidate_vs_original",
+                "comparison": "candidate-vs-original-standard",
+                "path": str(standard_path),
+                "sha256": standard_schedule_hash,
+            }
+        if confirmation and not authoritative_cells:
             lead40_bank_hash, lead40_schedule_id = bank_binding(
                 "lead-40", config.lead40_schedule_hash
             )
@@ -1386,6 +1935,32 @@ class PromotionController:
                     "lead_80_schedule_id": lead80_schedule_id,
                 }
             )
+            schedule_artifacts.update(
+                {
+                    "lead_40": {
+                        "cell": "lead_40",
+                        "comparison":
+                            "candidate-vs-champion-powered-lead-40",
+                        "stage": canonical_stage,
+                        "look": canonical_look,
+                        "path": str(self.runtime.lead40_schedule_path),
+                        "sha256": config.lead40_schedule_hash,
+                        "scheduleId": lead40_schedule_id,
+                        "suiteBankSha256": lead40_bank_hash,
+                    },
+                    "lead_80": {
+                        "cell": "lead_80",
+                        "comparison":
+                            "candidate-vs-champion-powered-lead-80",
+                        "stage": canonical_stage,
+                        "look": canonical_look,
+                        "path": str(self.runtime.lead80_schedule_path),
+                        "sha256": config.lead80_schedule_hash,
+                        "scheduleId": lead80_schedule_id,
+                        "suiteBankSha256": lead80_bank_hash,
+                    },
+                }
+            )
         specs = tuple(
             build_evaluation_matrix(
                 candidate_model_sha=candidate_hash,
@@ -1394,23 +1969,40 @@ class PromotionController:
                 powered_config_sha=config.powered_config_hash,
                 standard_config_sha=config.standard_config_hash,
                 powered_schedule_sha=ordinary_schedule_hash,
-                standard_schedule_sha=(
-                    config.standard_confirmation_schedule_hash
-                    if confirmation
-                    else ordinary_schedule_hash
-                ),
+                standard_schedule_sha=standard_schedule_hash,
                 policy_sha=config.policy_hash,
                 suite=ordinary_bank_name,
-                stage=stage,
-                look=look,
+                stage=canonical_stage,
+                look=canonical_look,
                 topology=topology,
                 suite_manifest_sha=config.suite_manifest_hash,
                 ordinary_suite_bank_sha=ordinary_bank_hash,
                 powered_schedule_id=ordinary_schedule_id,
-                standard_schedule_id=ordinary_schedule_id,
+                standard_schedule_id=standard_schedule_id,
                 **matrix_kwargs,
             )
         )
+        expected_artifacts = {
+            artifact["comparison"]: artifact
+            for artifact in schedule_artifacts.values()
+        }
+        for spec in specs:
+            artifact = expected_artifacts.get(spec.comparison)
+            if artifact is None:
+                raise SafetyHalt(
+                    f"evaluation matrix has unbound cell {spec.comparison}"
+                )
+            if (
+                spec.schedule_sha != artifact["sha256"]
+                or spec.schedule_id != artifact["scheduleId"]
+                or spec.suite_bank_sha != artifact["suiteBankSha256"]
+                or spec.look != canonical_look
+                or spec.stage != canonical_stage
+            ):
+                raise SafetyHalt(
+                    f"evaluation matrix cell contradicts manifest: "
+                    f"{spec.comparison}"
+                )
         config_hash = canonical_sha256(sorted({spec.config_sha for spec in specs}))
         schedule_hash = canonical_sha256(sorted({spec.schedule_sha for spec in specs}))
         evaluation_key = "matrix-" + canonical_sha256(
@@ -1424,6 +2016,13 @@ class PromotionController:
             config.policy_hash,
             config.selfplay_config_hash,
             required_topology,
+            canonical_stage,
+            canonical_look,
+            str(self.runtime.policy_path),
+            policy_version,
+            str(manifest_path),
+            config.suite_manifest_hash,
+            schedule_artifacts,
         )
 
     def evaluate_or_recommend(
@@ -1460,6 +2059,265 @@ class PromotionController:
             raise SafetyHalt("gate result omits GPU handoff provenance")
         return gate
 
+    def _stage0_request(
+        self,
+        plan: EvaluationMatrixPlan,
+        candidate: CandidateArtifact,
+        champion_hash: str,
+    ) -> Optional[Tuple[Path, str]]:
+        if plan.stage != "stage-0":
+            return None
+        stage_policy = _policy_get(
+            self.runtime.frozen_policy,
+            "evaluation_stages",
+            "stage_0_integrity_and_fixed_probes",
+        )
+        if not isinstance(stage_policy, Mapping):
+            manifest, _ = self._load_suite_manifest()
+            if self._manifest_cells(manifest):
+                raise SafetyHalt("frozen policy has no Stage-0 probe contract")
+            stage_policy = {
+                "legacy_adapter_compatibility": True,
+                "required_checks": [],
+            }
+        request = {
+            "schema_version": 1,
+            "contract": "risk-score-stage-0-request-v1",
+            "candidate_hash": candidate.model_hash,
+            "checkpoint_hash": candidate.checkpoint_hash,
+            "candidate_manifest_hash": candidate.directory_manifest_hash,
+            "tested_champion_hash": champion_hash,
+            "original_hash": self.runtime.controller.original_hash,
+            "policy_path": plan.policy_path,
+            "policy_hash": plan.policy_hash,
+            "policy_version": plan.policy_version,
+            "suite_manifest_path": plan.suite_manifest_path,
+            "suite_manifest_hash": plan.suite_manifest_hash,
+            "evaluation_key": plan.evaluation_key,
+            "stage": plan.stage,
+            "look": plan.look,
+            "probe_contract": dict(stage_policy),
+            "schedule_artifacts": {
+                key: dict(value)
+                for key, value in sorted(plan.schedule_artifacts.items())
+            },
+        }
+        request_hash = canonical_sha256(request)
+        root = self.runtime.evaluations / "stage-0" / "requests"
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / f"{request_hash}.json"
+        _write_immutable_json(path, request)
+        return path, sha256_file(path)
+
+    def _resolve_tested_champion_model_path(self, champion_hash: str) -> Path:
+        """Resolve the exact registry-bound model used as the tested champion."""
+
+        _hash(champion_hash, "tested champion hash")
+        if champion_hash == self.runtime.controller.original_hash:
+            model = self.runtime.original_model_path
+            if (
+                model.is_symlink()
+                or not model.is_file()
+                or sha256_file(model) != champion_hash
+            ):
+                raise SafetyHalt(
+                    "configured original champion model path/hash changed"
+                )
+            return model
+
+        state = self.registry.reconstruct()
+        if state.current_champion_hash != champion_hash:
+            raise SafetyHalt(
+                "configured evaluator plan names a non-current champion"
+            )
+        record = state.candidates.get(champion_hash)
+        generation = state.generations.get(state.current_generation_id)
+        if (
+            record is None
+            or generation is None
+            or generation.state != GenerationState.ACTIVE
+            or generation.candidate_hash != champion_hash
+            or generation.candidate_path != record.candidate_path
+        ):
+            raise SafetyHalt(
+                "non-original champion has no exact active registry path"
+            )
+        accepted = Path(record.candidate_path)
+        if (
+            not accepted.is_absolute()
+            or accepted.parent != self.runtime.accepted_models
+            or accepted.is_symlink()
+            or not accepted.is_dir()
+        ):
+            raise SafetyHalt(
+                "registry champion path is not an exact accepted candidate path"
+            )
+        artifact = inspect_candidate(accepted)
+        model = accepted / "model.bin.gz"
+        if (
+            artifact.model_hash != champion_hash
+            or model.is_symlink()
+            or not model.is_file()
+            or sha256_file(model) != champion_hash
+        ):
+            raise SafetyHalt(
+                "registry champion model path/hash contradicts champion identity"
+            )
+        return model
+
+    def _validate_stage0_probe_artifact(
+        self,
+        *,
+        probe_path: Path,
+        probe_hash: str,
+        request_path: Path,
+        request_hash: str,
+        candidate_hash: str,
+        champion_hash: str,
+    ) -> None:
+        try:
+            from risk_score.promotion_evidence import validate_stage0_probe
+
+            validate_stage0_probe(
+                probe_path,
+                expected_sha256=probe_hash,
+                policy=self.runtime.frozen_policy,
+                candidate_hash=candidate_hash,
+                champion_hash=champion_hash,
+                original_hash=self.runtime.controller.original_hash,
+                request_path=request_path,
+                request_sha256=request_hash,
+            )
+            request_bytes = request_path.read_bytes()
+            request = json.loads(request_bytes)
+            expected_request_bindings = {
+                "policy_path": str(self.runtime.policy_path),
+                "policy_hash": self.runtime.controller.policy_hash,
+                "policy_version":
+                    self.runtime.frozen_policy.get("policy_version"),
+                "suite_manifest_path":
+                    str(self.runtime.suites / "manifest.json"),
+                "suite_manifest_hash":
+                    self.runtime.controller.suite_manifest_hash,
+            }
+            if (
+                not isinstance(request, dict)
+                or request_bytes != canonical_json_bytes(request) + b"\n"
+                or any(
+                    request.get(key) != expected
+                    for key, expected in expected_request_bindings.items()
+                )
+            ):
+                raise ValueError(
+                    "Stage-0 request contradicts frozen runtime inputs"
+                )
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            raise SafetyHalt(
+                f"configured Stage-0 probe output is invalid: {exc}"
+            ) from exc
+
+    def _configured_stage0_probe(
+        self,
+        plan: EvaluationMatrixPlan,
+        candidate: CandidateArtifact,
+        *,
+        champion_hash: str,
+        champion_model_path: Path,
+        request_path: Path,
+        request_hash: str,
+    ) -> Tuple[Path, str]:
+        """Execute or reconcile the one probe artifact bound to a Stage-0 request."""
+
+        root = self.runtime.evaluations / "stage-0" / "probes"
+        root.mkdir(parents=True, exist_ok=True)
+        probe_path = root / f"{request_hash}.json"
+        if not probe_path.exists():
+            temporary_root = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{request_hash}.probe-", dir=str(root)
+                )
+            )
+            command_output = temporary_root / "probe.json"
+            try:
+                self.execute_argv(
+                    "stage0Probe",
+                    {
+                        "plan": (
+                            self.runtime.evaluations
+                            / "controller-adapter"
+                            / plan.evaluation_key
+                            / "plan.json"
+                        ),
+                        "evaluation_key": plan.evaluation_key,
+                        "candidate_dir": candidate.path,
+                        "candidate_model": candidate.path / "model.bin.gz",
+                        "candidate_hash": candidate.model_hash,
+                        "champion_model": champion_model_path,
+                        "champion_hash": champion_hash,
+                        "original_model": self.runtime.original_model_path,
+                        "original_hash": self.runtime.controller.original_hash,
+                        "powered_config": self.runtime.powered_config_path,
+                        "powered_config_hash":
+                            self.runtime.controller.powered_config_hash,
+                        "standard_config": self.runtime.standard_config_path,
+                        "standard_config_hash":
+                            self.runtime.controller.standard_config_hash,
+                        "policy": plan.policy_path,
+                        "policy_hash": plan.policy_hash,
+                        "policy_version": plan.policy_version,
+                        "suite_manifest": plan.suite_manifest_path,
+                        "suite_manifest_hash": plan.suite_manifest_hash,
+                        "stage0_request": request_path,
+                        "stage0_request_hash": request_hash,
+                        "stage0_request_sha256": request_hash,
+                        "stage0_probe": command_output,
+                        "stage0_probe_output": command_output,
+                    },
+                )
+                if command_output.is_symlink() or not command_output.is_file():
+                    raise SafetyHalt(
+                        "configured Stage-0 probe did not publish a regular "
+                        "output file"
+                    )
+                command_hash = sha256_file(command_output)
+                self._validate_stage0_probe_artifact(
+                    probe_path=command_output,
+                    probe_hash=command_hash,
+                    request_path=request_path,
+                    request_hash=request_hash,
+                    candidate_hash=candidate.model_hash,
+                    champion_hash=champion_hash,
+                )
+                try:
+                    probe_value = json.loads(
+                        command_output.read_text(encoding="utf-8")
+                    )
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise SafetyHalt(
+                        f"configured Stage-0 probe output is invalid: {exc}"
+                    ) from exc
+                if not isinstance(probe_value, dict):
+                    raise SafetyHalt(
+                        "configured Stage-0 probe output root must be an object"
+                    )
+                _write_immutable_json(probe_path, probe_value)
+            finally:
+                shutil.rmtree(temporary_root, ignore_errors=True)
+        if probe_path.is_symlink() or not probe_path.is_file():
+            raise SafetyHalt(
+                "configured Stage-0 probe did not publish a regular output file"
+            )
+        probe_hash = sha256_file(probe_path)
+        self._validate_stage0_probe_artifact(
+            probe_path=probe_path,
+            probe_hash=probe_hash,
+            request_path=request_path,
+            request_hash=request_hash,
+            candidate_hash=candidate.model_hash,
+            champion_hash=champion_hash,
+        )
+        return probe_path, probe_hash
+
     def configured_evaluation_executor(
         self, plan: EvaluationMatrixPlan, candidate: CandidateArtifact
     ) -> Mapping[str, Any]:
@@ -1474,59 +2332,259 @@ class PromotionController:
         plan_path = root / "plan.json"
         evidence_path = root / "evidence.json"
         _write_immutable_json(plan_path, plan.to_dict())
+        champion_spec = next(
+            (
+                spec
+                for spec in plan.specs
+                if spec.comparison == "candidate-vs-champion-powered"
+            ),
+            None,
+        )
+        if champion_spec is None:
+            raise SafetyHalt("evaluation matrix has no champion comparison")
+        champion_model_path = self._resolve_tested_champion_model_path(
+            champion_spec.reference_model_sha
+        )
+        stage0_request = self._stage0_request(
+            plan, candidate, champion_spec.reference_model_sha
+        )
 
         if not evidence_path.exists():
-            champion_spec = next(
-                (
-                    spec
-                    for spec in plan.specs
-                    if spec.comparison == "candidate-vs-champion-powered"
-                ),
-                None,
+            powered_champion = plan.schedule_artifacts[
+                "powered_candidate_vs_champion"
+            ]
+            powered_original = plan.schedule_artifacts[
+                "powered_candidate_vs_original"
+            ]
+            standard_original = plan.schedule_artifacts[
+                "standard_candidate_vs_original"
+            ]
+            lead40 = plan.schedule_artifacts.get("lead_40")
+            lead80 = plan.schedule_artifacts.get("lead_80")
+
+            integrity_result = self._stage_result(
+                candidate.model_hash, "integrity"
             )
-            if champion_spec is None:
-                raise SafetyHalt("evaluation matrix has no champion comparison")
-            schedule_paths = {
-                self.runtime.controller.discovery_schedule_hash:
-                    self.runtime.discovery_schedule_path,
-                self.runtime.controller.confirmation_schedule_hash:
-                    self.runtime.confirmation_schedule_path,
-                self.runtime.controller.audit_schedule_hash:
-                    self.runtime.audit_schedule_path,
-                self.runtime.controller.lead40_schedule_hash:
-                    self.runtime.lead40_schedule_path,
-                self.runtime.controller.lead80_schedule_hash:
-                    self.runtime.lead80_schedule_path,
-                self.runtime.controller.standard_confirmation_schedule_hash:
-                    self.runtime.standard_confirmation_schedule_path,
-            }
+            screen_result = self._stage_result(candidate.model_hash, "screen")
+            finalist_result = self._stage_result(
+                candidate.model_hash, "finalist"
+            )
+            integrity_artifacts = (
+                integrity_result.get("adapter_artifacts", {})
+                if isinstance(integrity_result, Mapping)
+                else {}
+            )
+            finalist_artifacts = (
+                finalist_result.get("adapter_artifacts", {})
+                if isinstance(finalist_result, Mapping)
+                else {}
+            )
+
+            if plan.stage == "stage-0":
+                if stage0_request is None:
+                    raise SafetyHalt("Stage-0 evaluation has no immutable request")
+                stage0_request_path = stage0_request[0]
+                stage0_request_hash = stage0_request[1]
+                stage0_probe_path, stage0_probe_hash = (
+                    self._configured_stage0_probe(
+                        plan,
+                        candidate,
+                        champion_hash=champion_spec.reference_model_sha,
+                        champion_model_path=champion_model_path,
+                        request_path=stage0_request_path,
+                        request_hash=stage0_request_hash,
+                    )
+                )
+            else:
+                try:
+                    stage0_request_path = Path(
+                        integrity_artifacts["stage0_request_path"]
+                    )
+                    stage0_request_hash = _hash(
+                        integrity_artifacts["stage0_request_hash"],
+                        "reused Stage-0 request hash",
+                    )
+                    stage0_probe_path = Path(
+                        integrity_artifacts["stage0_probe_path"]
+                    )
+                    stage0_probe_hash = _hash(
+                        integrity_artifacts.get(
+                            "stage0_probe_sha256",
+                            integrity_artifacts.get("stage0_probe_hash"),
+                        ),
+                        "reused Stage-0 probe hash",
+                    )
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise SafetyHalt(
+                        "later evaluation stage lacks finalized Stage-0 artifacts"
+                    ) from exc
+                self._validate_stage0_probe_artifact(
+                    probe_path=stage0_probe_path,
+                    probe_hash=stage0_probe_hash,
+                    request_path=stage0_request_path,
+                    request_hash=stage0_request_hash,
+                    candidate_hash=candidate.model_hash,
+                    champion_hash=champion_spec.reference_model_sha,
+                )
+
+            stage1_evidence_path: Any = ""
+            stage1_evidence_hash = ""
+            discovery_output: Any = ""
+            if plan.stage == "stage-2":
+                if not isinstance(screen_result, Mapping):
+                    raise SafetyHalt(
+                        "Stage-2 evaluation lacks finalized Stage-1 evidence"
+                    )
+                screen_artifacts = screen_result.get("adapter_artifacts")
+                if not isinstance(screen_artifacts, Mapping):
+                    raise SafetyHalt(
+                        "Stage-1 result has no evaluator artifact binding"
+                    )
+                stage1_key = screen_result.get("evaluation_key")
+                if not isinstance(stage1_key, str) or not stage1_key:
+                    raise SafetyHalt(
+                        "Stage-1 result has no immutable evaluation key"
+                    )
+                stage1_evidence_path = (
+                    self.runtime.evaluations
+                    / "controller-adapter"
+                    / stage1_key
+                    / "evidence.json"
+                )
+                recorded_stage1_path = screen_artifacts.get(
+                    "evaluator_evidence_path"
+                )
+                recorded_stage1_hash = screen_artifacts.get(
+                    "evaluator_evidence_hash"
+                )
+                if (
+                    recorded_stage1_path != str(stage1_evidence_path)
+                    or not isinstance(recorded_stage1_hash, str)
+                    or _SHA_RE.fullmatch(recorded_stage1_hash) is None
+                    or stage1_evidence_path.is_symlink()
+                    or not stage1_evidence_path.is_file()
+                    or sha256_file(stage1_evidence_path)
+                    != recorded_stage1_hash
+                ):
+                    raise SafetyHalt(
+                        "Stage-2 evaluation cannot resolve Stage-1 evidence"
+                    )
+                stage1_evidence_hash = recorded_stage1_hash
+                discovery_output = root / "discovery-evidence.json"
+
+            attempt_path: Any = ""
+            attempt_hash = ""
+            if plan.stage == "stage-3":
+                attempt_path = root / "attempt.json"
+                state = self.registry.reconstruct()
+                attempt = {
+                    "attempt_number": 1,
+                    "generation_id": state.current_generation_id,
+                    "promotions_for_generation": 0,
+                    "new_holdout_block": False,
+                    "new_alpha_allocation": False,
+                    "prespecified_cumulative_look": plan.look == "look-2",
+                }
+                _write_immutable_json(attempt_path, attempt)
+                attempt_hash = sha256_file(attempt_path)
+
+            discovery_evidence_path = finalist_artifacts.get(
+                "discovery_evidence_path", ""
+            )
+            discovery_evidence_hash = finalist_artifacts.get(
+                "discovery_evidence_sha256",
+                finalist_artifacts.get("discovery_evidence_hash", ""),
+            )
+            runner_manifests_path = root / "runner-manifests.json"
+
+            def schedule_value(
+                artifact: Optional[Mapping[str, Any]], key: str
+            ) -> Any:
+                return "" if artifact is None else artifact[key]
+
             self.execute_argv(
                 "evaluator",
                 {
                     "plan": plan_path,
+                    "plan_hash": sha256_file(plan_path),
+                    "plan_sha256": sha256_file(plan_path),
+                    "stage": plan.stage,
+                    "look": plan.look,
                     "evaluation_key": plan.evaluation_key,
                     "evidence_output": evidence_path,
                     "candidate_dir": candidate.path,
                     "candidate_model": candidate.path / "model.bin.gz",
                     "candidate_hash": candidate.model_hash,
+                    "champion_model": champion_model_path,
                     "champion_hash": champion_spec.reference_model_sha,
                     "original_model": self.runtime.original_model_path,
                     "original_hash": self.runtime.controller.original_hash,
-                    "policy": str(self.runtime.policy_path),
+                    "policy": plan.policy_path,
                     "policy_hash": plan.policy_hash,
+                    "policy_version": plan.policy_version,
+                    "suite_manifest": plan.suite_manifest_path,
+                    "suite_manifest_hash": plan.suite_manifest_hash,
                     "powered_config": self.runtime.powered_config_path,
+                    "powered_config_hash":
+                        self.runtime.controller.powered_config_hash,
                     "standard_config": self.runtime.standard_config_path,
-                    "powered_schedule": schedule_paths[
-                        champion_spec.schedule_sha
-                    ],
-                    "standard_schedule": schedule_paths[
-                        next(
-                            spec.schedule_sha
-                            for spec in plan.specs
-                            if "standard" in spec.comparison
-                        )
-                    ],
+                    "standard_config_hash":
+                        self.runtime.controller.standard_config_hash,
+                    "powered_schedule": powered_champion["path"],
+                    "powered_schedule_hash": powered_champion["sha256"],
+                    "powered_schedule_id": powered_champion["scheduleId"],
+                    "powered_champion_schedule":
+                        powered_champion["path"],
+                    "powered_champion_schedule_hash":
+                        powered_champion["sha256"],
+                    "powered_champion_schedule_id":
+                        powered_champion["scheduleId"],
+                    "powered_original_schedule": powered_original["path"],
+                    "powered_original_schedule_hash":
+                        powered_original["sha256"],
+                    "powered_original_schedule_id":
+                        powered_original["scheduleId"],
+                    "standard_schedule": standard_original["path"],
+                    "standard_schedule_hash": standard_original["sha256"],
+                    "standard_schedule_id":
+                        standard_original["scheduleId"],
+                    "standard_original_schedule":
+                        standard_original["path"],
+                    "standard_original_schedule_hash":
+                        standard_original["sha256"],
+                    "standard_original_schedule_id":
+                        standard_original["scheduleId"],
+                    "lead40_schedule": schedule_value(lead40, "path"),
+                    "lead40_schedule_hash":
+                        schedule_value(lead40, "sha256"),
+                    "lead40_schedule_id":
+                        schedule_value(lead40, "scheduleId"),
+                    "lead80_schedule": schedule_value(lead80, "path"),
+                    "lead80_schedule_hash":
+                        schedule_value(lead80, "sha256"),
+                    "lead80_schedule_id":
+                        schedule_value(lead80, "scheduleId"),
+                    "stage0_request": stage0_request_path,
+                    "stage0_request_hash": stage0_request_hash,
+                    "stage0_request_sha256": stage0_request_hash,
+                    "stage0_probe": stage0_probe_path,
+                    "stage0_probe_hash": stage0_probe_hash,
+                    "stage0_probe_sha256": stage0_probe_hash,
+                    "stage1_evidence": stage1_evidence_path,
+                    "stage1_evidence_hash": stage1_evidence_hash,
+                    "stage1_evidence_sha256": stage1_evidence_hash,
+                    "discovery_output": discovery_output,
+                    "discovery_evidence": discovery_evidence_path,
+                    "discovery_evidence_hash": discovery_evidence_hash,
+                    "discovery_evidence_sha256":
+                        discovery_evidence_hash,
+                    "runner_manifests": runner_manifests_path,
+                    "runner_manifests_output": runner_manifests_path,
+                    "attempt": attempt_path,
+                    "attempt_hash": attempt_hash,
+                    "attempt_sha256": attempt_hash,
                     "evaluations_root": self.runtime.evaluations,
+                    "evaluation_root": self.runtime.evaluations,
                 },
             )
         if evidence_path.is_symlink() or not evidence_path.is_file():
@@ -1543,15 +2601,16 @@ class PromotionController:
         if evidence_bytes != canonical_json_bytes(evidence) + b"\n":
             raise SafetyHalt("configured evaluator evidence must be canonical JSON")
 
-        champion_spec = next(
-            spec
-            for spec in plan.specs
-            if spec.comparison == "candidate-vs-champion-powered"
-        )
+        controller_stage = {
+            "stage-0": "integrity",
+            "stage-1": "screen",
+            "stage-2": "finalist",
+            "stage-3": "confirmation",
+        }[plan.stage]
         expected = {
             "schema_version": 1,
             "finalized": True,
-            "controller_stage": plan.specs[0].stage,
+            "controller_stage": controller_stage,
             "candidate_hash": candidate.model_hash,
             "tested_champion_hash": champion_spec.reference_model_sha,
             "original_hash": self.runtime.controller.original_hash,
@@ -1559,6 +2618,11 @@ class PromotionController:
             "config_hash": plan.config_hash,
             "schedule_hash": plan.schedule_hash,
             "policy_hash": plan.policy_hash,
+            "policy_path": plan.policy_path,
+            "policy_version": plan.policy_version,
+            "suite_manifest_path": plan.suite_manifest_path,
+            "suite_manifest_hash": plan.suite_manifest_hash,
+            "look": plan.look,
             "selfplay_config_hash": plan.selfplay_config_hash,
             "topology": plan.topology,
         }
@@ -1570,7 +2634,230 @@ class PromotionController:
                 "configured evaluator evidence contradicts its immutable plan: "
                 + ", ".join(sorted(conflicts))
             )
-        return evidence
+        supplied_artifacts = evidence.get("schedule_artifacts")
+        if (
+            not isinstance(supplied_artifacts, Mapping)
+            or {
+                key: dict(value)
+                for key, value in supplied_artifacts.items()
+                if isinstance(value, Mapping)
+            }
+            != {
+                key: dict(value)
+                for key, value in plan.schedule_artifacts.items()
+            }
+        ):
+            raise SafetyHalt(
+                "configured evaluator evidence omits exact schedule artifacts"
+            )
+        runner_manifests_path = (
+            self.runtime.evaluations
+            / "controller-adapter"
+            / plan.evaluation_key
+            / "runner-manifests.json"
+        )
+        runner_manifests_hash = evidence.get("runner_manifests_hash")
+        if (
+            evidence.get("runner_manifests_path")
+            != str(runner_manifests_path)
+            or not isinstance(runner_manifests_hash, str)
+            or _SHA_RE.fullmatch(runner_manifests_hash) is None
+            or runner_manifests_path.is_symlink()
+            or not runner_manifests_path.is_file()
+            or sha256_file(runner_manifests_path) != runner_manifests_hash
+        ):
+            raise SafetyHalt(
+                "configured evaluator runner manifest map is missing or changed"
+            )
+        try:
+            runner_map_bytes = runner_manifests_path.read_bytes()
+            runner_map = json.loads(runner_map_bytes)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SafetyHalt(
+                f"configured evaluator runner manifest map is invalid: {exc}"
+            ) from exc
+        if (
+            not isinstance(runner_map, dict)
+            or runner_map_bytes != canonical_json_bytes(runner_map) + b"\n"
+            or set(runner_map) != set(plan.schedule_artifacts)
+            or not all(
+                isinstance(value, str)
+                and Path(value).is_absolute()
+                and not Path(value).is_symlink()
+                and Path(value).is_file()
+                for value in runner_map.values()
+            )
+        ):
+            raise SafetyHalt(
+                "configured evaluator runner manifest map is not canonical/complete"
+            )
+
+        try:
+            evidence_request_path = Path(evidence["stage0_request_path"])
+            evidence_request_hash = _hash(
+                evidence["stage0_request_hash"],
+                "configured evidence Stage-0 request hash",
+            )
+            evidence_probe_path = Path(evidence["stage0_probe_path"])
+            evidence_probe_hash = _hash(
+                evidence.get(
+                    "stage0_probe_sha256",
+                    evidence.get("stage0_probe_hash"),
+                ),
+                "configured evidence Stage-0 probe hash",
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SafetyHalt(
+                "configured evaluator omits finalized Stage-0 provenance"
+            ) from exc
+        self._validate_stage0_probe_artifact(
+            probe_path=evidence_probe_path,
+            probe_hash=evidence_probe_hash,
+            request_path=evidence_request_path,
+            request_hash=evidence_request_hash,
+            candidate_hash=candidate.model_hash,
+            champion_hash=champion_spec.reference_model_sha,
+        )
+        if stage0_request is not None:
+            request_path, request_hash = stage0_request
+            if (
+                evidence_request_path != request_path
+                or evidence_request_hash != request_hash
+            ):
+                raise SafetyHalt(
+                    "configured evaluator Stage-0 provenance contradicts request"
+                )
+        return {
+            **evidence,
+            "candidate_sample_count": candidate.sample_count,
+            "candidate_manifest_hash": candidate.directory_manifest_hash,
+            "evaluator_evidence_path": str(evidence_path),
+            "evaluator_evidence_hash": sha256_file(evidence_path),
+        }
+
+    def _controller_result_path(
+        self, candidate_hash: str, stage: str, look: Optional[str] = None
+    ) -> Path:
+        root = self.runtime.evaluations / "controller-results" / candidate_hash
+        if stage == "confirmation":
+            if look is None:
+                raise ValueError("confirmation result path requires a look")
+            name = f"confirmation-{_canonical_confirmation_look(look)}.json"
+        else:
+            name = f"{stage}.json"
+        return root / name
+
+    @staticmethod
+    def _next_action(
+        decision: str, look: str, gate: Mapping[str, Any]
+    ) -> str:
+        supplied = gate.get("next_action")
+        allowed = {
+            "PROMOTE",
+            "CONTINUE_TO_LOOK_2",
+            "STOP_HARM",
+            "STOP_MAXIMUM_INCONCLUSIVE",
+        }
+        if supplied is None:
+            supplied = (
+                "PROMOTE"
+                if decision == "PASS"
+                else "STOP_HARM"
+                if decision == "FAIL"
+                else "CONTINUE_TO_LOOK_2"
+                if look == "look-1"
+                else "STOP_MAXIMUM_INCONCLUSIVE"
+            )
+        if supplied not in allowed:
+            raise SafetyHalt(f"unknown gate next_action: {supplied!r}")
+        expected_by_decision = {
+            "PASS": {"PROMOTE"},
+            "FAIL": {"STOP_HARM"},
+            "INCONCLUSIVE": {
+                "CONTINUE_TO_LOOK_2"
+                if look == "look-1"
+                else "STOP_MAXIMUM_INCONCLUSIVE"
+            },
+        }
+        if supplied not in expected_by_decision[decision]:
+            raise SafetyHalt(
+                f"gate decision {decision} contradicts next_action {supplied}"
+            )
+        return supplied
+
+    def _reconcile_confirmation_result(
+        self,
+        result: Mapping[str, Any],
+        artifact: CandidateArtifact,
+        plan: EvaluationMatrixPlan,
+        champion_hash: str,
+    ) -> None:
+        if (
+            result.get("candidate_hash") != artifact.model_hash
+            or result.get("tested_champion_hash") != champion_hash
+            or result.get("evaluation_key") != plan.evaluation_key
+            or result.get("look") != plan.look
+        ):
+            raise SafetyHalt(
+                "persisted confirmation result contradicts active evaluation"
+            )
+        decision = result.get("decision")
+        gate = result.get("gate")
+        if (
+            decision not in {"PASS", "FAIL", "INCONCLUSIVE"}
+            or not isinstance(gate, Mapping)
+        ):
+            raise SafetyHalt("persisted confirmation result is malformed")
+        next_action = self._next_action(decision, plan.look, gate)
+        current = self.registry.reconstruct()
+        record = current.candidates.get(artifact.model_hash)
+        if record is None:
+            raise SafetyHalt("confirmation result names an unknown candidate")
+        if record.state in {
+            CandidateState.CONFIRMED,
+            CandidateState.REJECTED,
+            CandidateState.QUARANTINED,
+        }:
+            return
+        if (
+            current.current_champion_hash != champion_hash
+            or record.state != CandidateState.EVALUATING_CONFIRMATION
+            or record.evaluation_key != plan.evaluation_key
+        ):
+            raise SafetyHalt(
+                "confirmation result no longer matches lifecycle state"
+            )
+        provenance = self._provenance(plan.config_hash, plan.schedule_hash)
+        if next_action == "PROMOTE":
+            report_hash = result.get("report_hash")
+            _hash(report_hash, "confirmation report hash")
+            self.registry.transition_candidate(
+                artifact.model_hash,
+                str(artifact.path),
+                CandidateState.CONFIRMED,
+                provenance=provenance,
+                champion_hash=champion_hash,
+                evaluation_key=plan.evaluation_key,
+                reason=f"finalized {plan.look} confirmation PASS",
+                actor=self.runtime.controller.actor,
+                payload={
+                    "look": plan.look,
+                    "report_hash": report_hash,
+                },
+            )
+        elif next_action in {"STOP_HARM", "STOP_MAXIMUM_INCONCLUSIVE"}:
+            self._move_candidate_terminal(
+                artifact,
+                CandidateState.REJECTED,
+                provenance=provenance,
+                champion_hash=champion_hash,
+                evaluation_key=plan.evaluation_key,
+                reason=(
+                    "finalized confirmation harm"
+                    if next_action == "STOP_HARM"
+                    else "maximum confirmation look remained inconclusive"
+                ),
+            )
 
     def process_evaluation_stage(
         self,
@@ -1595,13 +2882,27 @@ class PromotionController:
         candidate_record = state.candidates.get(candidate_hash)
         if candidate_record is None:
             raise SafetyHalt(f"unknown candidate: {candidate_hash}")
+        canonical_look = (
+            _canonical_confirmation_look(look)
+            if stage == "confirmation"
+            else look
+        )
+        if (
+            stage == "confirmation"
+            and candidate_record.tested_champion_hash is not None
+            and candidate_record.state == CandidateState.EVALUATING_CONFIRMATION
+            and candidate_record.tested_champion_hash != state.current_champion_hash
+        ):
+            raise SafetyHalt(
+                "confirmation candidate was evaluated against a stale champion"
+            )
         artifact = inspect_candidate(Path(candidate_record.candidate_path))
         plan = self.build_evaluation_plan(
             candidate_hash,
             state.current_champion_hash,
             suite=suite,
             stage=stage,
-            look=look,
+            look=canonical_look,
             topology=topology,
         )
         if self.recommendation_only:
@@ -1622,6 +2923,140 @@ class PromotionController:
                 "reportHash": sha256_file(report_path),
                 "reused": True,
             }
+        result_path = self._controller_result_path(
+            candidate_hash,
+            stage,
+            plan.look if stage == "confirmation" else None,
+        )
+        if result_path.is_file():
+            persisted = json.loads(result_path.read_text(encoding="utf-8"))
+            if (
+                not isinstance(persisted, dict)
+                or persisted.get("candidate_hash") != candidate_hash
+                or persisted.get("evaluation_key") != plan.evaluation_key
+                or persisted.get("tested_champion_hash")
+                != state.current_champion_hash
+            ):
+                raise SafetyHalt(
+                    f"persisted evaluation result conflicts: {result_path}"
+                )
+            if stage == "confirmation":
+                with self._writer_lock():
+                    self._reconcile_confirmation_result(
+                        persisted,
+                        artifact,
+                        plan,
+                        state.current_champion_hash,
+                    )
+            report_path = self.runtime.reports / f"{plan.evaluation_key}.final.json"
+            return {
+                "decision": persisted["decision"],
+                "nextAction": persisted.get("next_action"),
+                "evaluationKey": plan.evaluation_key,
+                "stage": stage,
+                "look": plan.look,
+                "reportPath": (
+                    str(report_path)
+                    if stage == "confirmation" and report_path.is_file()
+                    else None
+                ),
+                "reportHash": (
+                    sha256_file(report_path)
+                    if stage == "confirmation" and report_path.is_file()
+                    else None
+                ),
+                "reused": True,
+            }
+        if stage == "confirmation":
+            report_path = (
+                self.runtime.reports
+                / f"{plan.evaluation_key}.final.json"
+            )
+            if report_path.is_file():
+                report = json.loads(
+                    report_path.read_text(encoding="utf-8")
+                )
+                report_hash = sha256_file(report_path)
+                gate = report.get("gate")
+                if (
+                    not isinstance(report, dict)
+                    or report.get("finalized") is not True
+                    or report.get("candidate_hash") != candidate_hash
+                    or report.get("tested_champion_hash")
+                    != state.current_champion_hash
+                    or report.get("evaluation_key")
+                    != plan.evaluation_key
+                    or report.get("policy_hash") != plan.policy_hash
+                    or report.get("look") != plan.look
+                    or report.get("matrix") != plan.to_dict()
+                    or not isinstance(gate, Mapping)
+                ):
+                    raise SafetyHalt(
+                        "orphaned confirmation report contradicts active plan"
+                    )
+                decision = report.get("decision")
+                if decision not in {
+                    "PASS",
+                    "FAIL",
+                    "INCONCLUSIVE",
+                }:
+                    raise SafetyHalt(
+                        "orphaned confirmation report decision is invalid"
+                    )
+                next_action = self._next_action(
+                    decision, plan.look, gate
+                )
+                persisted = {
+                    "schema_version": 1,
+                    "candidate_hash": candidate_hash,
+                    "tested_champion_hash":
+                        state.current_champion_hash,
+                    "evaluation_key": plan.evaluation_key,
+                    "stage": stage,
+                    "look": plan.look,
+                    "decision": decision,
+                    "next_action": next_action,
+                    "policy_path": plan.policy_path,
+                    "policy_hash": plan.policy_hash,
+                    "policy_version": plan.policy_version,
+                    "suite_manifest_path":
+                        plan.suite_manifest_path,
+                    "suite_manifest_hash":
+                        plan.suite_manifest_hash,
+                    "schedule_artifacts": {
+                        key: dict(value)
+                        for key, value
+                        in plan.schedule_artifacts.items()
+                    },
+                    "evidence_hash": report.get(
+                        "gate_evidence_hash",
+                        canonical_sha256(gate),
+                    ),
+                    "adapter_artifacts": {},
+                    "gate": dict(gate),
+                    "report_path": str(report_path),
+                    "report_hash": report_hash,
+                }
+                result_path.parent.mkdir(parents=True, exist_ok=True)
+                _write_immutable_json(result_path, persisted)
+                with self._writer_lock():
+                    self._reconcile_confirmation_result(
+                        persisted,
+                        artifact,
+                        plan,
+                        state.current_champion_hash,
+                    )
+                return {
+                    "decision": decision,
+                    "nextAction": next_action,
+                    "evaluationKey": plan.evaluation_key,
+                    "stage": stage,
+                    "look": plan.look,
+                    "reportPath": str(report_path),
+                    "reportHash": report_hash,
+                    "reused": True,
+                    "recovered": True,
+                }
         if self.evaluation_executor is None or self.gate_evaluator is None:
             return {
                 "decision": "INCONCLUSIVE",
@@ -1633,8 +3068,49 @@ class PromotionController:
             if current.current_champion_hash != state.current_champion_hash:
                 raise SafetyHalt("champion changed before evaluation stage started")
             provenance = self._provenance(plan.config_hash, plan.schedule_hash)
-            transition_payload: Dict[str, Any] = {"matrix": plan.to_dict()}
+            transition_payload: Dict[str, Any] = {
+                "matrix": plan.to_dict(),
+                "look": plan.look,
+            }
             if stage == "confirmation":
+                if plan.look == "look-2":
+                    look1 = self._stage_result(
+                        candidate_hash, "confirmation", look="look-1"
+                    )
+                    look1_gate = look1.get("gate") if look1 else None
+                    if (
+                        look1 is None
+                        or look1.get("decision") != "INCONCLUSIVE"
+                        or not isinstance(look1_gate, Mapping)
+                        or self._next_action(
+                            "INCONCLUSIVE", "look-1", look1_gate
+                        )
+                        != "CONTINUE_TO_LOOK_2"
+                    ):
+                        raise SafetyHalt(
+                            "look-2 lacks a finalized look-1 continuation"
+                        )
+                    if (
+                        candidate_record.state
+                        != CandidateState.EVALUATING_CONFIRMATION
+                    ):
+                        raise SafetyHalt(
+                            "look-2 requires an active look-1 confirmation"
+                        )
+                    transition_payload.update(
+                        {
+                            "previous_evaluation_key":
+                                look1["evaluation_key"],
+                            "previous_result_hash": sha256_file(
+                                self._controller_result_path(
+                                    candidate_hash,
+                                    "confirmation",
+                                    "look-1",
+                                )
+                            ),
+                            "prespecified_cumulative_look": True,
+                        }
+                    )
                 self._rank_finalists(current)
                 ranking_path = (
                     self.runtime.evaluations
@@ -1654,6 +3130,16 @@ class PromotionController:
                         "ranking_hash": sha256_file(ranking_path),
                     }
                 )
+            stage0_request = self._stage0_request(
+                plan, artifact, state.current_champion_hash
+            )
+            if stage0_request is not None:
+                transition_payload.update(
+                    {
+                        "stage0_request_path": str(stage0_request[0]),
+                        "stage0_request_hash": stage0_request[1],
+                    }
+                )
             self.registry.transition_candidate(
                 candidate_hash,
                 str(artifact.path),
@@ -1665,12 +3151,39 @@ class PromotionController:
                 actor=self.runtime.controller.actor,
                 payload=transition_payload,
             )
+            if stage == "confirmation" and plan.look == "look-2":
+                self._checkpoint("confirmation-look-2-started")
             handoff_proof: Any = None
             with self._exclusive_gpu_handoff(plan, artifact) as handoff_proof:
                 raw_evidence = self.evaluation_executor(plan, artifact)
             verified_handoff = self._validate_gpu_handoff(handoff_proof)
             if not isinstance(raw_evidence, Mapping):
                 raise SafetyHalt("evaluation executor returned no immutable envelope")
+            exact_bindings = {
+                "policy_path": plan.policy_path,
+                "policy_hash": plan.policy_hash,
+                "policy_version": plan.policy_version,
+                "suite_manifest_path": plan.suite_manifest_path,
+                "suite_manifest_hash": plan.suite_manifest_hash,
+                "schedule_artifacts": {
+                    key: dict(value)
+                    for key, value in plan.schedule_artifacts.items()
+                },
+                "look": plan.look,
+                "candidate_sample_count": artifact.sample_count,
+                "candidate_manifest_hash":
+                    artifact.directory_manifest_hash,
+            }
+            contradicted = [
+                key
+                for key, expected in exact_bindings.items()
+                if key in raw_evidence and raw_evidence[key] != expected
+            ]
+            if contradicted:
+                raise SafetyHalt(
+                    "evaluation evidence contradicts runtime-bound inputs: "
+                    + ", ".join(sorted(contradicted))
+                )
             evidence = {
                 **dict(raw_evidence),
                 "gpu_handoff": verified_handoff,
@@ -1678,39 +3191,51 @@ class PromotionController:
                 "selfplay_config_hash": plan.selfplay_config_hash,
                 "topology": plan.topology,
                 "controller_stage": stage,
+                **exact_bindings,
             }
             gate = dict(self.gate_evaluator(evidence))
             if gate.get("gpu_handoff_hash") != evidence["gpu_handoff_hash"]:
                 raise SafetyHalt("gate result omits or contradicts GPU handoff proof")
+            gate_bindings = {
+                "policy_path": plan.policy_path,
+                "policy_hash": plan.policy_hash,
+                "policy_version": plan.policy_version,
+                "suite_manifest_path": plan.suite_manifest_path,
+                "suite_manifest_hash": plan.suite_manifest_hash,
+                "look": plan.look,
+            }
+            gate_conflicts = [
+                key
+                for key, expected in gate_bindings.items()
+                if key in gate and gate[key] != expected
+            ]
+            if gate_conflicts:
+                raise SafetyHalt(
+                    "gate result contradicts runtime-bound policy/manifest: "
+                    + ", ".join(sorted(gate_conflicts))
+                )
+            for key, value in gate_bindings.items():
+                gate.setdefault(key, value)
             gate["gpu_handoff"] = verified_handoff
             decision = gate.get("decision", "INCONCLUSIVE")
             if decision not in {"PASS", "FAIL", "INCONCLUSIVE"}:
                 raise SafetyHalt(f"unknown gate decision: {decision!r}")
+            next_action = (
+                self._next_action(decision, plan.look, gate)
+                if stage == "confirmation"
+                else None
+            )
+            if next_action is not None:
+                gate["next_action"] = next_action
             result: Dict[str, Any] = {
                 "decision": decision,
+                "nextAction": next_action,
                 "evaluationKey": plan.evaluation_key,
                 "stage": stage,
+                "look": plan.look,
             }
-            result_root = (
-                self.runtime.evaluations / "controller-results" / candidate_hash
-            )
-            result_root.mkdir(parents=True, exist_ok=True)
-            result_name = (
-                "confirmation-look-2.json"
-                if stage == "confirmation" and look == "prespecified-second-look"
-                else f"{stage}.json"
-            )
-            _write_immutable_json(
-                result_root / result_name,
-                {
-                    "schema_version": 1,
-                    "candidate_hash": candidate_hash,
-                    "tested_champion_hash": state.current_champion_hash,
-                    "evaluation_key": plan.evaluation_key,
-                    "decision": decision,
-                    "gate": gate,
-                },
-            )
+            report_path: Optional[Path] = None
+            report_hash: Optional[str] = None
             if stage == "confirmation":
                 report_path, report_hash, _ = self.finalize_gate_report(
                     plan,
@@ -1721,27 +3246,62 @@ class PromotionController:
                 result.update(
                     {"reportPath": str(report_path), "reportHash": report_hash}
                 )
-                if decision == "PASS":
-                    self.registry.transition_candidate(
-                        candidate_hash,
-                        str(artifact.path),
-                        CandidateState.CONFIRMED,
-                        provenance=provenance,
-                        champion_hash=state.current_champion_hash,
-                        evaluation_key=plan.evaluation_key,
-                        reason="finalized confirmation PASS",
-                        actor=self.runtime.controller.actor,
-                        payload={"report_hash": report_hash},
-                    )
-                elif decision == "FAIL":
-                    self._move_candidate_terminal(
-                        artifact,
-                        CandidateState.REJECTED,
-                        provenance=provenance,
-                        champion_hash=state.current_champion_hash,
-                        evaluation_key=plan.evaluation_key,
-                        reason="finalized confirmation FAIL",
-                    )
+            result_path.parent.mkdir(parents=True, exist_ok=True)
+            adapter_artifacts = {
+                key: evidence[key]
+                for key in (
+                    "stage0_request_path",
+                    "stage0_request_hash",
+                    "stage0_probe_path",
+                    "stage0_probe_hash",
+                    "stage0_probe_sha256",
+                    "discovery_evidence_path",
+                    "discovery_evidence_hash",
+                    "discovery_evidence_sha256",
+                    "runner_manifests_path",
+                    "runner_manifests_hash",
+                    "attempt_path",
+                    "attempt_hash",
+                    "evaluator_evidence_path",
+                    "evaluator_evidence_hash",
+                )
+                if key in evidence
+            }
+            persisted_result = {
+                "schema_version": 1,
+                "candidate_hash": candidate_hash,
+                "tested_champion_hash": state.current_champion_hash,
+                "evaluation_key": plan.evaluation_key,
+                "stage": stage,
+                "look": plan.look,
+                "decision": decision,
+                "next_action": next_action,
+                "policy_path": plan.policy_path,
+                "policy_hash": plan.policy_hash,
+                "policy_version": plan.policy_version,
+                "suite_manifest_path": plan.suite_manifest_path,
+                "suite_manifest_hash": plan.suite_manifest_hash,
+                "schedule_artifacts": {
+                    key: dict(value)
+                    for key, value in plan.schedule_artifacts.items()
+                },
+                "evidence_hash": canonical_sha256(evidence),
+                "adapter_artifacts": adapter_artifacts,
+                "gate": gate,
+                "report_path": (
+                    None if report_path is None else str(report_path)
+                ),
+                "report_hash": report_hash,
+            }
+            _write_immutable_json(result_path, persisted_result)
+            if stage == "confirmation":
+                self._checkpoint(f"confirmation-{plan.look}-finalized")
+                self._reconcile_confirmation_result(
+                    persisted_result,
+                    artifact,
+                    plan,
+                    state.current_champion_hash,
+                )
             elif decision == "FAIL":
                 self._move_candidate_terminal(
                     artifact,
@@ -1780,11 +3340,23 @@ class PromotionController:
             "selfplay_config_hash": plan.selfplay_config_hash,
             "topology": plan.topology,
         }
+        optional_gate_bindings = {
+            "policy_path": plan.policy_path,
+            "policy_version": plan.policy_version,
+            "suite_manifest_path": plan.suite_manifest_path,
+            "suite_manifest_hash": plan.suite_manifest_hash,
+            "look": plan.look,
+        }
         conflicts = [
             key
             for key, expected in expected_gate_metadata.items()
             if gate_result.get(key) != expected
         ]
+        conflicts.extend(
+            key
+            for key, expected in optional_gate_bindings.items()
+            if key in gate_result and gate_result.get(key) != expected
+        )
         if conflicts:
             raise SafetyHalt(
                 "gate result is not finalized for the exact evaluation: "
@@ -1809,6 +3381,15 @@ class PromotionController:
             "config_hash": plan.config_hash,
             "schedule_hash": plan.schedule_hash,
             "policy_hash": plan.policy_hash,
+            "policy_path": plan.policy_path,
+            "policy_version": plan.policy_version,
+            "suite_manifest_path": plan.suite_manifest_path,
+            "suite_manifest_hash": plan.suite_manifest_hash,
+            "look": plan.look,
+            "schedule_artifacts": {
+                key: dict(value)
+                for key, value in plan.schedule_artifacts.items()
+            },
             "selfplay_config_hash": plan.selfplay_config_hash,
             "topology": plan.topology,
             "gpu_handoff_hash": gpu_handoff_hash,
@@ -2012,6 +3593,13 @@ class PromotionController:
                 "target_state": target.value,
             },
         )
+        if target in {CandidateState.SUPERSEDED, CandidateState.REJECTED}:
+            self._create_trash_intent(
+                candidate.model_hash,
+                destination,
+                reason=f"{target.value}:{reason}",
+                move=False,
+            )
         return inspect_candidate(destination)
 
     def _reconcile_lifecycle_moves(self) -> None:
@@ -2059,6 +3647,16 @@ class PromotionController:
                     "target_state": target.value,
                 },
             )
+            if target in {
+                CandidateState.SUPERSEDED,
+                CandidateState.REJECTED,
+            }:
+                self._create_trash_intent(
+                    intent["candidate_hash"],
+                    destination,
+                    reason=f"{target.value}:{intent['reason']}",
+                    move=False,
+                )
 
     def _claim_candidate(
         self, candidate: CandidateArtifact, state: Any
@@ -2219,7 +3817,7 @@ class PromotionController:
             )
             for candidate in state.candidates.values()
         )
-        remaining_slots = self.runtime.controller.max_active_queue - active_existing
+        remaining_slots = self._effective_evaluator_limit() - active_existing
         if remaining_slots <= 0:
             selection = BacklogSelection((), tuple(candidates), {})
         else:
@@ -2252,6 +3850,793 @@ class PromotionController:
                         reason="deterministic backlog coalescing",
                     )
         return state, selection, ignored, tuple(item.name for item in duplicates)
+
+    @staticmethod
+    def _storage_manifest(path: Path) -> Tuple[str, int]:
+        if path.is_symlink():
+            raise SafetyHalt(f"retention source is a symlink: {path}")
+        if path.is_dir():
+            return _tree_manifest(path)
+        if path.is_file():
+            return (
+                canonical_sha256(
+                    {
+                        "schemaVersion": 1,
+                        "files": [
+                            {
+                                "path": path.name,
+                                "size": path.stat().st_size,
+                                "sha256": sha256_file(path),
+                            }
+                        ],
+                    }
+                ),
+                path.stat().st_size,
+            )
+        raise SafetyHalt(f"retention source is not a regular file/tree: {path}")
+
+    def _reference_reasons(self, reference_hash: str) -> Tuple[str, ...]:
+        _hash(reference_hash, "retention reference hash")
+        state = self.registry.reconstruct()
+        reasons = set(state.retention_status(reference_hash).reasons)
+        roots = (
+            ("report", self.runtime.reports),
+            ("evaluation", self.runtime.evaluations),
+            ("transaction", self.runtime.promotion_root / "transactions"),
+            ("audit", self.runtime.promotion_root / "audits"),
+        )
+        for kind, root in roots:
+            if not root.exists():
+                continue
+            for path in root.rglob("*.json"):
+                if path.is_symlink() or not path.is_file():
+                    continue
+                try:
+                    if reference_hash in path.read_text(encoding="utf-8"):
+                        reasons.add(
+                            f"{kind}:{path.relative_to(root).as_posix()}"
+                        )
+                except (OSError, UnicodeDecodeError) as exc:
+                    raise SafetyHalt(
+                        f"cannot inspect retention reference {path}: {exc}"
+                    ) from exc
+        return tuple(sorted(reasons))
+
+    def _create_trash_intent(
+        self,
+        reference_hash: str,
+        source_path: Path,
+        *,
+        reason: str,
+        move: bool,
+    ) -> Mapping[str, Any]:
+        _hash(reference_hash, "trash reference hash")
+        _nonempty(reason, "trash reason")
+        source = Path(source_path)
+        intent_path = (
+            self.runtime.promotion_root
+            / "trash"
+            / "intents"
+            / f"{reference_hash}.json"
+        )
+        if intent_path.exists():
+            intent = json.loads(intent_path.read_text(encoding="utf-8"))
+            if (
+                intent.get("reference_hash") != reference_hash
+                or intent.get("source_path") != str(source)
+            ):
+                raise SafetyHalt("trash intent identity conflicts with retry")
+        else:
+            manifest_hash, retained_bytes = self._storage_manifest(source)
+            now = self.now()
+            if now.tzinfo is None or now.utcoffset() is None:
+                raise SafetyHalt("controller clock must return timezone-aware time")
+            now = now.astimezone(timezone.utc)
+            grace_days = _policy_get(
+                self.runtime.frozen_policy,
+                "retention",
+                "trash_grace_period_days",
+                default=30,
+            )
+            if type(grace_days) is not int or grace_days < 30:
+                raise SafetyHalt(
+                    "trash grace period must be at least 30 days"
+                )
+            destination = (
+                self.runtime.promotion_root
+                / "trash"
+                / "objects"
+                / reference_hash
+                / source.name
+            )
+            intent = {
+                "schema_version": 1,
+                "contract": "reference-aware-trash-intent-v1",
+                "reference_hash": reference_hash,
+                "source_path": str(source),
+                "destination_path": str(destination),
+                "source_manifest_hash": manifest_hash,
+                "retained_bytes": retained_bytes,
+                "reason": reason,
+                "created_at_utc": utc_timestamp(now),
+                "delete_not_before_utc": utc_timestamp(
+                    now + timedelta(days=grace_days)
+                ),
+                "grace_period_days": grace_days,
+                "policy_hash": self.runtime.controller.policy_hash,
+            }
+            _write_immutable_json(intent_path, intent)
+        if not move:
+            return {
+                "status": "INTENT_CREATED",
+                "intentPath": str(intent_path),
+                **intent,
+            }
+        return self._reconcile_trash_intent(intent_path, mutate=True)
+
+    def schedule_trash(
+        self,
+        reference_hash: str,
+        source_path: Path,
+        *,
+        reason: str,
+    ) -> Mapping[str, Any]:
+        """Move an unreferenced object to grace storage without deleting it."""
+
+        if self.recommendation_only:
+            return {
+                "status": "RECOMMEND",
+                "referenceHash": reference_hash,
+                "sourcePath": str(source_path),
+                "reason": reason,
+            }
+        with self._writer_lock():
+            self.ensure_layout()
+            return self._create_trash_intent(
+                reference_hash,
+                source_path,
+                reason=reason,
+                move=True,
+            )
+
+    def _reconcile_trash_intent(
+        self, intent_path: Path, *, mutate: bool
+    ) -> Mapping[str, Any]:
+        intent = json.loads(intent_path.read_text(encoding="utf-8"))
+        reference_hash = intent.get("reference_hash")
+        _hash(reference_hash, "trash intent reference hash")
+        if intent.get("policy_hash") != self.runtime.controller.policy_hash:
+            raise SafetyHalt("trash intent policy hash changed")
+        source = Path(intent["source_path"])
+        destination = Path(intent["destination_path"])
+        deleted_path = (
+            self.runtime.promotion_root
+            / "trash"
+            / "deleted"
+            / f"{reference_hash}.json"
+        )
+        if deleted_path.is_file():
+            deleted = json.loads(deleted_path.read_text(encoding="utf-8"))
+            if deleted.get("reference_hash") != reference_hash:
+                raise SafetyHalt("trash deletion marker identity changed")
+            return {
+                "status": "DELETED",
+                "referenceHash": reference_hash,
+                "deletedAtUtc": deleted.get("deleted_at_utc"),
+                "reused": True,
+            }
+        deletion_intent_path = (
+            self.runtime.promotion_root
+            / "trash"
+            / "deletion-intents"
+            / f"{reference_hash}.json"
+        )
+        if (
+            not source.exists()
+            and not destination.exists()
+            and deletion_intent_path.is_file()
+        ):
+            deletion_intent = json.loads(
+                deletion_intent_path.read_text(encoding="utf-8")
+            )
+            if (
+                deletion_intent.get("reference_hash") != reference_hash
+                or deletion_intent.get("object_path") != str(destination)
+                or self._reference_reasons(reference_hash)
+            ):
+                raise SafetyHalt(
+                    "trash deletion recovery has contradictory provenance"
+                )
+            if not mutate:
+                return {
+                    "status": "DELETION_COMMIT_PENDING",
+                    "referenceHash": reference_hash,
+                }
+            _write_immutable_json(
+                deleted_path,
+                {
+                    "schema_version": 1,
+                    "reference_hash": reference_hash,
+                    "deleted_at_utc":
+                        deletion_intent["authorized_at_utc"],
+                    "manifest_hash":
+                        deletion_intent["manifest_file_hash"],
+                },
+            )
+            return {
+                "status": "DELETED",
+                "referenceHash": reference_hash,
+                "deletedAtUtc": deletion_intent[
+                    "authorized_at_utc"
+                ],
+                "recovered": True,
+            }
+        reasons = self._reference_reasons(reference_hash)
+        moved = destination.exists()
+        if not moved and reasons:
+            return {
+                "status": "BLOCKED_REFERENCES",
+                "referenceHash": reference_hash,
+                "reasons": list(reasons),
+                "deleteNotBeforeUtc": intent["delete_not_before_utc"],
+            }
+        if not moved:
+            if not source.exists():
+                raise SafetyHalt(
+                    "trash source and destination are both missing"
+                )
+            if not mutate:
+                return {
+                    "status": "READY_TO_TRASH",
+                    "referenceHash": reference_hash,
+                    "deleteNotBeforeUtc": intent["delete_not_before_utc"],
+                }
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            _recoverable_rename(
+                source,
+                destination,
+                expected_manifest_hash=intent["source_manifest_hash"],
+                inspector=lambda path: self._storage_manifest(path)[0],
+            )
+            moved = True
+        actual_hash, actual_bytes = self._storage_manifest(destination)
+        if (
+            actual_hash != intent["source_manifest_hash"]
+            or actual_bytes != intent["retained_bytes"]
+        ):
+            raise SafetyHalt("trash object contradicts immutable intent")
+        manifest_path = (
+            self.runtime.promotion_root
+            / "trash"
+            / "manifests"
+            / f"{reference_hash}.json"
+        )
+        manifest = {
+            "schema_version": 1,
+            "contract": "reference-aware-trash-manifest-v1",
+            "reference_hash": reference_hash,
+            "object_path": str(destination),
+            "source_path": str(source),
+            "manifest_hash": actual_hash,
+            "retained_bytes": actual_bytes,
+            "created_at_utc": intent["created_at_utc"],
+            "delete_not_before_utc": intent["delete_not_before_utc"],
+            "grace_period_days": intent["grace_period_days"],
+            "policy_hash": intent["policy_hash"],
+        }
+        if mutate:
+            _write_immutable_json(manifest_path, manifest)
+        deadline = _parse_utc_timestamp(intent["delete_not_before_utc"])
+        now = self.now().astimezone(timezone.utc)
+        reasons = self._reference_reasons(reference_hash)
+        if now < deadline:
+            return {
+                "status": "GRACE_PERIOD",
+                "referenceHash": reference_hash,
+                "objectPath": str(destination),
+                "retainedBytes": actual_bytes,
+                "deleteNotBeforeUtc": intent["delete_not_before_utc"],
+                "reasons": list(reasons),
+            }
+        if reasons:
+            return {
+                "status": "BLOCKED_REFERENCES",
+                "referenceHash": reference_hash,
+                "objectPath": str(destination),
+                "retainedBytes": actual_bytes,
+                "reasons": list(reasons),
+            }
+        if not mutate:
+            return {
+                "status": "READY_TO_DELETE",
+                "referenceHash": reference_hash,
+                "objectPath": str(destination),
+            }
+        if deletion_intent_path.is_file():
+            deletion_intent = json.loads(
+                deletion_intent_path.read_text(encoding="utf-8")
+            )
+            expected_deletion = {
+                "reference_hash": reference_hash,
+                "object_path": str(destination),
+                "object_manifest_hash": actual_hash,
+                "manifest_file_hash": sha256_file(manifest_path),
+                "delete_not_before_utc": intent["delete_not_before_utc"],
+                "reference_reasons": [],
+            }
+            if any(
+                deletion_intent.get(key) != value
+                for key, value in expected_deletion.items()
+            ):
+                raise SafetyHalt("trash deletion intent changed on retry")
+        else:
+            deletion_intent = {
+                "schema_version": 1,
+                "reference_hash": reference_hash,
+                "object_path": str(destination),
+                "object_manifest_hash": actual_hash,
+                "manifest_file_hash": sha256_file(manifest_path),
+                "authorized_at_utc": utc_timestamp(now),
+                "delete_not_before_utc": intent["delete_not_before_utc"],
+                "reference_reasons": [],
+            }
+            _write_immutable_json(
+                deletion_intent_path, deletion_intent
+            )
+        if destination.is_dir():
+            shutil.rmtree(destination)
+        else:
+            destination.unlink()
+        fsync_directory(destination.parent)
+        _write_immutable_json(
+            deleted_path,
+            {
+                "schema_version": 1,
+                "reference_hash": reference_hash,
+                "deleted_at_utc":
+                    deletion_intent["authorized_at_utc"],
+                "manifest_hash": sha256_file(manifest_path),
+            },
+        )
+        return {
+            "status": "DELETED",
+            "referenceHash": reference_hash,
+            "deletedAtUtc": deletion_intent["authorized_at_utc"],
+        }
+
+    def reconcile_trash(self, *, mutate: bool = False) -> Tuple[Mapping[str, Any], ...]:
+        root = self.runtime.promotion_root / "trash" / "intents"
+        if not root.exists():
+            return ()
+        return tuple(
+            self._reconcile_trash_intent(path, mutate=mutate)
+            for path in sorted(root.glob("*.json"))
+        )
+
+    def _effective_evaluator_limit(self) -> int:
+        policy_limit = _policy_get(
+            self.runtime.frozen_policy,
+            "queue",
+            "maximum_active_evaluator_entries",
+            default=self.runtime.controller.max_active_queue,
+        )
+        if type(policy_limit) is not int or policy_limit <= 0:
+            raise SafetyHalt("policy evaluator queue limit is invalid")
+        return min(self.runtime.controller.max_active_queue, policy_limit)
+
+    def _backpressure_status(self, state: Any) -> Mapping[str, Any]:
+        candidates, ignored = inventory_candidates(self.runtime.candidate_inbox)
+        active_states = {
+            CandidateState.CLAIMED,
+            CandidateState.EVALUATING_INTEGRITY,
+            CandidateState.EVALUATING_SCREEN,
+            CandidateState.EVALUATING_FINALIST,
+            CandidateState.EVALUATING_CONFIRMATION,
+        }
+        active = [
+            candidate
+            for candidate in state.candidates.values()
+            if candidate.state in active_states
+        ]
+        evaluator_limit = self._effective_evaluator_limit()
+        warning_depth = _policy_get(
+            self.runtime.frozen_policy,
+            "queue",
+            "important_queue_warning_depth",
+            default=evaluator_limit + 1,
+        )
+        if type(warning_depth) is not int or warning_depth <= 0:
+            raise SafetyHalt("policy queue warning depth is invalid")
+        export_depth = len(candidates) + len(ignored)
+        evaluation_depth = len(active)
+        export_paused = (
+            evaluation_depth >= evaluator_limit
+            or export_depth >= warning_depth
+        )
+        evaluation_paused = evaluation_depth >= evaluator_limit
+        reasons = []
+        if evaluation_depth >= evaluator_limit:
+            reasons.append("active-evaluator-limit")
+        if export_depth >= warning_depth:
+            reasons.append("export-backlog-warning-depth")
+        return {
+            "exportBacklogDepth": export_depth,
+            "evaluationBacklogDepth": evaluation_depth,
+            "maximumActiveEvaluatorEntries": evaluator_limit,
+            "importantQueueWarningDepth": warning_depth,
+            "exportPaused": export_paused,
+            "evaluationPaused": evaluation_paused,
+            "allowExport": not export_paused,
+            "allowEvaluation": not evaluation_paused,
+            "reasons": reasons,
+        }
+
+    @staticmethod
+    def _path_size(path: Path) -> int:
+        if path.is_symlink() or not path.exists():
+            return 0
+        if path.is_file():
+            return path.stat().st_size
+        total = 0
+        for child in path.rglob("*"):
+            if child.is_symlink():
+                continue
+            if child.is_file():
+                total += child.stat().st_size
+        return total
+
+    def _retained_bytes(self, state: Any) -> int:
+        paths = {
+            self.runtime.original_model_path,
+            self.runtime.policy_path,
+            self.runtime.powered_config_path,
+            self.runtime.standard_config_path,
+            self.runtime.selfplay_config_path,
+            self.runtime.gpu_lease_config_path,
+            self.runtime.suites / "manifest.json",
+            self.runtime.reports,
+            self.runtime.rollback_quarantine,
+        }
+        manifest, _ = self._load_suite_manifest()
+        for bank in manifest.get("banks", []):
+            if not isinstance(bank, Mapping):
+                continue
+            for role in ("positions", "schedule"):
+                artifact = bank.get(role)
+                relative = (
+                    artifact.get("path")
+                    if isinstance(artifact, Mapping)
+                    else None
+                )
+                if isinstance(relative, str):
+                    paths.add(self.runtime.suites / relative)
+        for cell in self._manifest_cells(manifest):
+            relative = self._cell_value(cell, "schedule_path", "path")
+            if isinstance(relative, str):
+                paths.add(self.runtime.suites / relative)
+        if not self._manifest_cells(manifest):
+            paths.update(
+                {
+                    self.runtime.discovery_schedule_path,
+                    self.runtime.confirmation_schedule_path,
+                    self.runtime.audit_schedule_path,
+                    self.runtime.lead40_schedule_path,
+                    self.runtime.lead80_schedule_path,
+                    self.runtime.standard_confirmation_schedule_path,
+                }
+            )
+        for candidate in state.candidates.values():
+            if state.is_pinned(candidate.candidate_hash):
+                paths.add(Path(candidate.candidate_path))
+        for generation in state.generations.values():
+            if generation.candidate_path is not None and state.is_pinned(
+                generation.candidate_hash
+            ):
+                paths.add(Path(generation.candidate_path))
+        for manifest_path in (
+            self.runtime.promotion_root / "trash" / "manifests"
+        ).glob("*.json"):
+            value = json.loads(manifest_path.read_text(encoding="utf-8"))
+            paths.add(Path(value["object_path"]))
+        return sum(self._path_size(path) for path in paths)
+
+    def _lease_status(self) -> Mapping[str, Any]:
+        if not self.runtime.lock_path.exists():
+            return {"owner": None, "pid": None, "acquiredAtUtc": None}
+        try:
+            value = json.loads(
+                self.runtime.lock_path.read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return {
+                "owner": None,
+                "pid": None,
+                "acquiredAtUtc": None,
+                "status": "unreadable",
+            }
+        active = self._writer_lock_depth > 0
+        if not active:
+            descriptor = os.open(str(self.runtime.lock_path), os.O_RDONLY)
+            try:
+                try:
+                    fcntl.flock(
+                        descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB
+                    )
+                except BlockingIOError:
+                    active = True
+                else:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+        return {
+            "owner": value.get("actor") if active else None,
+            "pid": value.get("pid") if active else None,
+            "acquiredAtUtc": (
+                value.get("acquired_at_utc") if active else None
+            ),
+            "lastOwner": value.get("actor"),
+        }
+
+    def _active_evaluation_status(self, state: Any) -> List[Mapping[str, Any]]:
+        evaluating = {
+            CandidateState.EVALUATING_INTEGRITY,
+            CandidateState.EVALUATING_SCREEN,
+            CandidateState.EVALUATING_FINALIST,
+            CandidateState.EVALUATING_CONFIRMATION,
+        }
+        rows = []
+        for candidate in sorted(
+            state.candidates.values(),
+            key=lambda item: item.candidate_hash,
+        ):
+            if candidate.state not in evaluating:
+                continue
+            event = next(
+                (
+                    item
+                    for item in reversed(state.events)
+                    if item.candidate_hash == candidate.candidate_hash
+                    and item.sequence == candidate.last_sequence
+                ),
+                None,
+            )
+            matrix = (
+                event.payload.get("matrix")
+                if event is not None
+                and isinstance(event.payload.get("matrix"), Mapping)
+                else {}
+            )
+            rows.append(
+                {
+                    "candidateHash": candidate.candidate_hash,
+                    "state": candidate.state.value,
+                    "stage": matrix.get(
+                        "stage", candidate.state.value
+                    ),
+                    "look": (
+                        event.payload.get("look")
+                        if event is not None
+                        else matrix.get("look")
+                    ),
+                    "evaluationKey": candidate.evaluation_key,
+                    "startedAtUtc": (
+                        event.timestamp_utc if event is not None else None
+                    ),
+                }
+            )
+        return rows
+
+    def _worker_ack_status(self, state: Any) -> List[Mapping[str, Any]]:
+        rows = []
+        for generation in sorted(
+            state.generations.values(),
+            key=lambda item: item.generation_id,
+        ):
+            if generation.state not in {
+                GenerationState.CANARY,
+                GenerationState.ROLLOUT,
+                GenerationState.ACTIVE,
+                GenerationState.ROLLBACK_PENDING,
+            } or generation.candidate_path is None:
+                continue
+            acknowledged = sorted(
+                self._acknowledged(
+                    generation.generation_id,
+                    generation.candidate_hash,
+                )
+            )
+            rows.append(
+                {
+                    "generationId": generation.generation_id,
+                    "candidateHash": generation.candidate_hash,
+                    "state": generation.state.value,
+                    "acknowledgedWorkerIds": acknowledged,
+                    "acknowledgedCount": len(acknowledged),
+                    "expectedCount": self.runtime.controller.worker_count,
+                }
+            )
+        return rows
+
+    def record_promotion_feedback(
+        self,
+        generation_id: str,
+        kind: str,
+        *,
+        evidence: Mapping[str, Any],
+    ) -> Path:
+        """Record a hash-bound first-data/shuffle/training feedback milestone."""
+
+        if not self.automatic:
+            raise SafetyHalt("promotion feedback mutation is disabled")
+        allowed = {
+            "first-game",
+            "first-tdata",
+            "first-shuffle",
+            "first-training-consumption",
+        }
+        if kind not in allowed:
+            raise ValueError(f"unknown promotion feedback kind: {kind}")
+        if not isinstance(evidence, Mapping):
+            raise ValueError("promotion feedback evidence must be an object")
+        with self._writer_lock():
+            transaction = self._transaction_dir(generation_id)
+            state = self.registry.reconstruct()
+            generation = state.generations.get(generation_id)
+            if generation is None:
+                raise SafetyHalt("promotion feedback names unknown generation")
+            evidence_copy = dict(evidence)
+            supplied_generation = evidence_copy.get("generation_id")
+            supplied_candidate = evidence_copy.get("candidate_hash")
+            if supplied_generation not in {None, generation_id}:
+                raise SafetyHalt("promotion feedback generation changed")
+            if supplied_candidate not in {None, generation.candidate_hash}:
+                raise SafetyHalt("promotion feedback candidate changed")
+            path = transaction / f"feedback-{kind}.json"
+            evidence_hash = canonical_sha256(evidence_copy)
+            if path.is_file():
+                existing = json.loads(path.read_text(encoding="utf-8"))
+                if (
+                    existing.get("generation_id") != generation_id
+                    or existing.get("candidate_hash")
+                    != generation.candidate_hash
+                    or existing.get("kind") != kind
+                    or existing.get("evidence_hash") != evidence_hash
+                    or existing.get("evidence") != evidence_copy
+                ):
+                    raise SafetyHalt(
+                        "promotion feedback retry changed immutable evidence"
+                    )
+                return path
+            payload = {
+                "schema_version": 1,
+                "generation_id": generation_id,
+                "candidate_hash": generation.candidate_hash,
+                "kind": kind,
+                "observed_at_utc": utc_timestamp(self.now()),
+                "evidence": evidence_copy,
+                "evidence_hash": evidence_hash,
+            }
+            _write_immutable_json(path, payload)
+            return path
+
+    def _promotion_feedback_status(self, state: Any) -> List[Mapping[str, Any]]:
+        rows = []
+        for generation in sorted(
+            state.generations.values(),
+            key=lambda item: item.generation_id,
+        ):
+            transaction = (
+                self.runtime.promotion_root
+                / "transactions"
+                / generation.generation_id
+            )
+            if not transaction.exists():
+                continue
+            active_event = next(
+                (
+                    event
+                    for event in reversed(state.events)
+                    if event.transition == Transition.GENERATION_ACTIVATED
+                    and event.payload.get("generation_id")
+                    == generation.generation_id
+                ),
+                None,
+            )
+            feedback: Dict[str, Any] = {
+                "generationId": generation.generation_id,
+                "candidateHash": generation.candidate_hash,
+                "promotedAtUtc": (
+                    active_event.timestamp_utc
+                    if active_event is not None
+                    else None
+                ),
+            }
+            for kind in (
+                "first-game",
+                "first-tdata",
+                "first-shuffle",
+                "first-training-consumption",
+            ):
+                path = transaction / f"feedback-{kind}.json"
+                observed = (
+                    json.loads(path.read_text(encoding="utf-8")).get(
+                        "observed_at_utc"
+                    )
+                    if path.is_file()
+                    else None
+                )
+                feedback[
+                    kind.replace("-", "_") + "_at_utc"
+                ] = observed
+                camel = {
+                    "first-game": "firstGameAtUtc",
+                    "first-tdata": "firstTdataAtUtc",
+                    "first-shuffle": "firstShuffleAtUtc",
+                    "first-training-consumption":
+                        "firstTrainingConsumptionAtUtc",
+                }[kind]
+                feedback[camel] = observed
+                if (
+                    observed is not None
+                    and feedback["promotedAtUtc"] is not None
+                ):
+                    feedback[
+                        camel.removesuffix("AtUtc") + "LatencySeconds"
+                    ] = max(
+                        0.0,
+                        (
+                            _parse_utc_timestamp(observed)
+                            - _parse_utc_timestamp(
+                                feedback["promotedAtUtc"]
+                            )
+                        ).total_seconds(),
+                    )
+            rows.append(feedback)
+        return rows
+
+    def _queue_status(self, state: Any) -> Mapping[str, Any]:
+        candidates, ignored = inventory_candidates(self.runtime.candidate_inbox)
+        paths = [item.path for item in candidates]
+        for candidate in state.candidates.values():
+            path = Path(candidate.candidate_path)
+            if path.exists():
+                paths.append(path)
+        now_epoch = self.now().timestamp()
+        ages = [
+            max(0.0, now_epoch - path.stat().st_mtime)
+            for path in paths
+            if path.exists()
+        ]
+        active_depth = len(self._active_evaluation_status(state))
+        pending_depth = len(candidates) + len(ignored)
+        return {
+            "depth": pending_depth + active_depth,
+            "pendingDepth": pending_depth,
+            "readyDepth": len(candidates),
+            "ignoredDepth": len(ignored),
+            "oldestAgeSeconds": max(ages) if ages else 0.0,
+            "activeDepth": active_depth,
+        }
+
+    def _audit_queue_status(self) -> Mapping[str, Any]:
+        root = self.runtime.promotion_root / "audits" / "queue"
+        requests = sorted(root.glob("*.json")) if root.exists() else []
+        reports_root = self.runtime.promotion_root / "audits" / "reports"
+        pending = [
+            path
+            for path in requests
+            if not (reports_root / path.name).is_file()
+        ]
+        now = self.now().timestamp()
+        ages = [
+            max(0.0, now - path.stat().st_mtime)
+            for path in pending
+        ]
+        return {
+            "depth": len(requests),
+            "pendingDepth": len(pending),
+            "oldestPendingAgeSeconds": max(ages) if ages else 0.0,
+        }
 
     def reconcile(self, *, mutate: bool = False) -> Mapping[str, Any]:
         """Validate projections and manifests; recommendation mode is read-only."""
@@ -2319,6 +4704,39 @@ class PromotionController:
                         "complete": (path.parent / "complete.json").exists(),
                     }
                 )
+        backpressure = self._backpressure_status(state)
+        if backpressure["exportPaused"]:
+            warnings.append("export-backpressure-active")
+        if backpressure["evaluationPaused"]:
+            warnings.append("evaluation-backpressure-active")
+        if mutate:
+            operations_path = (
+                self.runtime.promotion_root
+                / "operations"
+                / "backpressure.json"
+            )
+            atomic_write_bytes(
+                operations_path,
+                canonical_json_bytes(
+                    {
+                        "schema_version": 1,
+                        "updated_at_utc": utc_timestamp(self.now()),
+                        "controller_hash":
+                            self.runtime.controller.controller_hash,
+                        "policy_hash": self.runtime.controller.policy_hash,
+                        **backpressure,
+                    }
+                )
+                + b"\n",
+            )
+        queue_status = self._queue_status(state)
+        active_evaluations = self._active_evaluation_status(state)
+        worker_acknowledgements = self._worker_ack_status(state)
+        promotion_feedback = self._promotion_feedback_status(state)
+        audit_queue = self._audit_queue_status()
+        trash_status = list(self.reconcile_trash(mutate=False))
+        lease_status = self._lease_status()
+        retained_bytes = self._retained_bytes(state)
         return {
             "mode": "automatic" if mutate else "recommend-only",
             "lastSequence": state.last_sequence,
@@ -2328,18 +4746,62 @@ class PromotionController:
             "candidates": candidate_status,
             "pins": sorted(state.pins),
             "transactions": transactions,
+            "queue": queue_status,
+            "queueDepth": queue_status["depth"],
+            "queueAgeSeconds": queue_status["oldestAgeSeconds"],
+            "backpressure": backpressure,
+            "lease": lease_status,
+            "leaseOwner": lease_status["owner"],
+            "activeEvaluations": active_evaluations,
+            "activeStage": (
+                active_evaluations[0]["stage"]
+                if active_evaluations
+                else None
+            ),
+            "activeLook": (
+                active_evaluations[0]["look"]
+                if active_evaluations
+                else None
+            ),
+            "retention": {
+                "retainedBytes": retained_bytes,
+                "retainedHashes": sorted(state.retained_hashes()),
+            },
+            "retainedBytes": retained_bytes,
+            "workerAcknowledgements": worker_acknowledgements,
+            "workerAcks": worker_acknowledgements,
+            "promotionFeedback": promotion_feedback,
+            "promotionFeedbackTimestamps": promotion_feedback,
+            "deepAuditQueue": audit_queue,
+            "trash": trash_status,
             "warnings": sorted(warnings),
         }
 
     def _stage_result(
-        self, candidate_hash: str, stage: str
+        self,
+        candidate_hash: str,
+        stage: str,
+        *,
+        look: Optional[str] = None,
     ) -> Optional[Mapping[str, Any]]:
-        path = (
-            self.runtime.evaluations
-            / "controller-results"
-            / candidate_hash
-            / f"{stage}.json"
-        )
+        if stage == "confirmation" and look is None:
+            paths = (
+                self._controller_result_path(
+                    candidate_hash, stage, "look-2"
+                ),
+                self._controller_result_path(
+                    candidate_hash, stage, "look-1"
+                ),
+                self.runtime.evaluations
+                / "controller-results"
+                / candidate_hash
+                / "confirmation.json",
+            )
+            path = next((item for item in paths if item.exists()), paths[0])
+        else:
+            path = self._controller_result_path(
+                candidate_hash, stage, look
+            )
         if not path.exists():
             return None
         try:
@@ -2350,6 +4812,16 @@ class PromotionController:
             not isinstance(value, dict)
             or value.get("candidate_hash") != candidate_hash
             or value.get("decision") not in {"PASS", "FAIL", "INCONCLUSIVE"}
+            or (
+                stage == "confirmation"
+                and look is not None
+                and value.get("look") != _canonical_confirmation_look(look)
+            )
+            or (
+                value.get("policy_hash") is not None
+                and value.get("policy_hash")
+                != self.runtime.controller.policy_hash
+            )
         ):
             raise SafetyHalt(f"controller evaluation result contradicts candidate: {path}")
         return value
@@ -2362,10 +4834,15 @@ class PromotionController:
         )
         if ranking_path.exists():
             value = json.loads(ranking_path.read_text(encoding="utf-8"))
+            stored_hash = value.get("ranking_hash")
+            unhashed = dict(value)
+            unhashed.pop("ranking_hash", None)
             if (
                 value.get("generation_id") != state.current_generation_id
                 or value.get("champion_hash") != state.current_champion_hash
                 or value.get("policy_hash") != self.runtime.controller.policy_hash
+                or not isinstance(stored_hash, str)
+                or stored_hash != canonical_sha256(unhashed)
             ):
                 raise SafetyHalt("persisted finalist ranking provenance changed")
             return value
@@ -2391,35 +4868,84 @@ class PromotionController:
                 continue
             if not isinstance(gate, Mapping):
                 return None
-            utility = gate.get("realized_powered_utility_lower_bound")
-            risk = gate.get("final50_risk_upper_bound")
+            summary = gate.get("ranking_summary")
+            if not isinstance(summary, Mapping):
+                continue
+            utility = summary.get(
+                "realized_powered_utility_lower_bound"
+            )
+            risk = summary.get(
+                "final50_risk_upper_bound",
+                summary.get("final_50_risk_upper_bound"),
+            )
+            sample_count = summary.get(
+                "sample_count",
+                summary.get("training_sample_count"),
+            )
+            statistics_artifact_hash = summary.get(
+                "statistics_artifact_hash"
+            )
+            statistics_manifest_hash = summary.get(
+                "statistics_manifest_hash"
+            )
+            candidate_manifest_hash = summary.get(
+                "candidate_manifest_hash"
+            )
             if (
-                isinstance(utility, bool)
+                summary.get("schema_version") != 1
+                or summary.get("source_bound") is not True
+                or summary.get("candidate_hash") != record.candidate_hash
+                or not isinstance(statistics_artifact_hash, str)
+                or _SHA_RE.fullmatch(statistics_artifact_hash) is None
+                or not isinstance(statistics_manifest_hash, str)
+                or _SHA_RE.fullmatch(statistics_manifest_hash) is None
+                or not isinstance(candidate_manifest_hash, str)
+                or _SHA_RE.fullmatch(candidate_manifest_hash) is None
+                or candidate_manifest_hash
+                != inspect_candidate(
+                    Path(record.candidate_path)
+                ).directory_manifest_hash
+                or isinstance(utility, bool)
                 or not isinstance(utility, (int, float))
                 or isinstance(risk, bool)
                 or not isinstance(risk, (int, float))
+                or type(sample_count) is not int
+                or sample_count < 0
             ):
                 continue
-            sample_count, _ = parse_candidate_counters(
-                Path(record.candidate_path).name
-            )
             rows.append(
                 {
                     "candidate_hash": record.candidate_hash,
                     "realized_powered_utility_lower_bound": float(utility),
                     "final50_risk_upper_bound": float(risk),
                     "sample_count": sample_count,
+                    "statistics_artifact_hash":
+                        statistics_artifact_hash,
+                    "statistics_manifest_hash":
+                        statistics_manifest_hash,
+                    "candidate_manifest_hash": candidate_manifest_hash,
                 }
             )
         if not rows:
             return None
+
+        tie_width = _policy_get(
+            self.runtime.frozen_policy,
+            "evaluation_stages",
+            "stage_2_finalist_selection",
+            "utility_tie_width",
+            default=0.10,
+        )
+        tie_width_number = _finite_number(tie_width)
+        if tie_width_number is None or tie_width_number < 0.0:
+            raise SafetyHalt("frozen finalist utility tie width is invalid")
 
         def compare(left: Mapping[str, Any], right: Mapping[str, Any]) -> int:
             utility_delta = (
                 left["realized_powered_utility_lower_bound"]
                 - right["realized_powered_utility_lower_bound"]
             )
-            if abs(utility_delta) > 0.10:
+            if abs(utility_delta) > tie_width_number:
                 return -1 if utility_delta > 0 else 1
             if left["final50_risk_upper_bound"] != right["final50_risk_upper_bound"]:
                 return (
@@ -2430,6 +4956,8 @@ class PromotionController:
                 )
             if left["sample_count"] != right["sample_count"]:
                 return -1 if left["sample_count"] > right["sample_count"] else 1
+            if left["candidate_hash"] == right["candidate_hash"]:
+                return 0
             return -1 if left["candidate_hash"] < right["candidate_hash"] else 1
 
         ranked = sorted(rows, key=functools.cmp_to_key(compare))
@@ -2440,6 +4968,7 @@ class PromotionController:
             "policy_hash": self.runtime.controller.policy_hash,
             "ranking_rule":
                 "utility-lcb;within-0.10-final50-risk;later-sample",
+            "utility_tie_width": tie_width_number,
             "ranked": ranked,
             "selected_candidate_hash": ranked[0]["candidate_hash"],
         }
@@ -2480,6 +5009,27 @@ class PromotionController:
             CandidateState.EVALUATING_SCREEN: "finalist",
             CandidateState.EVALUATING_FINALIST: "confirmation",
         }
+
+        def active_confirmation_look(candidate_hash: str) -> str:
+            for event in reversed(state.events):
+                if (
+                    event.transition
+                    == Transition.EVALUATION_CONFIRMATION_STARTED
+                    and event.candidate_hash == candidate_hash
+                ):
+                    event_look = event.payload.get("look")
+                    if event_look is None:
+                        matrix = event.payload.get("matrix")
+                        event_look = (
+                            matrix.get("look")
+                            if isinstance(matrix, Mapping)
+                            else None
+                        )
+                    return _canonical_confirmation_look(
+                        event_look or "look-1"
+                    )
+            return "look-1"
+
         for record in sorted(
             state.candidates.values(),
             key=lambda item: (Path(item.candidate_path).name, item.candidate_hash),
@@ -2493,50 +5043,42 @@ class PromotionController:
                 if record.state != CandidateState.CLAIMED
                 else None
             )
+            selected_look = "automatic"
             if prior_result is not None:
-                if prior_result["decision"] != "PASS":
-                    if (
-                        prior_stage == "confirmation"
-                        and prior_result["decision"] == "INCONCLUSIVE"
-                    ):
-                        gate = prior_result.get("gate", {})
-                        authorized = (
-                            isinstance(gate, Mapping)
-                            and gate.get("second_look_authorized") is True
-                            and _SHA_RE.fullmatch(
-                                str(gate.get("new_holdout_hash", ""))
-                            )
-                            is not None
-                            and _SHA_RE.fullmatch(
-                                str(gate.get("new_alpha_allocation_hash", ""))
-                            )
-                            is not None
+                if prior_stage == "confirmation":
+                    result_look = _canonical_confirmation_look(
+                        prior_result.get("look")
+                        or active_confirmation_look(record.candidate_hash)
+                    )
+                    gate = prior_result.get("gate")
+                    if not isinstance(gate, Mapping):
+                        raise SafetyHalt(
+                            "confirmation result lacks a gate report"
                         )
-                        outcomes.append(
-                            {
-                                "candidateHash": record.candidate_hash,
-                                "stage": prior_stage,
-                                "decision": "PENDING",
-                                "reason": (
-                                    "second-look-allocation-awaiting-execution"
-                                    if authorized
-                                    else
-                                    "second-look-holdout-and-alpha-not-authorized"
-                                ),
-                            }
-                        )
-                        continue
+                    action = self._next_action(
+                        prior_result["decision"], result_look, gate
+                    )
+                    if action == "CONTINUE_TO_LOOK_2":
+                        stage = "confirmation"
+                        selected_look = "look-2"
                     else:
-                        outcomes.append(
-                            {
-                                "candidateHash": record.candidate_hash,
-                                "stage": prior_stage,
-                                "decision": prior_result["decision"],
-                                "reused": True,
-                            }
-                        )
-                        continue
-                stage = next_after_pass.get(record.state, stage)
+                        selected_look = result_look
+                elif prior_result["decision"] != "PASS":
+                    outcomes.append(
+                        {
+                            "candidateHash": record.candidate_hash,
+                            "stage": prior_stage,
+                            "decision": prior_result["decision"],
+                            "reused": True,
+                        }
+                    )
+                    continue
+                else:
+                    stage = next_after_pass.get(record.state, stage)
+            elif stage == "confirmation":
+                selected_look = active_confirmation_look(
+                    record.candidate_hash
+                )
             if stage == "confirmation":
                 if ranked_confirmation is None:
                     outcomes.append(
@@ -2573,28 +5115,359 @@ class PromotionController:
                     continue
                 confirmation_inflight = True
                 confirmation_allocations.add(record.candidate_hash)
+                if selected_look == "automatic":
+                    selected_look = "look-1"
             outcome = dict(
                 self.process_evaluation_stage(
                     record.candidate_hash,
                     stage=stage,
                     suite="confirmation" if stage == "confirmation" else stage,
-                    look=(
-                        "prespecified-second-look"
-                        if (
-                            stage == "confirmation"
-                            and prior_result is not None
-                            and prior_result.get("decision") == "INCONCLUSIVE"
-                        )
-                        else "fresh"
-                        if stage == "confirmation"
-                        else "automatic"
-                    ),
+                    look=selected_look,
                     topology="7-workers-100-threads",
                 )
             )
             outcome["candidateHash"] = record.candidate_hash
             outcomes.append(outcome)
         return tuple(outcomes)
+
+    def _near_safety_boundary(self, report: Mapping[str, Any]) -> bool:
+        gate = report.get("gate")
+        if not isinstance(gate, Mapping):
+            return False
+        summary = gate.get("ranking_summary")
+        for container in (gate, summary):
+            if isinstance(container, Mapping) and container.get(
+                "near_safety_boundary"
+            ) is True:
+                return True
+        fraction = _policy_get(
+            self.runtime.frozen_policy,
+            "evaluation_stages",
+            "deep_audit",
+            "near_boundary_fraction",
+            default=0.10,
+        )
+        fraction_value = _finite_number(fraction)
+        if fraction_value is None or fraction_value < 0.0:
+            raise SafetyHalt("deep-audit near-boundary policy is invalid")
+        zero_margin = _policy_get(
+            self.runtime.frozen_policy,
+            "evaluation_stages",
+            "deep_audit",
+            "near_zero_absolute_margin",
+            default=0.01,
+        )
+        zero_margin_value = _finite_number(zero_margin)
+        if zero_margin_value is None or zero_margin_value < 0.0:
+            raise SafetyHalt("deep-audit near-zero margin is invalid")
+        checks = gate.get("checks")
+        if not isinstance(checks, list):
+            return False
+        for check in checks:
+            if not isinstance(check, Mapping) or check.get("status") != "PASS":
+                continue
+            code = str(check.get("code", ""))
+            if not any(
+                token in code
+                for token in ("RISK_", "UTILITY_", "WIN_RATE_")
+            ):
+                continue
+            actual = _finite_number(check.get("actual"))
+            expected = _finite_number(check.get("expected"))
+            if actual is None or expected is None:
+                continue
+            tolerance = (
+                zero_margin_value
+                if expected == 0.0
+                else max(1.0e-12, abs(expected) * fraction_value)
+            )
+            if abs(actual - expected) <= tolerance:
+                return True
+        return False
+
+    def schedule_deep_audit(
+        self,
+        generation_id: str,
+        candidate_hash: str,
+        *,
+        reasons: Sequence[str],
+    ) -> Mapping[str, Any]:
+        """Durably enqueue one deterministic audit without launching a thread."""
+
+        if not self.automatic:
+            return {
+                "scheduled": False,
+                "recommendation": True,
+                "generation_id": generation_id,
+                "candidate_hash": candidate_hash,
+                "reasons": sorted(set(reasons)),
+            }
+        self._transaction_dir(generation_id)
+        _hash(candidate_hash, "deep-audit candidate hash")
+        normalized_reasons = sorted(
+            {
+                _nonempty(reason, "deep-audit reason")
+                for reason in reasons
+            }
+        )
+        if not normalized_reasons:
+            raise SafetyHalt("deep audit requires at least one reason")
+        state = self.registry.reconstruct()
+        generation = state.generations.get(generation_id)
+        if (
+            generation is None
+            or generation.candidate_hash != candidate_hash
+            or generation.state != GenerationState.ACTIVE
+        ):
+            raise SafetyHalt("deep audit requires the active generation")
+        activation = next(
+            (
+                event
+                for event in reversed(state.events)
+                if event.transition == Transition.GENERATION_ACTIVATED
+                and event.payload.get("generation_id") == generation_id
+            ),
+            None,
+        )
+        if activation is None:
+            raise SafetyHalt("active generation has no activation event")
+        policy = _policy_get(
+            self.runtime.frozen_policy,
+            "evaluation_stages",
+            "deep_audit",
+        )
+        if not isinstance(policy, Mapping):
+            raise SafetyHalt("frozen policy has no deep-audit contract")
+        manifest, _ = self._load_suite_manifest()
+        audit_bank = next(
+            (
+                bank
+                for bank in manifest.get("banks", [])
+                if isinstance(bank, Mapping)
+                and bank.get("name") == "audit"
+            ),
+            None,
+        )
+        audit_schedule_path = self.runtime.audit_schedule_path
+        audit_schedule_hash = self.runtime.controller.audit_schedule_hash
+        audit_schedule_id = None
+        audit_bank_hash = None
+        if isinstance(audit_bank, Mapping):
+            schedule = audit_bank.get("schedule")
+            positions = audit_bank.get("positions")
+            if not isinstance(schedule, Mapping) or not isinstance(
+                positions, Mapping
+            ):
+                raise SafetyHalt("audit suite bank is incomplete")
+            relative = schedule.get("path")
+            if (
+                not isinstance(relative, str)
+                and manifest.get("schemaVersion") == 2
+            ):
+                raise SafetyHalt("audit suite bank has no schedule path")
+            if isinstance(relative, str):
+                relative_path = Path(relative)
+                if (
+                    relative_path.is_absolute()
+                    or ".." in relative_path.parts
+                ):
+                    raise SafetyHalt(
+                        "deep-audit schedule path is unsafe"
+                    )
+                audit_schedule_path = (
+                    self.runtime.suites / relative_path
+                )
+                audit_schedule_hash = schedule.get("sha256")
+                audit_schedule_id = schedule.get("scheduleId")
+                audit_bank_hash = positions.get("sha256")
+                _hash(audit_schedule_hash, "deep-audit schedule hash")
+                _hash(audit_bank_hash, "deep-audit bank hash")
+                _nonempty(audit_schedule_id, "deep-audit schedule ID")
+                if (
+                    audit_schedule_path.is_symlink()
+                    or not audit_schedule_path.is_file()
+                    or sha256_file(audit_schedule_path)
+                    != audit_schedule_hash
+                ):
+                    raise SafetyHalt("deep-audit schedule changed")
+        request = {
+            "schema_version": 1,
+            "contract": "risk-score-deep-audit-request-v1",
+            "generation_id": generation_id,
+            "candidate_hash": candidate_hash,
+            "previous_champion_hash": generation.previous_champion_hash,
+            "policy_path": str(self.runtime.policy_path),
+            "policy_hash": self.runtime.controller.policy_hash,
+            "policy_version": self.runtime.frozen_policy.get("policy_version"),
+            "suite_manifest_path": str(
+                self.runtime.suites / "manifest.json"
+            ),
+            "suite_manifest_hash":
+                self.runtime.controller.suite_manifest_hash,
+            "audit_schedule_path": str(audit_schedule_path),
+            "audit_schedule_hash": audit_schedule_hash,
+            "audit_schedule_id": audit_schedule_id,
+            "audit_bank_hash": audit_bank_hash,
+            "activation_event_hash": activation.event_hash,
+            "scheduled_at_utc": activation.timestamp_utc,
+            "reasons": normalized_reasons,
+            "audit_contract": dict(policy),
+        }
+        path = (
+            self.runtime.promotion_root
+            / "audits"
+            / "queue"
+            / f"{generation_id}.json"
+        )
+        _write_immutable_json(path, request)
+        return {
+            "scheduled": True,
+            "generation_id": generation_id,
+            "candidate_hash": candidate_hash,
+            "request_path": str(path),
+            "request_hash": sha256_file(path),
+            "reasons": normalized_reasons,
+        }
+
+    def _schedule_deep_audit_if_needed(
+        self,
+        generation_id: str,
+        candidate_hash: str,
+        report: Mapping[str, Any],
+    ) -> Optional[Mapping[str, Any]]:
+        state = self.registry.reconstruct()
+        activation_events = [
+            event
+            for event in state.events
+            if event.transition == Transition.GENERATION_ACTIVATED
+        ]
+        interval = _policy_get(
+            self.runtime.frozen_policy,
+            "evaluation_stages",
+            "deep_audit",
+            "promotion_interval",
+            default=5,
+        )
+        if type(interval) is not int or interval <= 0:
+            raise SafetyHalt("deep-audit promotion interval is invalid")
+        reasons = []
+        if activation_events and len(activation_events) % interval == 0:
+            reasons.append(f"every-{interval}-promotions")
+        if self._near_safety_boundary(report):
+            reasons.append("near-safety-boundary")
+        if not reasons:
+            return None
+        return self.schedule_deep_audit(
+            generation_id,
+            candidate_hash,
+            reasons=reasons,
+        )
+
+    def record_deep_audit_report(
+        self,
+        generation_id: str,
+        *,
+        report_path: Path,
+        report_hash: str,
+    ) -> Path:
+        """Validate and retain one audit report for reconcile-time action."""
+
+        if not self.automatic:
+            raise SafetyHalt("deep-audit report mutation is disabled")
+        self._transaction_dir(generation_id)
+        _hash(report_hash, "deep-audit report hash")
+        queue_path = (
+            self.runtime.promotion_root
+            / "audits"
+            / "queue"
+            / f"{generation_id}.json"
+        )
+        if not queue_path.is_file():
+            raise SafetyHalt("deep-audit report has no queued request")
+        source = Path(report_path)
+        if (
+            source.is_symlink()
+            or not source.is_file()
+            or sha256_file(source) != report_hash
+        ):
+            raise SafetyHalt("deep-audit report hash mismatch")
+        value = json.loads(source.read_text(encoding="utf-8"))
+        request = json.loads(queue_path.read_text(encoding="utf-8"))
+        expected = {
+            "schema_version": 1,
+            "finalized": True,
+            "generation_id": generation_id,
+            "candidate_hash": request["candidate_hash"],
+            "policy_hash": self.runtime.controller.policy_hash,
+            "audit_request_hash": sha256_file(queue_path),
+        }
+        if (
+            not isinstance(value, dict)
+            or value.get("decision") not in {"PASS", "FAIL"}
+            or any(value.get(key) != expected_value for key, expected_value in expected.items())
+        ):
+            raise SafetyHalt("deep-audit report contradicts queued request")
+        stored = {
+            **value,
+            "source_report_path": str(source),
+            "source_report_hash": report_hash,
+        }
+        destination = (
+            self.runtime.promotion_root
+            / "audits"
+            / "reports"
+            / f"{generation_id}.json"
+        )
+        _write_immutable_json(destination, stored)
+        return destination
+
+    def _deep_audit_rollbacks(self) -> Tuple[str, ...]:
+        rollbacks = []
+        root = self.runtime.promotion_root / "audits" / "reports"
+        if not root.exists():
+            return ()
+        state = self.registry.reconstruct()
+        for path in sorted(root.glob("*.json")):
+            if path.is_symlink() or not path.is_file():
+                raise SafetyHalt(f"invalid deep-audit report: {path}")
+            data = path.read_bytes()
+            value = json.loads(data)
+            if data != canonical_json_bytes(value) + b"\n":
+                raise SafetyHalt(
+                    f"deep-audit report is not canonical: {path}"
+                )
+            generation_id = value.get("generation_id")
+            generation = state.generations.get(generation_id)
+            queue_path = (
+                self.runtime.promotion_root
+                / "audits"
+                / "queue"
+                / f"{generation_id}.json"
+            )
+            valid_binding = (
+                queue_path.is_file()
+                and value.get("audit_request_hash")
+                == sha256_file(queue_path)
+                and value.get("policy_hash")
+                == self.runtime.controller.policy_hash
+                and isinstance(value.get("source_report_hash"), str)
+                and _SHA_RE.fullmatch(value["source_report_hash"])
+                is not None
+            )
+            if not valid_binding:
+                raise SafetyHalt(
+                    f"deep-audit report provenance is invalid: {path}"
+                )
+            if (
+                value.get("finalized") is True
+                and value.get("decision") == "FAIL"
+                and value.get("rollback_required", True) is True
+                and generation is not None
+                and generation.state == GenerationState.ACTIVE
+                and state.current_generation_id == generation_id
+            ):
+                rollbacks.append(generation_id)
+        return tuple(rollbacks)
 
     def _ingest_rollout_ipc(self) -> bool:
         ingested = False
@@ -2708,6 +5581,7 @@ class PromotionController:
             self._require_disk()
             self._reconcile_unregistered_claims()
             self._reconcile_lifecycle_moves()
+            self.reconcile_trash(mutate=True)
             _, selection, ignored, duplicates = self._inventory_and_select(True)
             status = dict(self.reconcile(mutate=True))
             status["inventory"] = {
@@ -2732,17 +5606,19 @@ class PromotionController:
             self._require_disk()
             self._reconcile_unregistered_claims()
             self._reconcile_lifecycle_moves()
+            self.reconcile_trash(mutate=True)
             pending = []
             rollback_pending = [
                 generation.generation_id
                 for generation in self.registry.reconstruct().generations.values()
                 if generation.state == GenerationState.ROLLBACK_PENDING
             ]
+            audit_rollbacks = list(self._deep_audit_rollbacks())
             transaction_root = self.runtime.promotion_root / "transactions"
             for path in sorted(transaction_root.glob("*/intent.json")):
                 if not (path.parent / "complete.json").exists():
                     pending.append(json.loads(path.read_text(encoding="utf-8")))
-        for generation_id in rollback_pending:
+        for generation_id in sorted(set(rollback_pending + audit_rollbacks)):
             self.rollback(generation_id)
         for intent in pending:
             generation = self.registry.reconstruct().generations.get(
@@ -3112,10 +5988,15 @@ class PromotionController:
             )
             if (
                 not output.exists()
-                and (
-                    self._transaction_dir(generation_id)
-                    / "generation-data-admitted.json"
-                ).exists()
+                and any(
+                    (
+                        self._transaction_dir(generation_id) / name
+                    ).exists()
+                    for name in (
+                        "generation-data-admission-intent.json",
+                        "generation-data-admitted.json",
+                    )
+                )
             ):
                 output = (
                     self.runtime.admitted_selfplay
@@ -3202,10 +6083,15 @@ class PromotionController:
             )
             if (
                 not output.exists()
-                and (
-                    self._transaction_dir(generation_id)
-                    / "generation-data-admitted.json"
-                ).exists()
+                and any(
+                    (
+                        self._transaction_dir(generation_id) / name
+                    ).exists()
+                    for name in (
+                        "generation-data-admission-intent.json",
+                        "generation-data-admitted.json",
+                    )
+                )
             ):
                 output = (
                     self.runtime.admitted_selfplay
@@ -3395,12 +6281,15 @@ class PromotionController:
                     "generation data marker contradicts admitted generation"
                 )
             return True
-        if not source.is_dir():
+        admission_intent_path = transaction / "generation-data-admission-intent.json"
+        if not source.is_dir() and not destination.is_dir():
             return False
         closed_manifests = []
         process_identities = []
         for worker_id in range(self.runtime.controller.worker_count):
             output = source / f"worker-{worker_id:03d}"
+            if not output.is_dir() and destination.is_dir():
+                output = destination / f"worker-{worker_id:03d}"
             ack_path = (
                 self.runtime.rollout_quarantine
                 / generation_id
@@ -3419,7 +6308,36 @@ class PromotionController:
                 raise SafetyHalt("worker output is not stably closed for admission")
             closed_manifests.append(actual_hash)
             process_identities.append(ack["process_identity"])
-        manifest_hash, _ = _tree_manifest(source)
+        manifest_root = source if source.is_dir() else destination
+        manifest_hash, _ = _tree_manifest(manifest_root)
+        admission_intent = {
+            "schema_version": 1,
+            "generation_id": generation_id,
+            "candidate_hash": candidate_hash,
+            "source_path": str(source),
+            "destination_path": str(destination),
+            "manifest_hash": manifest_hash,
+            "closed_file_manifests": closed_manifests,
+            "process_identities": process_identities,
+            "requires_active_registry_generation": True,
+        }
+        _write_immutable_json(admission_intent_path, admission_intent)
+        generation = self.registry.reconstruct().generations.get(generation_id)
+        if (
+            generation is None
+            or generation.state != GenerationState.ACTIVE
+            or generation.candidate_hash != candidate_hash
+        ):
+            raise SafetyHalt(
+                "generation data cannot become shuffler-visible before activation"
+            )
+        if destination.is_dir() and not source.exists():
+            self._mark(
+                transaction,
+                "generation-data-admitted",
+                {"model_hash": candidate_hash, "manifest_hash": manifest_hash},
+            )
+            return True
         drain_plan = {
             "schema_version": 1,
             "generation_id": generation_id,
@@ -3624,6 +6542,22 @@ class PromotionController:
             if generation is not None and generation.state == GenerationState.ACTIVE:
                 if load_champion(self.runtime.champion_path).champion_hash != candidate_hash:
                     raise SafetyHalt("active generation contradicts champion projection")
+                acknowledged = self._acknowledged(
+                    generation_id, candidate_hash
+                )
+                if not self._commit_generation_data(
+                    generation_id, candidate_hash
+                ):
+                    return {
+                        "status": "WAITING_GENERATION_DATA",
+                        "acknowledged": sorted(acknowledged),
+                    }
+                self._checkpoint("promotion-generation-data-admitted")
+                self._schedule_deep_audit_if_needed(
+                    generation_id,
+                    candidate_hash,
+                    report_value,
+                )
                 self._mark(transaction, "complete", {"champion_hash": candidate_hash})
                 return {
                     "status": "ACTIVE",
@@ -3792,12 +6726,6 @@ class PromotionController:
             )
             self._mark(transaction, "champion-cas", {"champion_hash": candidate_hash})
             self._checkpoint("promotion-champion-cas")
-            if not self._commit_generation_data(generation_id, candidate_hash):
-                return {
-                    "status": "WAITING_GENERATION_DATA",
-                    "acknowledged": sorted(acknowledged),
-                }
-            self._checkpoint("promotion-generation-data-admitted")
             generation = self.registry.reconstruct().generations[generation_id]
             if generation.state == GenerationState.ROLLOUT:
                 self.registry.transition_generation(
@@ -3814,8 +6742,19 @@ class PromotionController:
                 raise SafetyHalt(
                     f"cannot commit activation from {generation.state.value}"
                 )
-            self._mark(transaction, "complete", {"champion_hash": candidate_hash})
             self._checkpoint("promotion-active-event")
+            if not self._commit_generation_data(generation_id, candidate_hash):
+                return {
+                    "status": "WAITING_GENERATION_DATA",
+                    "acknowledged": sorted(acknowledged),
+                }
+            self._checkpoint("promotion-generation-data-admitted")
+            self._schedule_deep_audit_if_needed(
+                generation_id,
+                candidate_hash,
+                report_value,
+            )
+            self._mark(transaction, "complete", {"champion_hash": candidate_hash})
             return {"status": "ACTIVE", "generation_id": generation_id, "candidate_hash": candidate_hash}
 
     def rollback(
@@ -4052,39 +6991,240 @@ class PromotionController:
 def configured_gate_evaluator(evidence: Mapping[str, Any]) -> Mapping[str, Any]:
     """Validate a configured adapter envelope and run the in-repo final gate."""
 
+    required_envelope = {
+        "controller_stage",
+        "candidate_hash",
+        "tested_champion_hash",
+        "original_hash",
+        "evaluation_key",
+        "config_hash",
+        "schedule_hash",
+        "policy_path",
+        "policy_hash",
+        "policy_version",
+        "suite_manifest_path",
+        "suite_manifest_hash",
+        "look",
+        "selfplay_config_hash",
+        "topology",
+        "gpu_handoff_hash",
+    }
+    missing = sorted(required_envelope.difference(evidence))
+    if missing:
+        raise SafetyHalt(
+            "configured evidence envelope is incomplete: "
+            + ", ".join(missing)
+        )
     stage = evidence.get("controller_stage")
+    if stage not in {"integrity", "screen", "finalist", "confirmation"}:
+        raise SafetyHalt(f"configured evidence has unknown stage: {stage!r}")
+    policy_path_value = evidence.get("policy_path")
+    if not isinstance(policy_path_value, str):
+        raise SafetyHalt("configured evidence has no runtime-bound policy path")
+    policy_path = Path(policy_path_value)
+    if (
+        not policy_path.is_absolute()
+        or policy_path.is_symlink()
+        or not policy_path.is_file()
+    ):
+        raise SafetyHalt("configured evidence policy path is not a regular file")
+    try:
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SafetyHalt(f"configured evidence policy is invalid: {exc}") from exc
+    if not isinstance(policy, dict):
+        raise SafetyHalt("configured evidence policy root must be an object")
+    policy_hash = canonical_sha256(policy)
+    policy_version = policy.get("policy_version")
+    if (
+        policy_hash != evidence.get("policy_hash")
+        or policy_version != evidence.get("policy_version")
+    ):
+        raise SafetyHalt(
+            "configured evidence policy version/hash differs from runtime binding"
+        )
     if stage == "confirmation":
         promotion_evidence = evidence.get("promotion_evidence")
         if not isinstance(promotion_evidence, Mapping):
             raise SafetyHalt(
                 "confirmation adapter evidence must contain promotion_evidence"
             )
+        if (
+            promotion_evidence.get("policy_hash") != policy_hash
+            or promotion_evidence.get("policy_version") != policy_version
+        ):
+            raise SafetyHalt(
+                "promotion evidence policy version/hash differs from runtime binding"
+            )
         from risk_score.promotion_gate import evaluate_promotion_gate
 
         result = dict(evaluate_promotion_gate(
             promotion_evidence,
+            policy=policy,
             expected_policy_hash=evidence["policy_hash"],
             expected_candidate_hash=evidence["candidate_hash"],
             expected_champion_hash=evidence["tested_champion_hash"],
             expected_original_hash=evidence["original_hash"],
         ))
+        if (
+            result.get("policy_hash") != policy_hash
+            or result.get("policy_version") != policy_version
+        ):
+            raise SafetyHalt(
+                "configured gate evaluated a different policy version/hash"
+            )
         result.update(
             {
                 "gpu_handoff_hash": evidence["gpu_handoff_hash"],
                 "selfplay_config_hash": evidence["selfplay_config_hash"],
                 "topology": evidence["topology"],
+                "policy_path": str(policy_path),
+                "suite_manifest_path": evidence["suite_manifest_path"],
+                "suite_manifest_hash": evidence["suite_manifest_hash"],
+                "look": evidence["look"],
             }
         )
         return result
 
     stage_gate = evidence.get("stage_gate")
-    if not isinstance(stage_gate, Mapping):
-        raise SafetyHalt("non-confirmation adapter evidence must contain stage_gate")
-    decision = stage_gate.get("decision")
+    stage_evidence = evidence.get("stage_evidence")
+    if isinstance(stage_gate, Mapping) and stage_gate.get(
+        "contract"
+    ) == "risk-score-derived-stage-evidence-v1":
+        derivation_hash = stage_gate.get("derivation_hash")
+        _hash(derivation_hash, "derived stage evidence hash")
+        stage_payload = dict(stage_gate)
+        stage_payload.pop("derivation_hash", None)
+        if canonical_sha256(stage_payload) != derivation_hash:
+            raise SafetyHalt(
+                "derived non-confirmation stage evidence hash is invalid"
+            )
+        validated_stage = dict(stage_gate)
+        stage_evidence_hash = derivation_hash
+    elif isinstance(stage_evidence, Mapping):
+        stage_evidence_hash = evidence.get("stage_evidence_hash")
+        _hash(stage_evidence_hash, "stage evidence hash")
+        if canonical_sha256(stage_evidence) != stage_evidence_hash:
+            raise SafetyHalt("non-confirmation stage evidence hash is invalid")
+        validated_stage = dict(stage_evidence)
+        if isinstance(stage_gate, Mapping):
+            if stage_gate.get("decision") != validated_stage.get("decision"):
+                raise SafetyHalt(
+                    "stage gate decision contradicts validated stage evidence"
+                )
+            supplied_stage_hash = stage_gate.get("stage_evidence_hash")
+            if supplied_stage_hash not in {None, stage_evidence_hash}:
+                raise SafetyHalt(
+                    "stage gate is bound to different stage evidence"
+                )
+    else:
+        raise SafetyHalt(
+            "non-confirmation adapter evidence must contain derived stage evidence"
+        )
+    decision = validated_stage.get("decision")
     if decision not in {"PASS", "FAIL", "INCONCLUSIVE"}:
         raise SafetyHalt(f"configured stage gate has invalid decision: {decision!r}")
+    if validated_stage.get("contract") == "risk-score-derived-stage-evidence-v1":
+        derived_artifacts = validated_stage.get("derived_artifacts")
+        if not isinstance(derived_artifacts, Mapping):
+            raise SafetyHalt("derived stage evidence has no artifacts")
+        if stage == "integrity":
+            stage0 = derived_artifacts.get("stage_0")
+            if not isinstance(stage0, Mapping):
+                raise SafetyHalt("derived Stage-0 evidence is missing")
+            derived_decision = (
+                "PASS" if stage0.get("stage_0_passed") is True else "FAIL"
+            )
+        else:
+            statistics = derived_artifacts.get("statistics")
+            if not isinstance(statistics, Mapping) or not statistics:
+                raise SafetyHalt("derived match stage statistics are missing")
+            champion_finalized = None
+            for name, finalized in statistics.items():
+                if not isinstance(finalized, Mapping):
+                    raise SafetyHalt(
+                        f"derived statistics cell {name!r} is malformed"
+                    )
+                artifact = finalized.get("statistics_artifact")
+                manifest = finalized.get("statistics_manifest")
+                artifact_hash = finalized.get(
+                    "statistics_artifact_hash"
+                )
+                manifest_hash = finalized.get(
+                    "statistics_manifest_hash"
+                )
+                if (
+                    not isinstance(artifact, Mapping)
+                    or not isinstance(manifest, Mapping)
+                    or artifact_hash != canonical_sha256(artifact)
+                    or manifest_hash != canonical_sha256(manifest)
+                    or manifest.get("statistics_artifact_hash")
+                    != artifact_hash
+                ):
+                    raise SafetyHalt(
+                        f"derived statistics cell {name!r} hash is invalid"
+                    )
+                if _policy_get(
+                    artifact,
+                    "data_binding",
+                    "comparison",
+                ) == "candidate-vs-champion-powered":
+                    champion_finalized = finalized
+            if not isinstance(champion_finalized, Mapping):
+                raise SafetyHalt(
+                    "derived statistics omit champion powered cell"
+                )
+            champion_artifact = champion_finalized[
+                "statistics_artifact"
+            ]
+            metric = _policy_get(
+                champion_artifact,
+                "metrics",
+                "realized_utility",
+                default={},
+            )
+            valid = (
+                _policy_get(
+                    champion_artifact,
+                    "validation",
+                    "promotion_valid",
+                )
+                is True
+            )
+            available = (
+                isinstance(metric, Mapping)
+                and metric.get("available") is True
+                and metric.get("complete") is True
+            )
+            if not valid:
+                derived_decision = "FAIL"
+            elif not available:
+                derived_decision = "INCONCLUSIVE"
+            elif stage == "screen":
+                upper = _finite_number(metric.get("upper_bound"))
+                threshold = _finite_number(
+                    _policy_get(
+                        policy,
+                        "evaluation_stages",
+                        "stage_1_cheap_paired_screen",
+                        "utility_futility_upper_bound",
+                    )
+                )
+                if upper is None or threshold is None:
+                    derived_decision = "INCONCLUSIVE"
+                elif upper <= threshold:
+                    derived_decision = "FAIL"
+                else:
+                    derived_decision = "PASS"
+            else:
+                derived_decision = "PASS"
+        if decision != derived_decision:
+            raise SafetyHalt(
+                "stage decision is not derivable from validated artifacts"
+            )
     expected = {
         "finalized": True,
+        "controller_stage": stage,
         "candidate_hash": evidence["candidate_hash"],
         "tested_champion_hash": evidence["tested_champion_hash"],
         "original_hash": evidence["original_hash"],
@@ -4096,15 +7236,155 @@ def configured_gate_evaluator(evidence: Mapping[str, Any]) -> Mapping[str, Any]:
         "topology": evidence["topology"],
     }
     conflicts = [
-        key for key, value in expected.items() if stage_gate.get(key) != value
+        key
+        for key, value in expected.items()
+        if validated_stage.get(key) != value
     ]
     if conflicts:
         raise SafetyHalt(
-            "configured stage gate contradicts evaluator evidence: "
+            "validated stage evidence contradicts evaluator envelope: "
             + ", ".join(sorted(conflicts))
         )
+    source_hashes = validated_stage.get(
+        "source_artifact_hashes",
+        validated_stage.get("artifact_hashes"),
+    )
+    if isinstance(source_hashes, Mapping):
+        normalized_hashes = dict(source_hashes)
+    else:
+        normalized_hashes: Dict[str, str] = {}
+
+        def collect_hashes(value: Any, prefix: str = "") -> None:
+            if isinstance(value, Mapping):
+                for key, item in value.items():
+                    path = f"{prefix}.{key}" if prefix else str(key)
+                    if (
+                        isinstance(item, str)
+                        and _SHA_RE.fullmatch(item) is not None
+                        and (
+                            str(key).endswith("hash")
+                            or str(key).endswith("_sha256")
+                        )
+                    ):
+                        normalized_hashes[path] = item
+                    else:
+                        collect_hashes(item, path)
+            elif isinstance(value, list):
+                for index, item in enumerate(value):
+                    collect_hashes(item, f"{prefix}[{index}]")
+
+        collect_hashes(validated_stage.get("derived_artifacts"))
+    if not normalized_hashes or any(
+        not isinstance(value, str) or _SHA_RE.fullmatch(value) is None
+        for value in normalized_hashes.values()
+    ):
+        raise SafetyHalt(
+            "non-confirmation stage evidence lacks hash-bound source artifacts"
+        )
+    ranking_summary = validated_stage.get("ranking_summary")
+    if stage == "finalist" and not isinstance(ranking_summary, Mapping):
+        statistics = _policy_get(
+            validated_stage,
+            "derived_artifacts",
+            "statistics",
+            default={},
+        )
+        champion_statistics = None
+        if isinstance(statistics, Mapping):
+            for finalized in statistics.values():
+                artifact = (
+                    finalized.get("statistics_artifact")
+                    if isinstance(finalized, Mapping)
+                    else None
+                )
+                binding = (
+                    artifact.get("data_binding")
+                    if isinstance(artifact, Mapping)
+                    else None
+                )
+                if (
+                    isinstance(binding, Mapping)
+                    and binding.get("comparison")
+                    == "candidate-vs-champion-powered"
+                ):
+                    champion_statistics = finalized
+                    break
+        artifact = (
+            champion_statistics.get("statistics_artifact")
+            if isinstance(champion_statistics, Mapping)
+            else None
+        )
+        utility = _policy_get(
+            artifact or {},
+            "metrics",
+            "realized_utility",
+            "lower_bound",
+        )
+        risk = _policy_get(
+            artifact or {},
+            "risk_differences",
+            "final_50",
+            "upper_bound",
+        )
+        utility_value = _finite_number(utility)
+        risk_value = _finite_number(risk)
+        sample_count = evidence.get("candidate_sample_count")
+        candidate_manifest_hash = evidence.get("candidate_manifest_hash")
+        if (
+            utility_value is None
+            or risk_value is None
+            or type(sample_count) is not int
+            or sample_count < 0
+            or not isinstance(candidate_manifest_hash, str)
+            or _SHA_RE.fullmatch(candidate_manifest_hash) is None
+            or not isinstance(champion_statistics, Mapping)
+        ):
+            raise SafetyHalt(
+                "finalist stage evidence lacks source-bound ranking statistics"
+            )
+        statistics_artifact_hash = champion_statistics.get(
+            "statistics_artifact_hash"
+        )
+        statistics_manifest_hash = champion_statistics.get(
+            "statistics_manifest_hash"
+        )
+        _hash(
+            statistics_artifact_hash,
+            "finalist statistics artifact hash",
+        )
+        _hash(
+            statistics_manifest_hash,
+            "finalist statistics manifest hash",
+        )
+        ranking_summary = {
+            "schema_version": 1,
+            "source_bound": True,
+            "source_cell": "powered_candidate_vs_champion",
+            "candidate_hash": evidence["candidate_hash"],
+            "statistics_artifact_hash": statistics_artifact_hash,
+            "statistics_manifest_hash": statistics_manifest_hash,
+            "candidate_manifest_hash": candidate_manifest_hash,
+            "realized_powered_utility_lower_bound": utility_value,
+            "final50_risk_upper_bound": risk_value,
+            "final_50_risk_upper_bound": risk_value,
+            "sample_count": sample_count,
+        }
     return {
-        **dict(stage_gate),
+        **validated_stage,
+        **expected,
+        "policy_path": evidence["policy_path"],
+        "policy_version": evidence["policy_version"],
+        "suite_manifest_path": evidence["suite_manifest_path"],
+        "suite_manifest_hash": evidence["suite_manifest_hash"],
+        "look": evidence["look"],
+        "decision": decision,
+        "stage_evidence_hash": stage_evidence_hash,
+        "source_artifact_hashes": normalized_hashes,
+        **(
+            {"ranking_summary": dict(ranking_summary)}
+            if isinstance(ranking_summary, Mapping)
+            else {}
+        ),
         "gpu_handoff_hash": evidence["gpu_handoff_hash"],
         "selfplay_config_hash": evidence["selfplay_config_hash"],
         "topology": evidence["topology"],

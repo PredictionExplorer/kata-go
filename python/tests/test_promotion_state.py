@@ -330,6 +330,132 @@ def test_candidate_transition_retry_is_idempotent_after_restart(
     assert restarted.reconstruct().last_sequence == 2
 
 
+@pytest.mark.parametrize(
+    "target_state",
+    [
+        CandidateState.DISCOVERED,
+        CandidateState.CLAIMED,
+        CandidateState.EVALUATING_INTEGRITY,
+        CandidateState.EVALUATING_SCREEN,
+        CandidateState.EVALUATING_FINALIST,
+        CandidateState.EVALUATING_CONFIRMATION,
+    ],
+)
+def test_restart_reconstructs_every_candidate_evaluation_state(
+    tmp_path, provenance, target_state
+):
+    registry, _ = bootstrap_registry(tmp_path, provenance)
+    candidate = digest("candidate-restart-" + target_state.value)
+    path = "candidates/claimed/" + target_state.value
+    champion = digest("champion-0")
+    transitions = (
+        (CandidateState.DISCOVERED, None),
+        (CandidateState.CLAIMED, None),
+        (CandidateState.EVALUATING_INTEGRITY, "integrity"),
+        (CandidateState.EVALUATING_SCREEN, "screen"),
+        (CandidateState.EVALUATING_FINALIST, "finalist"),
+        (CandidateState.EVALUATING_CONFIRMATION, "confirmation-look-1"),
+    )
+    expected_key = None
+    for state, evaluation_key in transitions:
+        registry.transition_candidate(
+            candidate,
+            path,
+            state,
+            provenance=provenance,
+            champion_hash=champion,
+            evaluation_key=evaluation_key,
+            reason=f"advance to {state.value}",
+            actor="test-controller",
+            payload=(
+                {"look": "look-1"}
+                if state == CandidateState.EVALUATING_CONFIRMATION
+                else None
+            ),
+        )
+        expected_key = evaluation_key
+        if state == target_state:
+            break
+
+    restarted = EventRegistry(tmp_path / "promotion")
+    record = restarted.reconstruct().candidates[candidate]
+    assert record.state == target_state
+    assert record.evaluation_key == expected_key
+    assert record.candidate_path == path
+
+
+def test_confirmation_can_advance_to_prespecified_second_look_once(
+    tmp_path, provenance
+):
+    registry, _ = bootstrap_registry(tmp_path, provenance)
+    candidate = digest("candidate-two-look")
+    path = "candidates/claimed/candidate-two-look"
+    champion = digest("champion-0")
+    for target, evaluation_key in (
+        (CandidateState.DISCOVERED, None),
+        (CandidateState.CLAIMED, None),
+        (CandidateState.EVALUATING_INTEGRITY, "integrity"),
+        (CandidateState.EVALUATING_SCREEN, "screen"),
+        (CandidateState.EVALUATING_FINALIST, "finalist"),
+        (CandidateState.EVALUATING_CONFIRMATION, "confirmation-look-1"),
+    ):
+        registry.transition_candidate(
+            candidate,
+            path,
+            target,
+            provenance=provenance,
+            champion_hash=champion,
+            evaluation_key=evaluation_key,
+            reason=f"advance to {target.value}",
+            actor="test-controller",
+            payload=(
+                {"look": "look-1"}
+                if target == CandidateState.EVALUATING_CONFIRMATION
+                else None
+            ),
+        )
+
+    second = registry.transition_candidate(
+        candidate,
+        path,
+        CandidateState.EVALUATING_CONFIRMATION,
+        provenance=provenance,
+        champion_hash=champion,
+        evaluation_key="confirmation-look-2",
+        reason="prespecified cumulative look 2 started",
+        actor="test-controller",
+        payload={
+            "look": "look-2",
+            "previous_evaluation_key": "confirmation-look-1",
+            "prespecified_cumulative_look": True,
+        },
+    )
+    retry = EventRegistry(tmp_path / "promotion").transition_candidate(
+        candidate,
+        path,
+        CandidateState.EVALUATING_CONFIRMATION,
+        provenance=provenance,
+        champion_hash=champion,
+        evaluation_key="confirmation-look-2",
+        reason="retry after restart",
+        actor="replacement-controller",
+        payload={
+            "look": "look-2",
+            "previous_evaluation_key": "confirmation-look-1",
+            "prespecified_cumulative_look": True,
+        },
+    )
+    state = registry.reconstruct()
+    confirmation_events = [
+        event
+        for event in state.events
+        if event.transition == Transition.EVALUATION_CONFIRMATION_STARTED
+    ]
+    assert retry == second
+    assert len(confirmation_events) == 2
+    assert state.candidates[candidate].evaluation_key == "confirmation-look-2"
+
+
 def test_append_rejects_illegal_transition_without_writing(tmp_path, provenance):
     registry, _ = bootstrap_registry(tmp_path, provenance)
     with pytest.raises(IllegalTransitionError, match="not discovered"):

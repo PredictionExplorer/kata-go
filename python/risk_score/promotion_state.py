@@ -478,6 +478,7 @@ _LEGAL_CANDIDATE_TRANSITIONS = {
         CandidateState.QUARANTINED,
     },
     CandidateState.EVALUATING_CONFIRMATION: {
+        CandidateState.EVALUATING_CONFIRMATION,
         CandidateState.CONFIRMED,
         CandidateState.REJECTED,
         CandidateState.QUARANTINED,
@@ -1520,7 +1521,17 @@ class EventRegistry:
         state = self.reconstruct()
         existing = state.candidates.get(candidate_hash)
         merged_payload = _copy_json_object(payload)
-        if existing is not None and existing.state == target:
+        confirmation_reentry = (
+            existing is not None
+            and existing.state == target == CandidateState.EVALUATING_CONFIRMATION
+            and evaluation_key is not None
+            and evaluation_key != existing.evaluation_key
+        )
+        if (
+            existing is not None
+            and existing.state == target
+            and not confirmation_reentry
+        ):
             if existing.candidate_path != candidate_path:
                 raise IllegalTransitionError(
                     "idempotent candidate retry changed the destination path"

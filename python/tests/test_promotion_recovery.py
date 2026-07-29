@@ -2,6 +2,7 @@ import contextlib
 import json
 import os
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -37,6 +38,34 @@ from risk_score.promotion_state import (
 
 def digest(label):
     return sha256_bytes(label.encode("utf-8"))
+
+
+def gate_ranking_summary(
+    candidate_hash,
+    sample_count,
+    candidate_manifest_hash,
+    *,
+    utility_lcb=0.2,
+    final50_upper=0.01,
+):
+    return {
+        "schema_version": 1,
+        "source_bound": True,
+        "source_cell": "powered_candidate_vs_champion",
+        "candidate_hash": candidate_hash,
+        "look_number": 1,
+        "statistics_artifact_hash": digest(
+            f"{candidate_hash}:statistics-artifact"
+        ),
+        "statistics_manifest_hash": digest(
+            f"{candidate_hash}:statistics-manifest"
+        ),
+        "candidate_manifest_hash": candidate_manifest_hash,
+        "realized_powered_utility_lower_bound": utility_lcb,
+        "final50_risk_upper_bound": final50_upper,
+        "final_50_risk_upper_bound": final50_upper,
+        "sample_count": sample_count,
+    }
 
 
 def gpu_handoff_factory(runtime):
@@ -169,6 +198,19 @@ def runtime_mapping(root, *, mutation_enabled=True, max_queue=4, min_free=0):
         },
         "commands": {
             "trainer": ["python3", "train.py", "--checkpoint", "{checkpoint}"],
+            "stage0Probe": [
+                "fake-stage0-probe",
+                "--request",
+                "{stage0_request}",
+                "--request-sha256",
+                "{stage0_request_sha256}",
+                "--candidate",
+                "{candidate_model}",
+                "--champion",
+                "{champion_model}",
+                "--output",
+                "{stage0_probe}",
+            ],
             "evaluator": [
                 "fake-evaluator",
                 "--plan",
@@ -228,6 +270,33 @@ def prepare_runtime(tmp_path, *, mutation_enabled=True, min_free=0, max_queue=4)
                 "policy_version": "test-v1",
                 "threshold": 0.5,
                 "frozen_plan": {"source_revision": "a" * 40},
+                "evaluation_stages": {
+                    "stage_0_integrity_and_fixed_probes": {
+                        "fixed_analysis_positions": 8,
+                        "fixed_analysis_visits": 16,
+                        "exploitability_sentinel_positions": 2,
+                        "exploitability_sentinel_visits": 32,
+                        "required_checks": ["model_hash", "finite_outputs"],
+                    },
+                    "stage_2_finalist_selection": {
+                        "utility_tie_width": 0.1,
+                    },
+                    "stage_3_promotion_confirmation": {
+                        "looks": [
+                            {"look_number": 1},
+                            {"look_number": 2},
+                        ],
+                    },
+                    "deep_audit": {
+                        "promotion_interval": 5,
+                        "near_boundary_fraction": 0.1,
+                    },
+                },
+                "queue": {
+                    "maximum_active_evaluator_entries": max_queue,
+                    "important_queue_warning_depth": max_queue + 1,
+                },
+                "retention": {"trash_grace_period_days": 30},
                 "rollout": {
                     "worker_count": 7,
                     "canary_workers": 1,
@@ -373,8 +442,8 @@ def create_hardened_candidate(
     return inspect_candidate(path)
 
 
-def bootstrap_and_claim(tmp_path):
-    runtime = prepare_runtime(tmp_path)
+def bootstrap_and_claim(tmp_path, *, max_queue=4):
+    runtime = prepare_runtime(tmp_path, max_queue=max_queue)
     controller = PromotionController(
         runtime, automatic=True, command_executor=successful_command
     )
@@ -682,6 +751,34 @@ def test_runtime_config_is_strict_absolute_and_safe_by_default(tmp_path):
     bad["paths"]["candidateInbox"] = str(symlink / "inbox")
     with pytest.raises(ConfigurationError, match="symlink ancestor"):
         RuntimeConfig.from_mapping(bad)
+
+
+def test_runtime_example_is_safe_and_uses_repository_evidence_cli():
+    example_path = (
+        Path(__file__).resolve().parents[1]
+        / "risk_score"
+        / "promotion_runtime.example.json"
+    )
+    example = load_json(example_path)
+    assert example["mutationEnabled"] is False
+    assert "risk_score.promotion_evaluator" in example["commands"]["evaluator"]
+    assert example["commands"]["stage0Probe"][0].endswith(
+        "run-risk-score-stage0-probe"
+    )
+    assert example["paths"]["policy"].endswith(
+        "risk_score/promotion_policy_v2.json"
+    )
+    assert example["paths"]["suites"].endswith("promotion-suites-v2")
+    assert example["paths"]["lead40Schedule"].endswith(
+        "promotion-suites-v2/schedules/lead-40-confirmation.jsonl"
+    )
+    assert example["paths"]["lead80Schedule"].endswith(
+        "promotion-suites-v2/schedules/lead-80-confirmation.jsonl"
+    )
+    assert example["paths"]["standardConfirmationSchedule"].endswith(
+        "promotion-suites-v2/schedules/prefixes/confirmation-pairs-128.jsonl"
+    )
+
 
 def test_cli_defaults_to_recommendation_and_requires_explicit_automatic():
     args = parse_args(["--runtime-config", "/tmp/runtime.json"])
@@ -1007,6 +1104,141 @@ def test_evaluation_plan_and_missing_executor_are_recommendations(tmp_path):
     assert inconclusive["decision"] == "INCONCLUSIVE"
 
 
+def test_confirmation_plan_selects_exact_authoritative_look_cells(tmp_path):
+    runtime = prepare_runtime(tmp_path)
+    manifest_path = runtime.suites / "manifest.json"
+    base = load_json(manifest_path)
+    comparisons = {
+        "powered_candidate_vs_champion":
+            "candidate-vs-champion-powered",
+        "powered_candidate_vs_original":
+            "candidate-vs-original-powered",
+        "standard_candidate_vs_original":
+            "candidate-vs-original-standard",
+        "lead_40": "candidate-vs-champion-powered-lead-40",
+        "lead_80": "candidate-vs-champion-powered-lead-80",
+    }
+    pair_counts = {
+        "look-1": {
+            "powered_candidate_vs_champion": 4,
+            "powered_candidate_vs_original": 4,
+            "standard_candidate_vs_original": 2,
+            "lead_40": 3,
+            "lead_80": 5,
+        },
+        "look-2": {
+            "powered_candidate_vs_champion": 8,
+            "powered_candidate_vs_original": 8,
+            "standard_candidate_vs_original": 2,
+            "lead_40": 6,
+            "lead_80": 10,
+        },
+    }
+    cells = []
+    artifacts = {}
+    for look, counts in pair_counts.items():
+        for cell_name, comparison in comparisons.items():
+            schedule_role = (
+                "powered-ordinary"
+                if cell_name.startswith("powered_")
+                else "standard-ordinary"
+                if cell_name.startswith("standard_")
+                else cell_name
+            )
+            key = (look, schedule_role)
+            if key not in artifacts:
+                path = runtime.suites / "schedules" / f"{look}-{schedule_role}.jsonl"
+                path.parent.mkdir(exist_ok=True)
+                path.write_text(f"{look}:{schedule_role}\n", encoding="utf-8")
+                artifacts[key] = (path, sha256_file(path))
+            path, schedule_hash = artifacts[key]
+            count = counts[cell_name]
+            bank_role = (
+                "confirmation"
+                if cell_name.startswith(("powered_", "standard_"))
+                else schedule_role
+            )
+            cells.append(
+                {
+                    "cell_name": cell_name,
+                    "stage": "stage-3",
+                    "look": look,
+                    "comparison": comparison,
+                    "suite": (
+                        "lead-40"
+                        if cell_name == "lead_40"
+                        else "lead-80"
+                        if cell_name == "lead_80"
+                        else "confirmation"
+                    ),
+                    "color_pairs": count,
+                    "independent_cluster_ids_hash": digest(
+                        f"{look}:{schedule_role}:clusters"
+                    ),
+                    "bank_hash": digest(f"{bank_role}:bank"),
+                    "schedule_path": str(path.relative_to(runtime.suites)),
+                    "schedule_hash": schedule_hash,
+                    "schedule_id": f"{look}-{schedule_role}",
+                }
+            )
+    payload = {
+        **{
+            key: value
+            for key, value in base.items()
+            if key != "manifestPayloadSha256"
+        },
+        "schemaVersion": 2,
+        "manifestContract":
+            "risk-score-authoritative-evaluation-manifest-v2",
+        "cells": cells,
+    }
+    manifest = {**payload, "manifestPayloadSha256": canonical_sha256(payload)}
+    manifest_path.write_bytes(canonical_json_bytes(manifest) + b"\n")
+    runtime = replace(
+        runtime,
+        controller=replace(
+            runtime.controller,
+            suite_manifest_hash=sha256_file(manifest_path),
+        ),
+    )
+    controller = PromotionController(runtime, automatic=False)
+    look1 = controller.build_evaluation_plan(
+        digest("candidate"),
+        digest("champion"),
+        suite="confirmation",
+        stage="confirmation",
+        look="look-1",
+        topology="7-workers-100-threads",
+    )
+    look2 = controller.build_evaluation_plan(
+        digest("candidate"),
+        digest("champion"),
+        suite="confirmation",
+        stage="confirmation",
+        look="look-2",
+        topology="7-workers-100-threads",
+    )
+    assert look1.look == "look-1"
+    assert look2.look == "look-2"
+    assert look1.evaluation_key != look2.evaluation_key
+    for plan, look in ((look1, "look-1"), (look2, "look-2")):
+        assert set(plan.schedule_artifacts) == set(comparisons)
+        for spec in plan.specs:
+            selected = next(
+                cell
+                for cell in cells
+                if cell["look"] == look
+                and cell["comparison"] == spec.comparison
+            )
+            assert spec.schedule_sha == selected["schedule_hash"]
+            assert (
+                plan.schedule_artifacts[
+                    selected["cell_name"]
+                ]["path"]
+                == str(runtime.suites / selected["schedule_path"])
+            )
+
+
 def test_finalize_gate_report_rejects_bare_and_stale_pass(tmp_path):
     runtime, controller, artifact = bootstrap_and_claim(tmp_path)
     champion = controller.registry.reconstruct().current_champion_hash
@@ -1076,8 +1308,11 @@ def test_injected_evaluation_and_gate_adapters_drive_confirmation(tmp_path):
             "selfplay_config_hash": evidence["selfplay_config_hash"],
             "topology": evidence["topology"],
             "gpu_handoff_hash": evidence["gpu_handoff_hash"],
-            "realized_powered_utility_lower_bound": 0.2,
-            "final50_risk_upper_bound": 0.01,
+            "ranking_summary": gate_ranking_summary(
+                evidence["candidate_hash"],
+                artifact.sample_count,
+                evidence["candidate_manifest_hash"],
+            ),
         }
 
     controller = PromotionController(
@@ -1112,6 +1347,428 @@ def test_injected_evaluation_and_gate_adapters_drive_confirmation(tmp_path):
     assert len(calls) == 4
 
 
+def sequential_adapters(runtime, controller_holder, calls, *, final_decision="PASS"):
+    def execute(plan, candidate):
+        calls.append((plan.stage, plan.look, plan.evaluation_key))
+        return {
+            "evaluation_key": plan.evaluation_key,
+            "candidate_hash": candidate.model_hash,
+            "tested_champion_hash":
+                controller_holder["controller"]
+                .registry.reconstruct()
+                .current_champion_hash,
+            "original_hash": runtime.controller.original_hash,
+            "config_hash": plan.config_hash,
+            "schedule_hash": plan.schedule_hash,
+            "policy_hash": plan.policy_hash,
+        }
+
+    def gate(evidence):
+        decision = "PASS"
+        next_action = None
+        if evidence["controller_stage"] == "confirmation":
+            if evidence["look"] == "look-1":
+                decision = "INCONCLUSIVE"
+                next_action = "CONTINUE_TO_LOOK_2"
+            else:
+                decision = final_decision
+                next_action = (
+                    "PROMOTE"
+                    if final_decision == "PASS"
+                    else "STOP_MAXIMUM_INCONCLUSIVE"
+                )
+        result = {
+            "decision": decision,
+            "finalized": True,
+            "ranking_summary": gate_ranking_summary(
+                evidence["candidate_hash"],
+                500000,
+                evidence["candidate_manifest_hash"],
+            ),
+            **{
+                key: evidence[key]
+                for key in (
+                    "candidate_hash",
+                    "tested_champion_hash",
+                    "original_hash",
+                    "evaluation_key",
+                    "config_hash",
+                    "schedule_hash",
+                    "policy_hash",
+                    "selfplay_config_hash",
+                    "topology",
+                    "gpu_handoff_hash",
+                )
+            },
+        }
+        if next_action is not None:
+            result["next_action"] = next_action
+        return result
+
+    return execute, gate
+
+
+def advance_to_first_confirmation_look(
+    controller, artifact, *, final_decision="PASS"
+):
+    for stage in ("integrity", "screen", "finalist"):
+        result = controller.process_evaluation_stage(
+            artifact.model_hash,
+            stage=stage,
+            suite=stage,
+            look="automatic",
+            topology="7-workers-100-threads",
+        )
+        assert result["decision"] == "PASS"
+    return controller.process_evaluation_stage(
+        artifact.model_hash,
+        stage="confirmation",
+        suite="confirmation",
+        look="look-1",
+        topology="7-workers-100-threads",
+    )
+
+
+def test_confirmation_look1_continues_to_look2_exactly_once(tmp_path):
+    runtime, _, artifact = bootstrap_and_claim(tmp_path)
+    holder = {}
+    calls = []
+    execute, gate = sequential_adapters(runtime, holder, calls)
+    controller = PromotionController(
+        runtime,
+        automatic=True,
+        evaluation_executor=execute,
+        gate_evaluator=gate,
+        gpu_lease_factory=gpu_handoff_factory(runtime),
+        command_executor=successful_command,
+    )
+    holder["controller"] = controller
+    first = advance_to_first_confirmation_look(controller, artifact)
+    assert first["decision"] == "INCONCLUSIVE"
+    assert first["nextAction"] == "CONTINUE_TO_LOOK_2"
+
+    second = controller.process_evaluation_stage(
+        artifact.model_hash,
+        stage="confirmation",
+        suite="confirmation",
+        look="look-2",
+        topology="7-workers-100-threads",
+    )
+    retry = controller.process_evaluation_stage(
+        artifact.model_hash,
+        stage="confirmation",
+        suite="confirmation",
+        look="look-2",
+        topology="7-workers-100-threads",
+    )
+    confirmation_events = [
+        event
+        for event in controller.registry.reconstruct().events
+        if event.transition.value == "evaluation.confirmation_started"
+    ]
+    assert second["decision"] == retry["decision"] == "PASS"
+    assert retry["reused"] is True
+    assert [event.payload["look"] for event in confirmation_events] == [
+        "look-1",
+        "look-2",
+    ]
+    assert [look for stage, look, _ in calls if stage == "stage-3"] == [
+        "look-1",
+        "look-2",
+    ]
+
+
+def test_stage0_request_is_deterministic_and_event_bound(tmp_path):
+    runtime, _, artifact = bootstrap_and_claim(tmp_path)
+    holder = {}
+    calls = []
+    execute, gate = sequential_adapters(runtime, holder, calls)
+    controller = PromotionController(
+        runtime,
+        automatic=True,
+        evaluation_executor=execute,
+        gate_evaluator=gate,
+        gpu_lease_factory=gpu_handoff_factory(runtime),
+        command_executor=successful_command,
+    )
+    holder["controller"] = controller
+    result = controller.process_evaluation_stage(
+        artifact.model_hash,
+        stage="integrity",
+        suite="integrity",
+        look="automatic",
+        topology="7-workers-100-threads",
+    )
+    event = controller.registry.reconstruct().events[-1]
+    request_path = Path(event.payload["stage0_request_path"])
+    request = load_json(request_path)
+    assert result["decision"] == "PASS"
+    assert event.payload["stage0_request_hash"] == sha256_file(request_path)
+    assert request["contract"] == "risk-score-stage-0-request-v1"
+    assert request["candidate_hash"] == artifact.model_hash
+    assert request["probe_contract"] == runtime.frozen_policy[
+        "evaluation_stages"
+    ]["stage_0_integrity_and_fixed_probes"]
+
+    before = request_path.read_bytes()
+    retry = controller.process_evaluation_stage(
+        artifact.model_hash,
+        stage="integrity",
+        suite="integrity",
+        look="automatic",
+        topology="7-workers-100-threads",
+    )
+    assert retry["reused"] is True
+    assert request_path.read_bytes() == before
+
+
+def test_confirmation_recovers_after_crash_starting_look2(tmp_path):
+    runtime, _, artifact = bootstrap_and_claim(tmp_path)
+    holder = {}
+    calls = []
+    execute, gate = sequential_adapters(runtime, holder, calls)
+    base = PromotionController(
+        runtime,
+        automatic=True,
+        evaluation_executor=execute,
+        gate_evaluator=gate,
+        gpu_lease_factory=gpu_handoff_factory(runtime),
+        command_executor=successful_command,
+    )
+    holder["controller"] = base
+    advance_to_first_confirmation_look(base, artifact)
+    fired = []
+
+    def crash(step):
+        if step == "confirmation-look-2-started" and not fired:
+            fired.append(step)
+            raise RuntimeError("crash between confirmation looks")
+
+    crashing = PromotionController(
+        runtime,
+        automatic=True,
+        evaluation_executor=execute,
+        gate_evaluator=gate,
+        gpu_lease_factory=gpu_handoff_factory(runtime),
+        command_executor=successful_command,
+        failure_hook=crash,
+    )
+    holder["controller"] = crashing
+    with pytest.raises(RuntimeError, match="between confirmation looks"):
+        crashing.process_evaluation_stage(
+            artifact.model_hash,
+            stage="confirmation",
+            suite="confirmation",
+            look="look-2",
+            topology="7-workers-100-threads",
+        )
+
+    recovered = PromotionController(
+        runtime,
+        automatic=True,
+        evaluation_executor=execute,
+        gate_evaluator=gate,
+        gpu_lease_factory=gpu_handoff_factory(runtime),
+        command_executor=successful_command,
+    )
+    holder["controller"] = recovered
+    result = recovered.process_evaluation_stage(
+        artifact.model_hash,
+        stage="confirmation",
+        suite="confirmation",
+        look="look-2",
+        topology="7-workers-100-threads",
+    )
+    events = [
+        event
+        for event in recovered.registry.reconstruct().events
+        if event.transition.value == "evaluation.confirmation_started"
+    ]
+    assert result["decision"] == "PASS"
+    assert len(events) == 2
+    assert [look for stage, look, _ in calls if stage == "stage-3"] == [
+        "look-1",
+        "look-2",
+    ]
+
+
+def test_confirmation_recovers_orphaned_final_report(tmp_path):
+    runtime, _, artifact = bootstrap_and_claim(tmp_path)
+    holder = {}
+    calls = []
+    execute, gate = sequential_adapters(runtime, holder, calls)
+    crashing = PromotionController(
+        runtime,
+        automatic=True,
+        evaluation_executor=execute,
+        gate_evaluator=gate,
+        gpu_lease_factory=gpu_handoff_factory(runtime),
+        command_executor=successful_command,
+    )
+    holder["controller"] = crashing
+    for stage in ("integrity", "screen", "finalist"):
+        crashing.process_evaluation_stage(
+            artifact.model_hash,
+            stage=stage,
+            suite=stage,
+            look="automatic",
+            topology="7-workers-100-threads",
+        )
+    original_finalize = crashing.finalize_gate_report
+
+    def finalize_then_crash(*args, **kwargs):
+        original_finalize(*args, **kwargs)
+        raise RuntimeError("crash after final report")
+
+    crashing.finalize_gate_report = finalize_then_crash
+    with pytest.raises(RuntimeError, match="after final report"):
+        crashing.process_evaluation_stage(
+            artifact.model_hash,
+            stage="confirmation",
+            suite="confirmation",
+            look="look-1",
+            topology="7-workers-100-threads",
+        )
+
+    recovered = PromotionController(
+        runtime,
+        automatic=True,
+        evaluation_executor=execute,
+        gate_evaluator=gate,
+        gpu_lease_factory=gpu_handoff_factory(runtime),
+        command_executor=successful_command,
+    )
+    holder["controller"] = recovered
+    result = recovered.process_evaluation_stage(
+        artifact.model_hash,
+        stage="confirmation",
+        suite="confirmation",
+        look="look-1",
+        topology="7-workers-100-threads",
+    )
+    assert result["decision"] == "INCONCLUSIVE"
+    assert result["recovered"] is True
+    assert [look for stage, look, _ in calls if stage == "stage-3"] == [
+        "look-1"
+    ]
+
+
+def test_final_confirmation_inconclusive_stops_without_promotion(tmp_path):
+    runtime, _, artifact = bootstrap_and_claim(tmp_path)
+    holder = {}
+    calls = []
+    execute, gate = sequential_adapters(
+        runtime, holder, calls, final_decision="INCONCLUSIVE"
+    )
+    controller = PromotionController(
+        runtime,
+        automatic=True,
+        evaluation_executor=execute,
+        gate_evaluator=gate,
+        gpu_lease_factory=gpu_handoff_factory(runtime),
+        command_executor=successful_command,
+    )
+    holder["controller"] = controller
+    advance_to_first_confirmation_look(
+        controller, artifact, final_decision="INCONCLUSIVE"
+    )
+    final = controller.process_evaluation_stage(
+        artifact.model_hash,
+        stage="confirmation",
+        suite="confirmation",
+        look="look-2",
+        topology="7-workers-100-threads",
+    )
+    record = controller.registry.reconstruct().candidates[
+        artifact.model_hash
+    ]
+    assert final["decision"] == "INCONCLUSIVE"
+    assert final["nextAction"] == "STOP_MAXIMUM_INCONCLUSIVE"
+    assert record.state == CandidateState.REJECTED
+    assert not any(
+        generation.candidate_hash == artifact.model_hash
+        for generation in controller.registry.reconstruct().generations.values()
+    )
+
+
+def test_second_look_rejects_stale_champion(tmp_path):
+    runtime, _, artifact = bootstrap_and_claim(tmp_path)
+    holder = {}
+    calls = []
+    execute, gate = sequential_adapters(runtime, holder, calls)
+    controller = PromotionController(
+        runtime,
+        automatic=True,
+        evaluation_executor=execute,
+        gate_evaluator=gate,
+        gpu_lease_factory=gpu_handoff_factory(runtime),
+        command_executor=successful_command,
+    )
+    holder["controller"] = controller
+    advance_to_first_confirmation_look(controller, artifact)
+    old_champion = controller.registry.reconstruct().current_champion_hash
+
+    replacement = create_candidate(
+        runtime.candidate_inbox,
+        "replacement-s1000000-d2000000",
+        b"replacement",
+    )
+    claimed = controller._claim_candidate(
+        replacement, controller.registry.reconstruct()
+    )
+    provenance = controller._provenance(
+        runtime.controller.powered_config_hash,
+        runtime.controller.discovery_schedule_hash,
+    )
+    for target, key in (
+        (CandidateState.EVALUATING_INTEGRITY, "replacement-integrity"),
+        (CandidateState.EVALUATING_SCREEN, "replacement-screen"),
+        (CandidateState.EVALUATING_FINALIST, "replacement-finalist"),
+        (CandidateState.EVALUATING_CONFIRMATION, "replacement-confirmation"),
+        (CandidateState.CONFIRMED, "replacement-confirmation"),
+    ):
+        controller.registry.transition_candidate(
+            claimed.model_hash,
+            str(claimed.path),
+            target,
+            provenance=provenance,
+            champion_hash=old_champion,
+            evaluation_key=key,
+            reason=f"replacement {target.value}",
+            actor="test-controller",
+        )
+    for target in (
+        GenerationState.PROMOTION_INTENT,
+        GenerationState.CANARY,
+        GenerationState.ROLLOUT,
+        GenerationState.ACTIVE,
+    ):
+        controller.registry.transition_generation(
+            "generation-replacement",
+            claimed.model_hash,
+            str(claimed.path),
+            target,
+            provenance=provenance,
+            tested_champion_hash=old_champion,
+            evaluation_key=(
+                "replacement-confirmation"
+                if target == GenerationState.PROMOTION_INTENT
+                else None
+            ),
+            reason=f"replacement {target.value}",
+            actor="test-controller",
+        )
+
+    with pytest.raises(SafetyHalt, match="stale champion"):
+        controller.process_evaluation_stage(
+            artifact.model_hash,
+            stage="confirmation",
+            suite="confirmation",
+            look="look-2",
+            topology="7-workers-100-threads",
+        )
+
+
 def test_run_once_orchestrates_all_stages_one_poll_at_a_time(tmp_path):
     runtime = prepare_runtime(tmp_path)
     holder = {}
@@ -1132,8 +1789,11 @@ def test_run_once_orchestrates_all_stages_one_poll_at_a_time(tmp_path):
         return {
             "decision": "PASS",
             "finalized": True,
-            "realized_powered_utility_lower_bound": 0.2,
-            "final50_risk_upper_bound": 0.01,
+            "ranking_summary": gate_ranking_summary(
+                evidence["candidate_hash"],
+                artifact.sample_count,
+                evidence["candidate_manifest_hash"],
+            ),
             **evidence,
         }
 
@@ -1188,8 +1848,18 @@ def test_only_one_confirmation_attempt_is_allocated_per_champion(tmp_path):
                 else "PASS"
             ),
             "finalized": True,
-            "realized_powered_utility_lower_bound": 0.2,
-            "final50_risk_upper_bound": 0.01,
+            "ranking_summary": gate_ranking_summary(
+                evidence["candidate_hash"],
+                parse_candidate_counters(
+                    Path(
+                        holder["controller"]
+                        .registry.reconstruct()
+                        .candidates[evidence["candidate_hash"]]
+                        .candidate_path
+                    ).name
+                )[0],
+                evidence["candidate_manifest_hash"],
+            ),
             **{
                 key: evidence[key]
                 for key in (
@@ -1276,12 +1946,69 @@ def test_missing_orchestration_adapters_do_not_advance_candidate(tmp_path):
 
 
 def test_configured_evaluator_adapter_is_shell_free_and_identity_checked(tmp_path):
-    runtime, _, artifact = bootstrap_and_claim(tmp_path)
+    runtime = prepare_runtime(tmp_path)
+    bootstrap = PromotionController(
+        runtime, automatic=True, command_executor=successful_command
+    )
+    bootstrap.bootstrap(
+        runtime.controller.original_hash,
+        "generation-0",
+        confirmation="BOOTSTRAP_INITIAL_CHAMPION",
+    )
+    discovered = create_candidate(runtime.candidate_inbox)
+    bootstrap.run_once()
+    record = bootstrap.registry.reconstruct().candidates[discovered.model_hash]
+    artifact = inspect_candidate(Path(record.candidate_path))
     calls = []
 
     def command(argv):
         argv = list(argv)
         calls.append(argv)
+        if argv[0] == "fake-stage0-probe":
+            request_path = Path(argv[argv.index("--request") + 1])
+            output_path = Path(argv[argv.index("--output") + 1])
+            request = load_json(request_path)
+            stage_policy = runtime.frozen_policy["evaluation_stages"][
+                "stage_0_integrity_and_fixed_probes"
+            ]
+            atomic_write_json(
+                output_path,
+                {
+                    "schema_version": 1,
+                    "contract": "risk-score-stage-0-probe-output-v1",
+                    "finalized": True,
+                    "candidate_hash": request["candidate_hash"],
+                    "tested_champion_hash": request["tested_champion_hash"],
+                    "original_hash": request["original_hash"],
+                    "policy_hash": request["policy_hash"],
+                    "request_hash": sha256_file(request_path),
+                    "checks": {
+                        name: True for name in stage_policy["required_checks"]
+                    },
+                    "measurements": {
+                        "fixed_analysis_positions":
+                            stage_policy["fixed_analysis_positions"],
+                        "fixed_analysis_visits":
+                            stage_policy["fixed_analysis_visits"],
+                        "exploitability_sentinel_positions":
+                            stage_policy["exploitability_sentinel_positions"],
+                        "exploitability_sentinel_visits":
+                            stage_policy["exploitability_sentinel_visits"],
+                        "hard_tactical_failures": 0,
+                        "hard_exploitability_failures": 0,
+                        "unresolved_failures": 0,
+                        "model_runtime_errors": 0,
+                        "perspective_violations": 0,
+                        "clamp_violations": 0,
+                        "endpoint_violations": 0,
+                        "nonfinite_violations": 0,
+                        "decomposition_violations": 0,
+                        "selected_move_endpoint_mass_dominated": False,
+                        "visit_stability_acceptable": True,
+                    },
+                },
+            )
+            return SimpleNamespace(returncode=0)
         plan_path = Path(argv[argv.index("--plan") + 1])
         evidence_path = Path(argv[argv.index("--evidence") + 1])
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
@@ -1292,6 +2019,7 @@ def test_configured_evaluator_adapter_is_shell_free_and_identity_checked(tmp_pat
         )
         metadata = {
             "finalized": True,
+            "controller_stage": "integrity",
             "candidate_hash": artifact.model_hash,
             "tested_champion_hash": champion,
             "original_hash": runtime.controller.original_hash,
@@ -1299,16 +2027,56 @@ def test_configured_evaluator_adapter_is_shell_free_and_identity_checked(tmp_pat
             "config_hash": plan["configHash"],
             "schedule_hash": plan["scheduleHash"],
             "policy_hash": plan["policyHash"],
-                "selfplay_config_hash": plan["selfplayConfigHash"],
-                "topology": plan["topology"],
+            "policy_path": plan["policyPath"],
+            "policy_version": plan["policyVersion"],
+            "suite_manifest_path": plan["suiteManifestPath"],
+            "suite_manifest_hash": plan["suiteManifestHash"],
+            "look": plan["look"],
+            "selfplay_config_hash": plan["selfplayConfigHash"],
+            "topology": plan["topology"],
         }
+        stage_evidence = {
+            "schema_version": 1,
+            **metadata,
+            "decision": "PASS",
+            "source_artifact_hashes": {
+                "runner": digest("validated-stage-runner"),
+                "statistics": digest("validated-stage-statistics"),
+            },
+        }
+        request_path = next(
+            (runtime.evaluations / "stage-0" / "requests").glob("*.json")
+        )
+        probe_path = next(
+            (runtime.evaluations / "stage-0" / "probes").glob("*.json")
+        )
+        runner_map_path = evidence_path.parent / "runner-manifests.json"
+        runner_map = {}
+        for name in plan["scheduleArtifacts"]:
+            manifest_path = evidence_path.parent / f"{name}.manifest.json"
+            atomic_write_json(manifest_path, {"cell": name})
+            runner_map[name] = str(manifest_path)
+        atomic_write_json(runner_map_path, runner_map)
         atomic_write_json(
             evidence_path,
             {
                 "schema_version": 1,
                 "controller_stage": "integrity",
                 **metadata,
-                "stage_gate": {"decision": "PASS", **metadata},
+                "schedule_artifacts": plan["scheduleArtifacts"],
+                "stage0_request_path": str(request_path),
+                "stage0_request_hash": sha256_file(request_path),
+                "stage0_probe_path": str(probe_path),
+                "stage0_probe_hash": sha256_file(probe_path),
+                "stage0_probe_sha256": sha256_file(probe_path),
+                "runner_manifests_path": str(runner_map_path),
+                "runner_manifests_hash": sha256_file(runner_map_path),
+                "stage_evidence": stage_evidence,
+                "stage_evidence_hash": canonical_sha256(stage_evidence),
+                "stage_gate": {
+                    "decision": "PASS",
+                    "stage_evidence_hash": canonical_sha256(stage_evidence),
+                },
             },
         )
         return SimpleNamespace(returncode=0)
@@ -1329,7 +2097,10 @@ def test_configured_evaluator_adapter_is_shell_free_and_identity_checked(tmp_pat
         topology="7-workers-100-threads",
     )
     assert result["decision"] == "PASS"
-    assert calls[0][0] == "fake-evaluator"
+    assert [call[0] for call in calls] == [
+        "fake-stage0-probe",
+        "fake-evaluator",
+    ]
     assert (
         controller.registry.reconstruct().candidates[artifact.model_hash].state
         == CandidateState.EVALUATING_INTEGRITY
@@ -1342,13 +2113,24 @@ def test_configured_evaluator_adapter_is_shell_free_and_identity_checked(tmp_pat
         / "evidence.json"
     )
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    untrusted = dict(evidence)
+    untrusted.pop("stage_evidence")
+    untrusted.pop("stage_evidence_hash")
+    untrusted["stage_gate"] = {"decision": "PASS"}
+    untrusted.update(
+        {
+            "gpu_handoff_hash": digest("handoff"),
+        }
+    )
+    with pytest.raises(SafetyHalt, match="derived stage evidence"):
+        configured_gate_evaluator(untrusted)
     evidence["candidate_hash"] = digest("wrong-candidate")
     atomic_write_json(evidence_path, evidence)
     with pytest.raises(SafetyHalt, match="contradicts"):
         controller.configured_evaluation_executor(
             controller.build_evaluation_plan(
                 artifact.model_hash,
-                digest("champion-0"),
+                runtime.controller.original_hash,
                 suite="integrity",
                 stage="integrity",
                 look="automatic",
@@ -1356,6 +2138,48 @@ def test_configured_evaluator_adapter_is_shell_free_and_identity_checked(tmp_pat
             ),
             artifact,
         )
+
+
+def test_configured_stage0_probe_missing_output_fails_closed(tmp_path):
+    runtime = prepare_runtime(tmp_path)
+    bootstrap = PromotionController(
+        runtime, automatic=True, command_executor=successful_command
+    )
+    bootstrap.bootstrap(
+        runtime.controller.original_hash,
+        "generation-0",
+        confirmation="BOOTSTRAP_INITIAL_CHAMPION",
+    )
+    discovered = create_candidate(runtime.candidate_inbox)
+    bootstrap.run_once()
+    record = bootstrap.registry.reconstruct().candidates[discovered.model_hash]
+    artifact = inspect_candidate(Path(record.candidate_path))
+    calls = []
+
+    def command(argv):
+        calls.append(list(argv))
+        return SimpleNamespace(returncode=0)
+
+    controller = PromotionController(
+        runtime,
+        automatic=True,
+        gate_evaluator=configured_gate_evaluator,
+        command_executor=command,
+        gpu_lease_factory=gpu_handoff_factory(runtime),
+    )
+    controller.evaluation_executor = controller.configured_evaluation_executor
+    with pytest.raises(SafetyHalt, match="did not publish"):
+        controller.process_evaluation_stage(
+            artifact.model_hash,
+            stage="integrity",
+            suite="integrity",
+            look="automatic",
+            topology="7-workers-100-threads",
+        )
+    assert [call[0] for call in calls] == ["fake-stage0-probe"]
+    assert not list(
+        (runtime.evaluations / "controller-adapter").glob("*/evidence.json")
+    )
 
 
 def test_superseded_and_rejected_candidates_move_durably(tmp_path):
@@ -1576,6 +2400,263 @@ def test_stale_report_never_creates_promotion_intent(tmp_path):
             **promotion_kwargs(runtime, bad_report, sha256_file(bad_report)),
         )
     assert "generation-stale" not in controller.registry.reconstruct().generations
+
+
+def activate_registry_generation(controller, runtime, index):
+    champion = controller.registry.reconstruct().current_champion_hash
+    artifact = create_candidate(
+        runtime.candidate_inbox,
+        f"audit-{index}-s{index * 500000}-d{index * 1000000}",
+        f"audit-candidate-{index}".encode(),
+    )
+    claimed = controller._claim_candidate(
+        artifact, controller.registry.reconstruct()
+    )
+    provenance = controller._provenance(
+        runtime.controller.powered_config_hash,
+        runtime.controller.discovery_schedule_hash,
+    )
+    confirmation_key = f"audit-confirmation-{index}"
+    for target, key in (
+        (CandidateState.EVALUATING_INTEGRITY, f"audit-integrity-{index}"),
+        (CandidateState.EVALUATING_SCREEN, f"audit-screen-{index}"),
+        (CandidateState.EVALUATING_FINALIST, f"audit-finalist-{index}"),
+        (CandidateState.EVALUATING_CONFIRMATION, confirmation_key),
+        (CandidateState.CONFIRMED, confirmation_key),
+    ):
+        controller.registry.transition_candidate(
+            claimed.model_hash,
+            str(claimed.path),
+            target,
+            provenance=provenance,
+            champion_hash=champion,
+            evaluation_key=key,
+            reason=f"audit fixture {target.value}",
+            actor="test-controller",
+        )
+    generation_id = f"generation-audit-{index}"
+    for target in (
+        GenerationState.PROMOTION_INTENT,
+        GenerationState.CANARY,
+        GenerationState.ROLLOUT,
+        GenerationState.ACTIVE,
+    ):
+        controller.registry.transition_generation(
+            generation_id,
+            claimed.model_hash,
+            str(claimed.path),
+            target,
+            provenance=provenance,
+            tested_champion_hash=champion,
+            evaluation_key=(
+                confirmation_key
+                if target == GenerationState.PROMOTION_INTENT
+                else None
+            ),
+            reason=f"audit fixture {target.value}",
+            actor="test-controller",
+        )
+    return generation_id, claimed
+
+
+def test_every_fifth_promotion_enqueues_one_deep_audit(tmp_path):
+    runtime = prepare_runtime(tmp_path)
+    controller = PromotionController(runtime, automatic=True)
+    controller.bootstrap(
+        digest("champion-0"),
+        "generation-0",
+        confirmation="BOOTSTRAP_INITIAL_CHAMPION",
+    )
+    fifth = None
+    for index in range(1, 6):
+        fifth = activate_registry_generation(controller, runtime, index)
+        if index == 1:
+            near_generation, near_artifact = fifth
+            near = controller._schedule_deep_audit_if_needed(
+                near_generation,
+                near_artifact.model_hash,
+                {
+                    "gate": {
+                        "ranking_summary": {
+                            "near_safety_boundary": True,
+                        }
+                    }
+                },
+            )
+            assert near["reasons"] == ["near-safety-boundary"]
+    generation_id, artifact = fifth
+    first = controller._schedule_deep_audit_if_needed(
+        generation_id,
+        artifact.model_hash,
+        {"gate": {}},
+    )
+    retry = controller._schedule_deep_audit_if_needed(
+        generation_id,
+        artifact.model_hash,
+        {"gate": {}},
+    )
+    assert first == retry
+    assert first["reasons"] == ["every-5-promotions"]
+    assert len(
+        list(
+            (
+                runtime.promotion_root / "audits" / "queue"
+            ).glob("*.json")
+        )
+    ) == 2
+
+
+def test_trash_grace_reference_protection_and_backpressure_status(tmp_path):
+    runtime, _, artifact = bootstrap_and_claim(
+        tmp_path, max_queue=2
+    )
+    clock = [datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc)]
+    controller = PromotionController(
+        runtime,
+        automatic=True,
+        now=lambda: clock[0],
+    )
+    state = controller.registry.reconstruct()
+    provenance = controller._provenance(
+        runtime.controller.powered_config_hash,
+        runtime.controller.discovery_schedule_hash,
+    )
+    controller.registry.pin_reference(
+        "test-trash-hold",
+        artifact.model_hash,
+        kind="test-hold",
+        owner="test",
+        provenance=provenance,
+        champion_hash=state.current_champion_hash,
+        reason="protect trash fixture",
+        actor="test-controller",
+    )
+    controller._move_candidate_terminal(
+        artifact,
+        CandidateState.SUPERSEDED,
+        provenance=provenance,
+        champion_hash=state.current_champion_hash,
+        evaluation_key=None,
+        reason="trash fixture superseded",
+    )
+    blocked = controller.reconcile_trash(mutate=True)
+    assert blocked[0]["status"] == "BLOCKED_REFERENCES"
+    assert Path(
+        controller.registry.reconstruct()
+        .candidates[artifact.model_hash]
+        .candidate_path
+    ).is_dir()
+
+    controller.registry.unpin_reference(
+        "test-trash-hold",
+        provenance=provenance,
+        champion_hash=state.current_champion_hash,
+        reason="release trash fixture",
+        actor="test-controller",
+    )
+    grace = controller.reconcile_trash(mutate=True)
+    object_path = Path(grace[0]["objectPath"])
+    assert grace[0]["status"] == "GRACE_PERIOD"
+    assert object_path.is_dir()
+
+    for index in range(3):
+        create_candidate(
+            runtime.candidate_inbox,
+            f"queued-{index}-s{(index + 1) * 500000}-d{index + 1}",
+            f"queued-{index}".encode(),
+        )
+    status = controller.reconcile(mutate=False)
+    assert status["queue"]["depth"] == 3
+    assert status["backpressure"]["exportPaused"] is True
+    assert status["backpressure"]["allowExport"] is False
+    assert status["lease"]["owner"] is None
+    assert status["retention"]["retainedBytes"] >= artifact.size_bytes
+    assert status["trash"][0]["status"] == "GRACE_PERIOD"
+
+    clock[0] += timedelta(days=31)
+    deleted = controller.reconcile_trash(mutate=True)
+    assert deleted[0]["status"] == "DELETED"
+    assert not object_path.exists()
+    assert controller.reconcile_trash(mutate=True)[0]["reused"] is True
+
+
+def test_reconcile_status_reports_worker_acks_and_feedback_timestamps(tmp_path):
+    runtime, controller, artifact = bootstrap_and_claim(tmp_path)
+    _, report_path, report_hash = confirm_and_report(controller, artifact)
+    converge_promotion(
+        controller,
+        runtime,
+        artifact,
+        "generation-feedback",
+        promotion_kwargs(runtime, report_path, report_hash),
+    )
+    for kind in (
+        "first-game",
+        "first-tdata",
+        "first-shuffle",
+        "first-training-consumption",
+    ):
+        controller.record_promotion_feedback(
+            "generation-feedback",
+            kind,
+            evidence={"path": f"/evidence/{kind}"},
+        )
+    status = controller.reconcile(mutate=False)
+    acknowledgements = next(
+        row
+        for row in status["workerAcknowledgements"]
+        if row["generationId"] == "generation-feedback"
+    )
+    feedback = next(
+        row
+        for row in status["promotionFeedback"]
+        if row["generationId"] == "generation-feedback"
+    )
+    assert acknowledgements["acknowledgedCount"] == 7
+    assert feedback["promotedAtUtc"] is not None
+    assert feedback["first_game_at_utc"] is not None
+    assert feedback["first_training_consumption_at_utc"] is not None
+    assert status["deepAuditQueue"]["pendingDepth"] == 0
+
+
+def test_deep_audit_failure_triggers_replay_safe_rollback(tmp_path):
+    runtime, controller, artifact = bootstrap_and_claim(tmp_path)
+    _, report_path, report_hash = confirm_and_report(controller, artifact)
+    kwargs = promotion_kwargs(runtime, report_path, report_hash)
+    converge_promotion(
+        controller, runtime, artifact, "generation-audit-rollback", kwargs
+    )
+    scheduled = controller.schedule_deep_audit(
+        "generation-audit-rollback",
+        artifact.model_hash,
+        reasons=["near-safety-boundary"],
+    )
+    external = tmp_path / "deep-audit-fail.json"
+    atomic_write_json(
+        external,
+        {
+            "schema_version": 1,
+            "finalized": True,
+            "decision": "FAIL",
+            "rollback_required": True,
+            "generation_id": "generation-audit-rollback",
+            "candidate_hash": artifact.model_hash,
+            "policy_hash": runtime.controller.policy_hash,
+            "audit_request_hash": scheduled["request_hash"],
+        },
+    )
+    controller.record_deep_audit_report(
+        "generation-audit-rollback",
+        report_path=external,
+        report_hash=sha256_file(external),
+    )
+    controller.run_reconcile()
+    assert (
+        controller.registry.reconstruct()
+        .generations["generation-audit-rollback"]
+        .state
+        == GenerationState.ROLLED_BACK
+    )
 
 
 def test_promotion_failure_hooks_converge_after_rename_and_cas(tmp_path):

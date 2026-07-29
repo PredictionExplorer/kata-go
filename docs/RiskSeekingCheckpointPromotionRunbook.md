@@ -21,7 +21,8 @@ volume.
 Freeze and hash these together:
 
 - the source revision and local diff;
-- `python/risk_score/promotion_policy_v1.json`;
+- `python/risk_score/promotion_policy_v2.json`;
+- the unchanged v1 policy and its hash when retaining historical v1 evidence;
 - `cpp/configs/risk_score/promotion_powered_match.cfg`;
 - `cpp/configs/risk_score/promotion_standard_match.cfg`;
 - `cpp/configs/risk_score/promotion_selfplay_worker_19x19.cfg`;
@@ -45,17 +46,25 @@ cd "$REPO/python"
 python3 -c 'from risk_score.paired_stats import load_policy, canonical_sha256; print(canonical_sha256(load_policy()))'
 ```
 
+The checked-in v2 policy prints
+`8562bcd7b835ae0cfcfe517a290748258da229b3fcf588dc99b3703c2b8f6023`.
+Any other value is a different policy and requires a new review and suite
+freeze.
+
 ## Installation and preflight
 
 From the repository root:
 
 ```bash
 python3 -m json.tool python/risk_score/promotion_policy_v1.json >/dev/null
+python3 -m json.tool python/risk_score/promotion_policy_v2.json >/dev/null
 python3 -m json.tool python/risk_score/promotion_runtime.example.json >/dev/null
 python3 -m json.tool python/risk_score/gpu_lease_runtime.example.json >/dev/null
 cd python
 python3 -m risk_score.promotion_controller --help
 python3 -m risk_score.evaluation_runner --help
+python3 -m risk_score.promotion_evaluator --help
+python3 -m risk_score.promotion_evidence --help
 python3 -m risk_score.build_evaluation_suites --help
 ```
 
@@ -112,13 +121,17 @@ Create a new, previously absent output directory:
 cd "$REPO/python"
 python3 -m risk_score.build_evaluation_suites \
   "$RUN_DIR/evaluation/source-positions.jsonl" \
-  --output-dir "$RUN_DIR/evaluation/promotion-suites-v1" \
-  --seed risk-score-promotion-v1
+  --output-dir "$RUN_DIR/evaluation/promotion-suites-v2" \
+  --seed risk-score-promotion-v2 \
+  --policy "$REPO/python/risk_score/promotion_policy_v2.json"
 ```
 
 Review row counts, exclusions, labels, source hashes, bank hashes, and schedule
-hashes in the emitted manifest. Confirmation data must not have been used to
-rank candidates. Publish a new version rather than overwriting a frozen suite.
+hashes in the emitted manifest. Confirm that every risk-bearing pair has a
+distinct independent position cluster, that look 1 is an exact complete-pair
+prefix of look 2, and that Lead discovery positions are disjoint from Lead
+confirmation positions. Confirmation data must not have been used to rank
+candidates. Publish a new version rather than overwriting a frozen suite.
 
 ## Bootstrap and inventory
 
@@ -144,6 +157,19 @@ Gated export also requires `KATAGO_MODEL_PROBE_COMMAND_JSON`, a JSON argv array
 that loads `{model_file}` with the production CUDA binary and rejects
 non-finite or incompatible output. Publication fails closed when this variable
 is missing or the probe exits nonzero.
+
+When the promotion controller owns the run, also set:
+
+```bash
+export KATAGO_PROMOTION_BACKPRESSURE_FILE="$TRAIN_BASE/promotion/operations/backpressure.json"
+export KATAGO_PROMOTION_POLICY_HASH="8562bcd7b835ae0cfcfe517a290748258da229b3fcf588dc99b3703c2b8f6023"
+export KATAGO_PROMOTION_BACKPRESSURE_MAX_AGE_SECONDS=120
+```
+
+The gated exporter validates canonical JSON, policy identity, and freshness,
+pauses cleanly when `allowExport=false`, and fails closed on stale or malformed
+status. Leave these variables unset only when the controller is deliberately
+not supervising export cadence.
 
 The first inventory should identify the original, earliest, newest,
 approximately 500k-sample anchors, and checkpoints adjacent to known training
@@ -187,8 +213,12 @@ produce the same events, evaluation keys, and reports.
 ### Configured evaluator adapter
 
 Automatic controller mode invokes the runtime `commands.evaluator` argv
-template. The adapter must atomically publish canonical `evidence.json` at the
-provided `{evidence_output}` path. Its envelope must bind:
+template. Use the reviewed in-repository `risk_score.promotion_evaluator`
+unless an equivalent replacement has been audited. It runs the exact
+manifest-bound match cells through `EvaluationRunner`, then uses
+`risk_score.promotion_evidence` to atomically publish canonical
+`evidence.json` at the provided `{evidence_output}` path. Its envelope must
+bind:
 
 - controller stage;
 - candidate, tested champion, and original hashes;
@@ -197,10 +227,12 @@ provided `{evidence_output}` path. Its envelope must bind:
 - canonical policy hash; and
 - `finalized=true`.
 
-For integrity, screen, and finalist stages, include a finalized `stage_gate`
-with matching metadata and a `PASS`, `FAIL`, or `INCONCLUSIVE` decision. For
-confirmation, include `promotion_evidence`; the controller runs the in-repo
-versioned promotion gate and does not trust an external PASS.
+For integrity, screen, and finalist stages, the evaluator derives a finalized
+decision from validated runner/statistics artifacts. For confirmation, it
+includes `promotion_evidence`; the controller runs the in-repo versioned
+promotion gate and does not trust an external PASS. Stage 0 is a separate
+configured argv probe that must atomically publish a canonical, request-bound
+result before any later stage may run.
 
 The adapter owns environment-specific GPU lease invocation and construction of
 the candidate/champion/original evaluation matrix. It must return nonzero
@@ -311,12 +343,20 @@ Automatic mode is allowed only after:
 - all rollback drills pass; and
 - monitoring exposes every invariant and latency target.
 
-The checked-in v1 sample counts cannot establish the tight Lead catastrophe
-margins when both models have zero observed events: the cluster-level exact
-upper bound is about 9.25% at look 1 and 3.70% at look 2. The gate therefore
-returns `INCONCLUSIVE`. Keep automatic promotion disabled until a new policy
-with adequate prespecified sample sizes (or an independently justified
-cluster-aware method) is published before viewing affected results.
+Policy v1 remains immutable historical evidence and must not be used for new
+automatic promotion. Policy v2 uses cumulative confirmation looks:
+
+- look 1: 512 powered ordinary pairs per matchup, 128 standard pairs, 512
+  Lead-40 pairs, and 1,024 Lead-80 pairs;
+- look 2: 1,024 powered ordinary pairs per matchup, 128 standard pairs, 1,024
+  Lead-40 pairs, and 2,048 Lead-80 pairs.
+
+At the final catastrophe alpha, zero events across 1,024 independent clusters
+have an exact upper bound of about 0.470%; 2,048 clusters give about 0.235%.
+The first look may therefore continue rather than promote when its tightest
+zero-event margins remain inconclusive. A full final confirmation is 5,248
+color pairs, or 10,496 games, before canary audit work; benchmark this workload
+before accepting the four-hour target.
 
 Review and set `"mutationEnabled": true` in both controller and GPU-lease
 runtime configs, then use the controller's explicit automatic flag. Keep a

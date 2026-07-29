@@ -23,9 +23,11 @@ management, and rollout control.
 
 ## Current state
 
-As of 2026-07-28:
+As of 2026-07-29:
 
-- source revision is
+- repository implementation is based on
+  `16e954ffa20327f56c3d910066195107f48bad4c` plus the currently reviewed
+  policy-v2 closure diff; the original training run remains rooted at
   `a51c32967fdfb246923aebf12801812504cfbd40`;
 - the active objective is `scorePower=1.5`, `scoreScale=20`,
   `winWeight=4`;
@@ -43,12 +45,14 @@ yet alter later self-play.
 
 ## Implementation status
 
-Last updated: 2026-07-28.
+Last updated: 2026-07-29.
 
 Checked items have repository evidence. Live-run items remain unchecked until
 they are verified on the actual training filesystem and H100 hosts.
-Mutation-enabled deployment remains blocked until every final-audit hardening
-item is checked.
+The repository-foundation checklist records implemented building blocks; it
+does not by itself establish an end-to-end automatic promotion path.
+Mutation-enabled deployment remains blocked until every repository-closure,
+final-audit hardening, and required live-environment item is checked.
 
 ### Existing prerequisites
 
@@ -62,7 +66,7 @@ item is checked.
 - [x] Existing descriptive risk-score summaries and move comparisons are
   covered by Python tests.
 
-### Repository implementation
+### Repository foundation
 
 - [x] Freeze promotion policy v1 and explicit powered/standard match configs.
 - [x] Build independent, content-addressed evaluation suite manifests.
@@ -76,18 +80,36 @@ item is checked.
   transactions.
 - [x] Add the promotion operations runbook and all planned automated tests.
 
+### Repository closure
+
+- [x] Publish an immutable, statistically feasible promotion policy v2 while
+  retaining v1 byte-for-byte for historical evidence.
+- [x] Publish exact cumulative look-1/look-2 schedules with independent
+  position-cluster quotas and separate Lead discovery/confirmation holdouts.
+- [x] Build an in-repository evaluator evidence adapter from finalized match
+  outputs through paired statistics to gate-grade promotion evidence.
+- [x] Bind finalist ranking to finalized statistics artifacts and make the
+  prespecified second confirmation look executable and crash-recoverable.
+- [x] Execute and bind Stage 0 probes, schedule deep audits, and connect audit
+  failures to rollback.
+- [x] Complete reference-aware trash/grace handling, queue backpressure, and
+  structured invariant/SLO status.
+- [x] Add the remaining failure-injection tests and run the Python promotion
+  suite in CI.
+- [x] Pass final focused/full repository verification and record the exact
+  commands below.
+
 Repository verification recorded so far:
 
 - `uv run --with pytest pytest tests/test_evaluation_runner.py -q`
-  (2026-07-28): 146 tests passed under the repository's configured Python test
-  selection.
+  (2026-07-28): 146 tests passed because `python/pytest.ini` appended the full
+  `tests` selection; this was not a focused-file count.
 - `uv run --with pytest pytest tests/test_promotion_state.py -q`
-  (2026-07-28): 146 tests passed under the repository's configured Python test
-  selection.
+  (2026-07-28): 146 tests passed under the same appended full-suite selection.
 - `uv run --with pytest pytest tests/test_gpu_lease.py
   tests/test_hardened_exporter.py -q` (2026-07-28): 147 tests passed under the
-  repository's configured Python test selection; shell syntax and runtime JSON
-  validation also passed.
+  appended full-suite selection; shell syntax and runtime JSON validation also
+  passed.
 - `uv run --with pytest pytest tests/test_paired_stats.py
   tests/test_promotion_gate.py tests/test_evaluation_runner.py
   tests/test_risk_score.py -q` (2026-07-28): 168 tests passed, including
@@ -116,6 +138,16 @@ Repository verification recorded so far:
 - `python3 -m compileall -q risk_score`, strict example-config loading,
   `bash -n python/selfplay/export_model_for_selfplay.sh`, and
   `git diff --check` (2026-07-28): passed.
+- `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. uv run --with pytest pytest
+  -p no:cacheprovider -c /dev/null tests -q` (2026-07-29): 310 tests passed.
+- Focused policy/statistics, suite/evidence, evaluator integration,
+  state/recovery, and mid-pair/restart runs (2026-07-29): 68, 45, 73, 79, and
+  63 tests passed, respectively.
+- Policy v2 canonical SHA-256 (2026-07-29):
+  `8562bcd7b835ae0cfcfe517a290748258da229b3fcf588dc99b3703c2b8f6023`.
+- Final `compileall`, v1/v2 policy and runtime JSON parsing, promotion CLI
+  help smokes, exporter shell syntax, GitHub workflow YAML parsing, pinned
+  policy validation, and `git diff --check` (2026-07-29): passed.
 
 ### Final audit hardening
 
@@ -145,10 +177,10 @@ Repository verification recorded so far:
   provenance, and publish read-only generation model copies.
 - [x] Enforce path containment/alias safety and require the gated exporter
   model-load/finite-output probe.
-- [ ] Resolve the frozen v1 lead-suite sample-size/zero-event-bound mismatch
-  before enabling automatic promotion. With independent position clusters, the
-  exact zero-event upper bound is approximately 9.25% at look 1 and 3.70% at
-  look 2, so the current Lead risk margins correctly remain inconclusive.
+- [x] Preserve frozen v1 as historical evidence and publish v2 with feasible
+  final-look sample sizes. V2 requires 1,024 independent ordinary/Lead-40
+  clusters and 2,048 Lead-80 clusters at look 2, giving exact zero-event upper
+  bounds of approximately 0.470% and 0.235%, respectively.
 
 ### Live environment validation
 
@@ -272,6 +304,16 @@ loading, and training-data generation remain the execution engines.
   - bounded parallel match subprocesses;
   - output validation and retry;
   - candidate/champion/original matrices.
+- `python/risk_score/promotion_evaluator.py`
+  - manifest-bound matrix execution;
+  - exact champion-model hash resolution;
+  - Stage 0 artifact reuse;
+  - atomic runner-manifest and evidence publication.
+- `python/risk_score/promotion_evidence.py`
+  - finalized runner-to-statistics assembly;
+  - exact five-cell and combined-Lead evidence binding;
+  - Stage 0 and discovery provenance;
+  - canonical controller evidence publication.
 - `python/risk_score/build_evaluation_suites.py`
   - frozen ordinary, Lead-40, Lead-80, tactical, and exploitability suites;
   - independent discovery, confirmation, and audit holdouts.
@@ -286,8 +328,10 @@ loading, and training-data generation remain the execution engines.
   - candidate and original both use standard KataGo utility;
   - ordinary-strength safety control.
 - `python/risk_score/promotion_policy_v1.json`
-  - all sample counts, confidence levels, safety margins, queue limits,
-    sequential boundaries, and rollout thresholds.
+  - immutable historical policy and evidence identity.
+- `python/risk_score/promotion_policy_v2.json`
+  - feasible cumulative sample/cluster counts, confidence levels, safety
+    margins, queue limits, sequential boundaries, and rollout thresholds.
 - `docs/RiskSeekingCheckpointPromotionRunbook.md`
   - installation, supervision, recovery, manual override, and incident
     procedures.
@@ -299,6 +343,9 @@ loading, and training-data generation remain the execution engines.
 - `python/tests/test_promotion_state.py`
 - `python/tests/test_gpu_lease.py`
 - `python/tests/test_evaluation_runner.py`
+- `python/tests/test_promotion_evaluator.py`
+- `python/tests/test_promotion_evidence.py`
+- `python/tests/test_hardened_exporter.py`
 - `python/tests/test_promotion_recovery.py`
 
 No C++ change is required for the first production controller. Optional C++
@@ -554,7 +601,9 @@ routine safe promotion.
 
 ## Confidence and sequential testing
 
-All thresholds and looks are frozen in `promotion_policy_v1.json`.
+Historical v1 thresholds remain frozen in `promotion_policy_v1.json`; all new
+automatic evaluations use the independently frozen
+`promotion_policy_v2.json`.
 
 Primary inference:
 
@@ -872,8 +921,27 @@ Automated tests must cover:
 - registry/index loss and rebuild; and
 - filesystem rename/fsync behavior on the actual run volume.
 
-Tests include unit fixtures, statistical golden data, property-based
-idempotency tests, bounded dummy-model integration, and actual b40 CUDA smokes.
+Repository coverage status:
+
+- [x] Competing controller lock, candidate/export rename conflicts, duplicate
+  name/different hash, malformed JSONL, stale champion, GPU lease conflicts,
+  trainer drain failures, model-probe failures, partial worker
+  acknowledgements, rollback boundaries, insufficient disk, and registry
+  replay.
+- [x] Kill-after-step recovery across the promotion filesystem transaction.
+- [x] Explicit evaluator death after only one game of a color pair.
+- [x] Parametric restart coverage from every candidate evaluation state,
+  including between confirmation looks.
+- [x] End-to-end runner-to-statistics-to-real-gate-to-controller coverage
+  without injected PASS fields.
+- [x] Deep-audit scheduling and asynchronous rollback-trigger coverage.
+- [ ] Actual run-volume rename/fsync and b40 CUDA failure drills; these remain
+  live-environment items.
+
+Repository tests include unit fixtures, statistical golden data, bounded
+dummy-model integration, and deterministic parametrized idempotency coverage
+without an external property-testing dependency. Actual b40 CUDA smokes remain
+pending.
 
 ## Implementation phases
 
@@ -882,7 +950,7 @@ idempotency tests, bounded dummy-model integration, and actual b40 CUDA smokes.
 Duration: approximately half a day.
 
 - inventory and hash all staged candidates;
-- freeze promotion policy v1;
+- retain promotion policy v1 and freeze the corrected policy v2;
 - freeze discovery/confirmation/audit schedules;
 - verify current source, binary, configs, GPU identity, and filesystems;
 - measure candidate storage and export cadence;

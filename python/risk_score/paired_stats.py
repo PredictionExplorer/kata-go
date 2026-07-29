@@ -23,7 +23,9 @@ from typing import Any, DefaultDict, Dict, Iterable, List, Mapping, Optional, Se
 
 
 SCHEMA_VERSION = 1
-DEFAULT_POLICY_PATH = Path(__file__).with_name("promotion_policy_v1.json")
+V1_POLICY_PATH = Path(__file__).with_name("promotion_policy_v1.json")
+V2_POLICY_PATH = Path(__file__).with_name("promotion_policy_v2.json")
+DEFAULT_POLICY_PATH = V2_POLICY_PATH
 RISK_METRICS = (
     "final_20",
     "final_50",
@@ -50,6 +52,25 @@ def canonical_json(value: Any) -> str:
 
 def canonical_sha256(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def exact_zero_event_upper_bound(alpha: float, independent_clusters: int) -> float:
+    """Return the exact one-sided no-event bound without cancellation."""
+
+    if (
+        isinstance(alpha, bool)
+        or not isinstance(alpha, (int, float))
+        or not math.isfinite(float(alpha))
+        or not 0.0 < float(alpha) < 1.0
+    ):
+        raise ValueError("alpha must be finite and strictly between zero and one")
+    if (
+        isinstance(independent_clusters, bool)
+        or not isinstance(independent_clusters, int)
+        or independent_clusters <= 0
+    ):
+        raise ValueError("independent_clusters must be a positive integer")
+    return -math.expm1(math.log(float(alpha)) / independent_clusters)
 
 
 def load_policy(path: Path = DEFAULT_POLICY_PATH) -> Dict[str, Any]:
@@ -1013,7 +1034,7 @@ def _metric_report(
         and clusters > 0
         and estimate is not None
     ):
-        zero_event_bound = 1.0 - alpha ** (1.0 / clusters)
+        zero_event_bound = exact_zero_event_upper_bound(alpha, clusters)
         if upper_bound is None or upper_bound < zero_event_bound:
             upper_bound = zero_event_bound
         if bootstrap is not None and (

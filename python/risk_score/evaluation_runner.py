@@ -79,6 +79,11 @@ _SCHEDULE_BINDING_FIELDS = (
     "positionContentSha256",
     "positionSemanticSha256",
 )
+_OPTIONAL_SCHEDULE_PROVENANCE_FIELDS = (
+    "suiteQualifiedName",
+    "suiteHoldout",
+    "independentClusterId",
+)
 
 
 class EvaluationError(RuntimeError):
@@ -236,6 +241,7 @@ class EvaluationPlan:
     schedule_id: str
     execution: RunnerExecutionIdentity
     schedule_rows: Tuple[Dict[str, Any], ...]
+    manifest_cell: Optional[Mapping[str, Any]]
     shards: Tuple[ScheduleShard, ...]
     commands: Tuple[CommandPlan, ...]
     partial_dir: Path
@@ -477,6 +483,26 @@ def validate_schedule_rows(
                     raise EvaluationValidationError(
                         f"schedule rows use inconsistent {field}"
                     )
+            if "suiteQualifiedName" in row:
+                _nonempty_string(
+                    row["suiteQualifiedName"], f"{source} suiteQualifiedName"
+                )
+            if "suiteHoldout" in row and row["suiteHoldout"] is not None:
+                _nonempty_string(row["suiteHoldout"], f"{source} suiteHoldout")
+            if "independentClusterId" in row:
+                cluster_id = row["independentClusterId"]
+                if (
+                    not isinstance(cluster_id, str)
+                    or _SHA256_PATTERN.fullmatch(cluster_id) is None
+                ):
+                    raise EvaluationValidationError(
+                        f"{source} independentClusterId must be a SHA-256"
+                    )
+                if cluster_id != row["positionSemanticSha256"]:
+                    raise EvaluationValidationError(
+                        f"{source} independentClusterId contradicts "
+                        "positionSemanticSha256"
+                    )
         checked.append(row)
         pair_rows.setdefault(pair_id, []).append(row)
 
@@ -509,6 +535,11 @@ def validate_schedule_rows(
                 f"pairId {pair_id!r} must use distinct seeds"
             )
         for field in _SCHEDULE_BINDING_FIELDS:
+            if first.get(field) != second.get(field):
+                raise EvaluationValidationError(
+                    f"pairId {pair_id!r} has inconsistent {field}"
+                )
+        for field in _OPTIONAL_SCHEDULE_PROVENANCE_FIELDS:
             if first.get(field) != second.get(field):
                 raise EvaluationValidationError(
                     f"pairId {pair_id!r} has inconsistent {field}"
@@ -640,6 +671,17 @@ def _copy_schedule_bindings(
         elif field in row:
             raise EvaluationValidationError(
                 f"{source} has unscheduled binding field {field}"
+            )
+    for field in _OPTIONAL_SCHEDULE_PROVENANCE_FIELDS:
+        if field in expected:
+            if field in row and row[field] != expected[field]:
+                raise EvaluationValidationError(
+                    f"{source} {field} contradicts immutable schedule provenance"
+                )
+            row[field] = expected[field]
+        elif field in row:
+            raise EvaluationValidationError(
+                f"{source} has unscheduled provenance field {field}"
             )
 
 
@@ -915,6 +957,16 @@ def validate_move_rows(
             raise EvaluationValidationError(
                 f"{source} bot does not match the result color assignment"
             )
+        score_lead = _finite_number(row.get("scoreLead"), f"{source} scoreLead")
+        win_probability = _finite_number(
+            row.get("winProbability"), f"{source} winProbability"
+        )
+        if not 0.0 <= win_probability <= 1.0:
+            raise EvaluationValidationError(
+                f"{source} winProbability must be between zero and one"
+            )
+        row["scoreLead"] = score_lead
+        row["winProbability"] = win_probability
         turns_by_game[game_id].append(turn_number)
         checked.append(row)
     for result in results:
@@ -1096,6 +1148,199 @@ def _verify_canonical_json_hash(path: Path, expected_sha: str, role: str) -> Non
             f"{role} canonical SHA-256 mismatch for {path}: "
             f"{actual}, expected {expected_sha}"
         )
+
+
+def load_suite_manifest(path: Path) -> Dict[str, Any]:
+    """Load a canonical suite manifest and verify its self-hashed payload."""
+
+    manifest_path = Path(path)
+    try:
+        data = manifest_path.read_bytes()
+        value = json.loads(data.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise EvaluationValidationError(
+            f"cannot load evaluation suite manifest {manifest_path}: {exc}"
+        ) from exc
+    if not isinstance(value, dict):
+        raise EvaluationValidationError(
+            "evaluation suite manifest must be a JSON object"
+        )
+    expected_data = (canonical_json(value) + "\n").encode("utf-8")
+    if data != expected_data:
+        raise EvaluationValidationError(
+            "evaluation suite manifest must be canonical newline-terminated JSON"
+        )
+    payload = dict(value)
+    payload_hash = payload.pop("manifestPayloadSha256", None)
+    if payload_hash != canonical_sha256(payload):
+        raise EvaluationValidationError(
+            "evaluation suite manifest payload SHA-256 is invalid"
+        )
+    return value
+
+
+def _iter_manifest_cells(value: Any) -> Iterable[Mapping[str, Any]]:
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                yield item
+        return
+    if not isinstance(value, dict):
+        return
+    has_coordinate = (
+        ("comparison" in value)
+        and ("stage" in value)
+        and ("look" in value)
+        and ("schedule_hash" in value or isinstance(value.get("schedule"), dict))
+    )
+    if has_coordinate:
+        yield value
+        return
+    for child in value.values():
+        yield from _iter_manifest_cells(child)
+
+
+def _relative_manifest_path(value: Any, source: str) -> str:
+    text = _nonempty_string(value, source)
+    path = Path(text)
+    if path.is_absolute() or any(part in ("", ".", "..") for part in path.parts):
+        raise EvaluationValidationError(f"{source} must be a normalized relative path")
+    return path.as_posix()
+
+
+def _manifest_cell_field(
+    cell: Mapping[str, Any],
+    name: str,
+    *,
+    nested: Optional[Tuple[str, str]] = None,
+) -> Any:
+    if name in cell:
+        return cell[name]
+    if nested is not None:
+        container = cell.get(nested[0])
+        if isinstance(container, dict):
+            return container.get(nested[1])
+    return None
+
+
+def resolve_manifest_cell(
+    manifest: Union[Path, Mapping[str, Any]],
+    *,
+    stage: str,
+    look: str,
+    comparison: str,
+    suite: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Resolve and validate one exact stage/look/comparison manifest cell."""
+
+    if isinstance(manifest, (str, os.PathLike, Path)):
+        loaded = load_suite_manifest(Path(manifest))
+    elif isinstance(manifest, Mapping):
+        loaded = json.loads(canonical_json(manifest))
+        payload = dict(loaded)
+        payload_hash = payload.pop("manifestPayloadSha256", None)
+        if payload_hash != canonical_sha256(payload):
+            raise EvaluationValidationError(
+                "evaluation suite manifest payload SHA-256 is invalid"
+            )
+    else:
+        raise EvaluationValidationError(
+            "evaluation suite manifest must be a path or object"
+        )
+
+    cells = list(_iter_manifest_cells(loaded.get("cells")))
+    matches = [
+        dict(cell)
+        for cell in cells
+        if cell.get("stage") == stage
+        and cell.get("look") == look
+        and cell.get("comparison") == comparison
+        and (suite is None or cell.get("suite") == suite)
+    ]
+    if len(matches) != 1:
+        raise EvaluationValidationError(
+            "suite manifest coordinates must resolve exactly one cell; "
+            f"stage={stage!r}, look={look!r}, comparison={comparison!r}, "
+            f"suite={suite!r}, matches={len(matches)}"
+        )
+    cell = matches[0]
+    cell_name = _nonempty_string(cell.get("cell_name"), "manifest cell_name")
+    cell_id = _nonempty_string(cell.get("cell_id"), "manifest cell_id")
+    cell_payload = dict(cell)
+    cell_payload.pop("cell_id", None)
+    expected_cell_id = "suite-cell-" + canonical_sha256(cell_payload)
+    if cell_id != expected_cell_id:
+        raise EvaluationValidationError("suite manifest cell_id is invalid")
+
+    manifest_policy_hash = loaded.get("policy_hash")
+    manifest_policy_version = loaded.get("policy_version")
+    manifest_source_revision = loaded.get("source_revision")
+    if (
+        cell.get("policy_hash") != manifest_policy_hash
+        or cell.get("policy_version") != manifest_policy_version
+        or cell.get("source_revision") != manifest_source_revision
+    ):
+        raise EvaluationValidationError(
+            "suite manifest cell policy/source binding is inconsistent"
+        )
+    for field_name in ("policy_hash", "bank_hash", "schedule_hash"):
+        value = cell.get(field_name)
+        if not isinstance(value, str) or _SHA256_PATTERN.fullmatch(value) is None:
+            raise EvaluationValidationError(
+                f"suite manifest cell {field_name} must be a SHA-256"
+            )
+    _relative_manifest_path(cell.get("bank_path"), "manifest cell bank_path")
+    _relative_manifest_path(cell.get("schedule_path"), "manifest cell schedule_path")
+    _nonempty_string(cell.get("schedule_id"), "manifest cell schedule_id")
+
+    pair_count = cell.get("color_pairs")
+    row_count = cell.get("schedule_row_count")
+    minimum_clusters = cell.get("minimum_independent_position_clusters")
+    if (
+        type(pair_count) is not int
+        or pair_count <= 0
+        or type(row_count) is not int
+        or row_count != pair_count * 2
+        or type(minimum_clusters) is not int
+        or minimum_clusters <= 0
+        or minimum_clusters > pair_count
+    ):
+        raise EvaluationValidationError(
+            "suite manifest cell has invalid pair/row/cluster quotas"
+        )
+    cluster_ids = cell.get("independent_cluster_ids")
+    if not (
+        isinstance(cluster_ids, list)
+        and len(cluster_ids) == pair_count
+        and len(cluster_ids) == len(set(cluster_ids))
+        and all(
+            isinstance(value, str) and _SHA256_PATTERN.fullmatch(value) is not None
+            for value in cluster_ids
+        )
+    ):
+        raise EvaluationValidationError(
+            "suite manifest cell must use one unique SHA-256 cluster per pair"
+        )
+    if cell.get("independent_cluster_ids_hash") != canonical_sha256(cluster_ids):
+        raise EvaluationValidationError(
+            "suite manifest cell independent_cluster_ids_hash is invalid"
+        )
+    position_ids = cell.get("position_ids")
+    if not (
+        isinstance(position_ids, list)
+        and len(position_ids) == pair_count
+        and len(position_ids) == len(set(position_ids))
+        and all(isinstance(value, str) and value for value in position_ids)
+    ):
+        raise EvaluationValidationError(
+            "suite manifest cell position_ids are incomplete or duplicated"
+        )
+    if cell.get("position_ids_hash") != canonical_sha256(position_ids):
+        raise EvaluationValidationError(
+            "suite manifest cell position_ids_hash is invalid"
+        )
+    cell["cell_name"] = cell_name
+    return cell
 
 
 def build_evaluation_matrix(
@@ -1423,27 +1668,119 @@ class EvaluationRunner:
         self,
         spec: EvaluationSpec,
         suite_manifest_path: Optional[Path],
+        schedule_path: Path,
         schedule_rows: Sequence[Mapping[str, Any]],
-    ) -> None:
+    ) -> Optional[Dict[str, Any]]:
         if spec.suite_manifest_sha is None:
-            return
+            return None
         assert suite_manifest_path is not None
-        try:
-            manifest = json.loads(suite_manifest_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise EvaluationValidationError(
-                f"cannot load evaluation suite manifest: {exc}"
-            ) from exc
-        if not isinstance(manifest, dict):
-            raise EvaluationValidationError(
-                "evaluation suite manifest must be an object"
+        manifest = load_suite_manifest(suite_manifest_path)
+        exact_cells = list(_iter_manifest_cells(manifest.get("cells")))
+        if exact_cells:
+            matching_exact = [
+                cell
+                for cell in exact_cells
+                if cell.get("stage") == spec.stage
+                and cell.get("look") == spec.look
+                and cell.get("comparison") == spec.comparison
+                and cell.get("suite") == spec.suite
+            ]
+            if len(matching_exact) > 1:
+                raise EvaluationValidationError(
+                    "suite manifest has duplicate exact evaluation coordinates"
+                )
+            if not matching_exact and spec.stage == "stage-3":
+                raise EvaluationValidationError(
+                    "suite manifest has no exact Stage-3 evaluation cell"
+                )
+        else:
+            matching_exact = []
+        if matching_exact:
+            cell = resolve_manifest_cell(
+                manifest,
+                stage=spec.stage,
+                look=spec.look,
+                comparison=spec.comparison,
+                suite=spec.suite,
             )
-        payload = dict(manifest)
-        payload_sha = payload.pop("manifestPayloadSha256", None)
-        if payload_sha != canonical_sha256(payload):
-            raise EvaluationValidationError(
-                "evaluation suite manifest payload SHA-256 is invalid"
-            )
+            if manifest.get("policy_hash") != spec.policy_sha:
+                raise EvaluationValidationError(
+                    "suite manifest policy hash contradicts EvaluationSpec"
+                )
+            expected_schedule_path = (
+                suite_manifest_path.parent / cell["schedule_path"]
+            ).resolve()
+            if schedule_path.resolve() != expected_schedule_path:
+                raise EvaluationValidationError(
+                    "schedule path does not match exact suite manifest cell"
+                )
+            expected_values = {
+                "schedule_hash": spec.schedule_sha,
+                "schedule_id": schedule_rows[0]["scheduleId"],
+                "schedule_row_count": len(schedule_rows),
+                "color_pairs": len({row["pairId"] for row in schedule_rows}),
+                "bank_hash": spec.suite_bank_sha,
+            }
+            actual_values = {key: cell.get(key) for key in expected_values}
+            if actual_values != expected_values:
+                raise EvaluationValidationError(
+                    "suite manifest contradicts exact schedule cell: "
+                    f"expected {expected_values}, got {actual_values}"
+                )
+            if spec.schedule_id is None:
+                raise EvaluationValidationError(
+                    "exact suite manifest cells require schedule_id in EvaluationSpec"
+                )
+            if spec.schedule_id != cell["schedule_id"]:
+                raise EvaluationValidationError(
+                    "EvaluationSpec schedule_id contradicts manifest cell"
+                )
+
+            pairs: Dict[str, Mapping[str, Any]] = {}
+            for row in schedule_rows:
+                pairs.setdefault(row["pairId"], row)
+            cluster_ids = [
+                row.get(
+                    "independentClusterId",
+                    row.get("positionSemanticSha256"),
+                )
+                for row in pairs.values()
+            ]
+            position_ids = sorted(row["positionId"] for row in pairs.values())
+            if cluster_ids != cell["independent_cluster_ids"]:
+                raise EvaluationValidationError(
+                    "schedule independent clusters contradict manifest cell"
+                )
+            if canonical_sha256(cluster_ids) != cell["independent_cluster_ids_hash"]:
+                raise EvaluationValidationError(
+                    "schedule independent cluster hash contradicts manifest cell"
+                )
+            if position_ids != cell["position_ids"]:
+                raise EvaluationValidationError(
+                    "schedule position IDs contradict manifest cell"
+                )
+            if canonical_sha256(position_ids) != cell["position_ids_hash"]:
+                raise EvaluationValidationError(
+                    "schedule position ID hash contradicts manifest cell"
+                )
+            pair_counts_by_cluster: Dict[str, int] = {}
+            for cluster_id in cluster_ids:
+                pair_counts_by_cluster[cluster_id] = (
+                    pair_counts_by_cluster.get(cluster_id, 0) + 1
+                )
+            if len(cluster_ids) < cell["minimum_independent_position_clusters"] or any(
+                count != 1 for count in pair_counts_by_cluster.values()
+            ):
+                raise EvaluationValidationError(
+                    "exact manifest cell must use one pair per independent cluster"
+                )
+            qualified_names = {row.get("suiteQualifiedName") for row in schedule_rows}
+            if qualified_names != {cell["bank_name"]}:
+                raise EvaluationValidationError(
+                    "schedule qualified bank name contradicts manifest cell"
+                )
+            return cell
+
         matching_banks = [
             bank
             for bank in manifest.get("banks", [])
@@ -1475,6 +1812,7 @@ class EvaluationRunner:
             raise EvaluationValidationError(
                 "EvaluationSpec suite does not match suite manifest bank"
             )
+        return None
 
     def plan(
         self,
@@ -1514,9 +1852,10 @@ class EvaluationRunner:
             raise EvaluationValidationError(
                 "evaluation runner schedules must use bot indices 0 and 1"
             )
-        self._verify_suite_binding(
+        manifest_cell = self._verify_suite_binding(
             spec,
             Path(suite_manifest_path) if suite_manifest_path is not None else None,
+            schedule_path,
             schedule_rows,
         )
         if (
@@ -1566,6 +1905,7 @@ class EvaluationRunner:
             schedule_id=schedule_rows[0]["scheduleId"],
             execution=execution,
             schedule_rows=schedule_rows,
+            manifest_cell=manifest_cell,
             shards=shards,
             commands=commands,
             partial_dir=partial_dir,
@@ -1586,6 +1926,12 @@ class EvaluationRunner:
                 "pairCount": len({row["pairId"] for row in plan.schedule_rows}),
                 "suiteManifestSha256": plan.spec.suite_manifest_sha,
                 "suiteBankSha256": plan.spec.suite_bank_sha,
+                "manifestCell": plan.manifest_cell,
+                "manifestCellSha256": (
+                    canonical_sha256(plan.manifest_cell)
+                    if plan.manifest_cell is not None
+                    else None
+                ),
             },
             "shards": [
                 {
@@ -1898,6 +2244,12 @@ class EvaluationRunner:
                 "pairCount": len({row["pairId"] for row in plan.schedule_rows}),
                 "suiteManifestSha256": plan.spec.suite_manifest_sha,
                 "suiteBankSha256": plan.spec.suite_bank_sha,
+                "manifestCell": plan.manifest_cell,
+                "manifestCellSha256": (
+                    canonical_sha256(plan.manifest_cell)
+                    if plan.manifest_cell is not None
+                    else None
+                ),
             },
             "results": {
                 "path": "results.jsonl",
@@ -1982,6 +2334,13 @@ class EvaluationRunner:
             or schedule_manifest.get("suiteManifestSha256")
             != plan.spec.suite_manifest_sha
             or schedule_manifest.get("suiteBankSha256") != plan.spec.suite_bank_sha
+            or schedule_manifest.get("manifestCell") != plan.manifest_cell
+            or schedule_manifest.get("manifestCellSha256")
+            != (
+                canonical_sha256(plan.manifest_cell)
+                if plan.manifest_cell is not None
+                else None
+            )
         ):
             raise EvaluationConflictError("final manifest contradicts schedule")
         results_manifest = manifest.get("results")

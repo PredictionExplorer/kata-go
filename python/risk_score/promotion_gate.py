@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Versioned PASS/FAIL/INCONCLUSIVE gate for checkpoint promotion.
 
-The gate consumes a finalized confirmation evidence dictionary. Missing
-mandatory evidence is INCONCLUSIVE, while a supplied value that proves a
-policy violation is FAIL. PASS is possible only when every emitted check
-passes. Checks and reason codes are sorted to make reports byte-stable after
-canonical JSON serialization.
+The gate consumes finalized confirmation evidence. Under v2, INCONCLUSIVE is
+reserved for complete evidence whose prespecified statistical margins remain
+unresolved; malformed, missing, provenance, and safety evidence fails closed.
+PASS is possible only when every emitted check passes. Checks and reason codes
+are sorted to make reports byte-stable after canonical JSON serialization.
 """
 
 import argparse
@@ -15,21 +15,50 @@ import math
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 try:
-    from .paired_stats import DEFAULT_POLICY_PATH, canonical_sha256, load_policy
+    from .paired_stats import (
+        DEFAULT_POLICY_PATH,
+        canonical_sha256,
+        exact_zero_event_upper_bound,
+        load_policy,
+    )
 except ImportError:  # pragma: no cover - supports direct script execution
-    from paired_stats import DEFAULT_POLICY_PATH, canonical_sha256, load_policy
+    from paired_stats import (
+        DEFAULT_POLICY_PATH,
+        canonical_sha256,
+        exact_zero_event_upper_bound,
+        load_policy,
+    )
 
 
 GATE_REPORT_SCHEMA_VERSION = 1
 EVIDENCE_SCHEMA_VERSION = 1
-EXPECTED_POLICY_VERSION = "risk-seeking-checkpoint-promotion-v1"
-EXPECTED_POLICY_HASH = "d3578dfdf99e4aace0461310b7225c1d42051fc4e87770e22d89b8545645d324"
+V1_POLICY_VERSION = "risk-seeking-checkpoint-promotion-v1"
+V1_POLICY_HASH = "d3578dfdf99e4aace0461310b7225c1d42051fc4e87770e22d89b8545645d324"
+V2_POLICY_VERSION = "risk-seeking-checkpoint-promotion-v2"
+V2_POLICY_HASH = "8562bcd7b835ae0cfcfe517a290748258da229b3fcf588dc99b3703c2b8f6023"
+PINNED_POLICY_REGISTRY = {
+    V1_POLICY_VERSION: {
+        "schema_version": 1,
+        "policy_hash": V1_POLICY_HASH,
+    },
+    V2_POLICY_VERSION: {
+        "schema_version": 2,
+        "policy_hash": V2_POLICY_HASH,
+    },
+}
+POLICY_REGISTRY = PINNED_POLICY_REGISTRY
+EXPECTED_POLICY_VERSION = V2_POLICY_VERSION
+EXPECTED_POLICY_HASH = V2_POLICY_HASH
 PASS = "PASS"
 FAIL = "FAIL"
 INCONCLUSIVE = "INCONCLUSIVE"
+PROMOTE = "PROMOTE"
+CONTINUE_TO_LOOK_2 = "CONTINUE_TO_LOOK_2"
+STOP_HARM = "STOP_HARM"
+STOP_MAXIMUM_INCONCLUSIVE = "STOP_MAXIMUM_INCONCLUSIVE"
 _MISSING = object()
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SOURCE_REVISION_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
@@ -55,6 +84,13 @@ RISK_CELL_BINDINGS = {
     "targeted_lead_40_suite_loss": "lead_40",
     "lead_80_loss": "lead_80",
     "targeted_lead_80_suite_loss": "lead_80",
+}
+CELL_PAIR_COUNT_KEYS = {
+    "powered_candidate_vs_champion": "powered_ordinary_color_pairs_per_matchup",
+    "powered_candidate_vs_original": "powered_ordinary_color_pairs_per_matchup",
+    "standard_candidate_vs_original": "standard_ordinary_color_pairs",
+    "lead_40": "lead_40_color_pairs",
+    "lead_80": "lead_80_color_pairs",
 }
 
 
@@ -98,12 +134,17 @@ def _policy_errors(policy: Any) -> List[str]:
     if not isinstance(policy, dict):
         return ["POLICY_NOT_OBJECT"]
     errors: List[str] = []
-    if canonical_sha256(policy) != EXPECTED_POLICY_HASH:
-        errors.append("POLICY_CONTENT_HASH_MISMATCH")
+    policy_version = policy.get("policy_version")
+    registry_entry = PINNED_POLICY_REGISTRY.get(policy_version)
+    if registry_entry is None:
+        errors.append("POLICY_VERSION_UNSUPPORTED")
+    else:
+        if policy.get("schema_version") != registry_entry["schema_version"]:
+            errors.append("POLICY_SCHEMA_VERSION_MISMATCH")
+        if canonical_sha256(policy) != registry_entry["policy_hash"]:
+            errors.append("POLICY_CONTENT_HASH_MISMATCH")
 
     exact_values: Tuple[Tuple[Tuple[str, ...], Any], ...] = (
-        (("schema_version",), 1),
-        (("policy_version",), EXPECTED_POLICY_VERSION),
         (("status",), "frozen"),
         (("objective", "win_weight"), 4.0),
         (("objective", "score_power"), 1.5),
@@ -197,7 +238,17 @@ def _policy_errors(policy: Any) -> List[str]:
         "stage_3_promotion_confirmation",
         "looks",
     )
-    expected_counts = ((1, 256, 128, 64, 64), (2, 512, 128, 128, 128))
+    expected_counts_by_version = {
+        V1_POLICY_VERSION: (
+            (1, 256, 128, 64, 64),
+            (2, 512, 128, 128, 128),
+        ),
+        V2_POLICY_VERSION: (
+            (1, 512, 128, 512, 1024),
+            (2, 1024, 128, 1024, 2048),
+        ),
+    }
+    expected_counts = expected_counts_by_version.get(policy_version)
     if not isinstance(stage_3_looks, list) or len(stage_3_looks) != 2:
         errors.append("POLICY_INVALID_STAGE_3_LOOKS")
     else:
@@ -212,7 +263,7 @@ def _policy_errors(policy: Any) -> List[str]:
             for look in stage_3_looks
             if isinstance(look, dict)
         )
-        if actual_counts != expected_counts:
+        if expected_counts is None or actual_counts != expected_counts:
             errors.append("POLICY_CHANGED_STAGE_3_COUNTS")
 
     expected_risks = {
@@ -242,6 +293,169 @@ def _policy_errors(policy: Any) -> List[str]:
     matrix = _path(policy, "required_confirmation_matrix")
     if not isinstance(matrix, dict) or set(matrix) != required_cells:
         errors.append("POLICY_INVALID_REQUIRED_CONFIRMATION_MATRIX")
+
+    if policy_version == V2_POLICY_VERSION:
+        if policy.get("supersedes") != {
+            "policy_version": V1_POLICY_VERSION,
+            "policy_hash": V1_POLICY_HASH,
+        }:
+            errors.append("POLICY_INVALID_SUPERSEDES_BINDING")
+
+        stage_3 = _path(
+            policy,
+            "evaluation_stages",
+            "stage_3_promotion_confirmation",
+        )
+        if not isinstance(stage_3, dict):
+            errors.append("POLICY_INVALID_STAGE_3")
+        else:
+            if stage_3.get("look_data_relationship") != "cumulative_prefix":
+                errors.append("POLICY_INVALID_CUMULATIVE_PREFIX_SEMANTICS")
+            if (
+                stage_3.get("independent_position_cluster_semantics")
+                != "one_color_pair_per_independent_position_cluster"
+                or stage_3.get("color_pairs_per_independent_position_cluster") != 1
+            ):
+                errors.append("POLICY_INVALID_INDEPENDENT_CLUSTER_SEMANTICS")
+
+        sequential = _path(policy, "confidence", "sequential_testing")
+        if isinstance(sequential, dict) and isinstance(looks, list):
+            for family, alpha_name in (
+                ("routine", "routine_one_sided_alpha"),
+                ("catastrophe", "catastrophe_one_sided_alpha"),
+            ):
+                family_alpha = _path(
+                    policy,
+                    "confidence",
+                    family,
+                    "family_one_sided_alpha",
+                )
+                allocated = [
+                    look.get(alpha_name)
+                    for look in looks
+                    if isinstance(look, dict)
+                ]
+                if not (
+                    _is_finite_number(family_alpha)
+                    and len(allocated) == sequential.get("look_count")
+                    and all(
+                        _is_finite_number(value) and 0.0 < float(value) < 1.0
+                        for value in allocated
+                    )
+                    and math.isclose(
+                        sum(float(value) for value in allocated),
+                        float(family_alpha),
+                        rel_tol=0.0,
+                        abs_tol=1.0e-15,
+                    )
+                ):
+                    errors.append(
+                        "POLICY_INVALID_" + family.upper() + "_ALPHA_SPENDING"
+                    )
+
+        if isinstance(stage_3_looks, list) and len(stage_3_looks) == 2:
+            ordered_stage_looks = sorted(
+                (
+                    look
+                    for look in stage_3_looks
+                    if isinstance(look, dict)
+                    and isinstance(look.get("look_number"), int)
+                    and not isinstance(look.get("look_number"), bool)
+                ),
+                key=lambda look: look["look_number"],
+            )
+            if len(ordered_stage_looks) != 2 or [
+                look["look_number"] for look in ordered_stage_looks
+            ] != [1, 2]:
+                errors.append("POLICY_INVALID_CUMULATIVE_LOOK_ORDER")
+            else:
+                previous_counts: Dict[str, int] = {}
+                previous_minima: Dict[str, int] = {}
+                for look in ordered_stage_looks:
+                    minima = look.get("minimum_independent_position_clusters")
+                    if not isinstance(minima, dict) or set(minima) != required_cells:
+                        errors.append(
+                            "POLICY_INVALID_LOOK_"
+                            + str(look["look_number"])
+                            + "_MINIMUM_INDEPENDENT_POSITION_CLUSTERS"
+                        )
+                        continue
+                    for cell_name in sorted(required_cells):
+                        pair_count = look.get(CELL_PAIR_COUNT_KEYS[cell_name])
+                        minimum = minima.get(cell_name)
+                        if not (
+                            _is_nonnegative_integer(pair_count)
+                            and pair_count > 0
+                            and _is_nonnegative_integer(minimum)
+                            and minimum > 0
+                            and minimum == pair_count
+                        ):
+                            errors.append(
+                                "POLICY_INVALID_LOOK_"
+                                + str(look["look_number"])
+                                + "_"
+                                + cell_name.upper()
+                                + "_PAIR_CLUSTER_COUNTS"
+                            )
+                            continue
+                        if (
+                            cell_name in previous_counts
+                            and (
+                                pair_count < previous_counts[cell_name]
+                                or minimum < previous_minima[cell_name]
+                            )
+                        ):
+                            errors.append(
+                                "POLICY_NONMONOTONIC_CUMULATIVE_"
+                                + cell_name.upper()
+                            )
+                        previous_counts[cell_name] = pair_count
+                        previous_minima[cell_name] = minimum
+
+                final_look = ordered_stage_looks[-1]
+                final_minima = final_look.get(
+                    "minimum_independent_position_clusters"
+                )
+                alpha_look = next(
+                    (
+                        look
+                        for look in looks
+                        if isinstance(look, dict) and look.get("look_number") == 2
+                    ),
+                    None,
+                )
+                catastrophe_alpha = (
+                    alpha_look.get("catastrophe_one_sided_alpha")
+                    if isinstance(alpha_look, dict)
+                    else None
+                )
+                if (
+                    isinstance(final_minima, dict)
+                    and _is_finite_number(catastrophe_alpha)
+                    and 0.0 < float(catastrophe_alpha) < 1.0
+                    and isinstance(actual_risks, dict)
+                ):
+                    for risk_name, source_cell in sorted(
+                        RISK_CELL_BINDINGS.items()
+                    ):
+                        clusters = final_minima.get(source_cell)
+                        threshold = actual_risks.get(risk_name)
+                        if not (
+                            _is_nonnegative_integer(clusters)
+                            and clusters > 0
+                            and _is_finite_number(threshold)
+                            and exact_zero_event_upper_bound(
+                                float(catastrophe_alpha),
+                                clusters,
+                            )
+                            <= float(threshold)
+                        ):
+                            errors.append(
+                                "POLICY_INFEASIBLE_FINAL_ZERO_EVENT_"
+                                + risk_name.upper()
+                            )
+                else:
+                    errors.append("POLICY_INVALID_FINAL_ZERO_EVENT_INPUTS")
     return sorted(set(errors))
 
 
@@ -309,6 +523,10 @@ def evaluate_promotion_gate(
 
     active_policy = load_policy() if policy is None else policy
     computed_policy_hash = policy_hash(active_policy) if isinstance(active_policy, dict) else None
+    evidence_is_object = isinstance(evidence, dict)
+    evidence_type = type(evidence).__name__
+    if not evidence_is_object:
+        evidence = {}
     candidate_hash = evidence.get("candidate_hash") if isinstance(evidence, dict) else None
     champion_hash = evidence.get("champion_hash") if isinstance(evidence, dict) else None
     original_hash = evidence.get("original_hash") if isinstance(evidence, dict) else None
@@ -321,6 +539,7 @@ def evaluate_promotion_gate(
     )
     checks: Dict[str, Dict[str, Any]] = {}
     reason_codes: List[str] = []
+    continuation_inconclusive_codes: Set[str] = set()
 
     def report_value(value: Any) -> Any:
         if value is _MISSING:
@@ -447,6 +666,12 @@ def evaluate_promotion_gate(
             operator=operator,
         )
 
+    add(
+        "EVIDENCE_OBJECT",
+        PASS if evidence_is_object else FAIL,
+        actual="object" if evidence_is_object else evidence_type,
+        expected="object",
+    )
     policy_errors = _policy_errors(active_policy)
     add(
         "POLICY_SCHEMA_AND_FROZEN_VALUES",
@@ -461,6 +686,8 @@ def evaluate_promotion_gate(
             "schema_version": GATE_REPORT_SCHEMA_VERSION,
             "schema_name": "risk-seeking-promotion-gate-report",
             "decision": FAIL,
+            "next_action": STOP_HARM,
+            "continuation_eligible": False,
             "reason_codes": sorted(set(reason_codes)),
             "checks": [checks[code] for code in sorted(checks)],
             "finalized": True,
@@ -478,6 +705,11 @@ def evaluate_promotion_gate(
             "look_number": evidence.get("look_number")
             if isinstance(evidence, dict)
             else None,
+            "ranking_summary": {
+                "source_bound": False,
+                "realized_powered_utility_lower_bound": None,
+                "final_50_risk_upper_bound": None,
+            },
         }
 
     require_equal(
@@ -618,6 +850,7 @@ def evaluate_promotion_gate(
         )
 
     matrix = evidence.get("confirmation_matrix", _MISSING)
+    v2_policy = active_policy.get("schema_version") == 2
     stage_3 = active_policy["evaluation_stages"]["stage_3_promotion_confirmation"]
     cell_specs = active_policy["required_confirmation_matrix"]
     provenance = evidence.get("provenance", _MISSING)
@@ -649,10 +882,48 @@ def evaluate_promotion_gate(
         _path(suite_manifest, "source_revision"),
         active_policy["frozen_plan"]["source_revision"],
     )
+    raw_suite_cells = _path(suite_manifest, "cells")
+    authoritative_suite_manifest = isinstance(raw_suite_cells, list)
+    if authoritative_suite_manifest:
+        require_equal(
+            "PROVENANCE_SUITE_MANIFEST_SCHEMA",
+            _path(suite_manifest, "schemaVersion"),
+            2,
+        )
+        require_equal(
+            "PROVENANCE_SUITE_MANIFEST_CONTRACT",
+            _path(suite_manifest, "manifestContract"),
+            "risk-score-authoritative-evaluation-manifest-v2",
+        )
+
+    def selected_suite_manifest_cell(cell_name: str) -> Any:
+        if isinstance(raw_suite_cells, dict):
+            return _path(raw_suite_cells, cell_name)
+        if isinstance(raw_suite_cells, list):
+            matches = [
+                entry
+                for entry in raw_suite_cells
+                if isinstance(entry, dict)
+                and entry.get("cell_name") == cell_name
+                and entry.get("stage") == "stage-3"
+                and (
+                    entry.get("look_number") == look_number
+                    or entry.get("look")
+                    == (
+                        f"look-{look_number}"
+                        if isinstance(look_number, int)
+                        else None
+                    )
+                )
+            ]
+            return matches[0] if len(matches) == 1 else _MISSING
+        return _MISSING
+
     cells: Dict[str, Any] = {}
     cell_artifacts: Dict[str, Any] = {}
     cell_statistics_manifests: Dict[str, Any] = {}
     expected_pair_counts: Dict[str, Optional[int]] = {}
+    expected_cluster_counts: Dict[str, Optional[int]] = {}
     for cell_name in sorted(cell_specs):
         cell = _path(matrix, cell_name)
         cells[cell_name] = cell
@@ -741,16 +1012,21 @@ def evaluate_promotion_gate(
         )
         if look_config is None:
             expected_pair_counts[cell_name] = None
+            expected_cluster_counts[cell_name] = None
             add(code_prefix + "_COLOR_PAIRS", INCONCLUSIVE)
         else:
-            pair_key = {
-                "powered_candidate_vs_champion": "powered_ordinary_color_pairs_per_matchup",
-                "powered_candidate_vs_original": "powered_ordinary_color_pairs_per_matchup",
-                "standard_candidate_vs_original": "standard_ordinary_color_pairs",
-                "lead_40": "lead_40_color_pairs",
-                "lead_80": "lead_80_color_pairs",
-            }[cell_name]
+            pair_key = CELL_PAIR_COUNT_KEYS[cell_name]
             expected_pair_counts[cell_name] = int(look_config[pair_key])
+            minimum_clusters = look_config.get(
+                "minimum_independent_position_clusters"
+            )
+            expected_cluster_counts[cell_name] = (
+                int(minimum_clusters[cell_name])
+                if v2_policy
+                and isinstance(minimum_clusters, dict)
+                and _is_nonnegative_integer(minimum_clusters.get(cell_name))
+                else None
+            )
             require_equal(
                 code_prefix + "_COLOR_PAIRS",
                 cell.get("color_pairs", _MISSING),
@@ -868,6 +1144,26 @@ def evaluate_promotion_gate(
                 _path(runner_manifest, "schedule", "pairCount"),
                 expected_pair_counts.get(cell_name),
             )
+            if authoritative_suite_manifest:
+                manifest_cell = selected_suite_manifest_cell(cell_name)
+                require_equal(
+                    code_prefix + "_RUNNER_MANIFEST_CELL",
+                    _path(runner_manifest, "schedule", "manifestCell"),
+                    manifest_cell,
+                )
+                require_sha(
+                    code_prefix + "_RUNNER_MANIFEST_CELL_HASH",
+                    _path(
+                        runner_manifest,
+                        "schedule",
+                        "manifestCellSha256",
+                    ),
+                    (
+                        canonical_sha256(manifest_cell)
+                        if isinstance(manifest_cell, dict)
+                        else None
+                    ),
+                )
             expected_rows = (
                 2 * expected_pair_counts[cell_name]
                 if expected_pair_counts.get(cell_name) is not None
@@ -1012,10 +1308,9 @@ def evaluate_promotion_gate(
             )
         cell_artifacts[cell_name] = statistics_artifact
 
-    suite_cells = _path(suite_manifest, "cells")
     for cell_name in sorted(cell_specs):
         code_prefix = "SUITE_MANIFEST_" + cell_name.upper()
-        suite_entry = _path(suite_cells, cell_name)
+        suite_entry = selected_suite_manifest_cell(cell_name)
         cell = cells.get(cell_name, _MISSING)
         require_equal(
             code_prefix + "_SUITE",
@@ -1035,7 +1330,10 @@ def evaluate_promotion_gate(
             continue
         require_equal(
             code_prefix + "_SUITE_HASH",
-            _path(suite_entry, "suite_hash"),
+            _first_present(
+                _path(suite_entry, "suite_hash"),
+                _path(suite_entry, "bank_hash"),
+            ),
             _path(cell, "suite_hash"),
         )
         require_equal(
@@ -1053,30 +1351,100 @@ def evaluate_promotion_gate(
             _path(suite_entry, "color_pairs"),
             expected_pair_counts.get(cell_name),
         )
+        if authoritative_suite_manifest:
+            require_equal(
+                code_prefix + "_MINIMUM_CLUSTERS",
+                _path(
+                    suite_entry,
+                    "minimum_independent_position_clusters",
+                ),
+                expected_cluster_counts.get(cell_name),
+            )
+            independent_cluster_ids = _path(
+                suite_entry,
+                "independent_cluster_ids",
+            )
+            valid_independent_clusters = (
+                isinstance(independent_cluster_ids, list)
+                and all(_is_sha256(value) for value in independent_cluster_ids)
+                and len(independent_cluster_ids)
+                == expected_cluster_counts.get(cell_name)
+                and len(independent_cluster_ids)
+                == len(set(independent_cluster_ids))
+            )
+            add(
+                code_prefix + "_INDEPENDENT_CLUSTER_IDS",
+                PASS if valid_independent_clusters else FAIL,
+                actual=(
+                    len(independent_cluster_ids)
+                    if isinstance(independent_cluster_ids, list)
+                    else independent_cluster_ids
+                ),
+                expected=expected_cluster_counts.get(cell_name),
+                operator="==",
+            )
+            require_sha(
+                code_prefix + "_INDEPENDENT_CLUSTER_IDS_HASH",
+                _path(
+                    suite_entry,
+                    "independent_cluster_ids_hash",
+                ),
+                (
+                    canonical_sha256(independent_cluster_ids)
+                    if isinstance(independent_cluster_ids, list)
+                    else None
+                ),
+            )
         position_ids = _path(suite_entry, "position_ids")
+        minimum_clusters = expected_cluster_counts.get(cell_name)
+        valid_position_count = (
+            len(position_ids) == minimum_clusters
+            if v2_policy
+            and isinstance(position_ids, list)
+            and minimum_clusters is not None
+            else isinstance(position_ids, list) and len(position_ids) >= 3
+        )
         if not (
             isinstance(position_ids, list)
-            and len(position_ids) >= 3
-            and len(position_ids) == len(set(position_ids))
+            and valid_position_count
             and all(_nonempty(value) for value in position_ids)
+            and len(position_ids) == len(set(position_ids))
         ):
+            expected_positions: Any = (
+                minimum_clusters
+                if v2_policy and minimum_clusters is not None
+                else "at least three"
+            )
             add(
                 code_prefix + "_POSITION_IDS",
                 FAIL if position_ids is not _MISSING else INCONCLUSIVE,
                 actual=position_ids,
-                expected="at least three unique nonempty frozen position IDs",
+                expected=(
+                    f"exactly {expected_positions} unique nonempty frozen position IDs"
+                    if isinstance(expected_positions, int)
+                    else "at least three unique nonempty frozen position IDs"
+                ),
             )
         else:
             add(
                 code_prefix + "_POSITION_IDS",
                 PASS,
                 actual=len(position_ids),
-                expected="at least three unique frozen position IDs",
+                expected=(
+                    minimum_clusters
+                    if v2_policy
+                    else "at least three unique frozen position IDs"
+                ),
             )
         require_equal(
             code_prefix + "_STATISTICS_POSITIONS",
             _path(cell_statistics_manifests.get(cell_name), "position_ids"),
-            position_ids,
+            (
+                sorted(position_ids)
+                if isinstance(position_ids, list)
+                and all(_nonempty(value) for value in position_ids)
+                else position_ids
+            ),
         )
 
     complete_cells = [
@@ -1153,7 +1521,11 @@ def evaluate_promotion_gate(
         name: _path(cell_statistics_manifests.get(name), "position_ids")
         for name in ("lead_40", "lead_80")
     }
-    if all(isinstance(value, list) for value in lead_position_ids.values()):
+    if all(
+        isinstance(value, list)
+        and all(_nonempty(position_id) for position_id in value)
+        for value in lead_position_ids.values()
+    ):
         combined_position_ids = sorted(
             set(lead_position_ids["lead_40"]).union(lead_position_ids["lead_80"])
         )
@@ -1164,6 +1536,13 @@ def evaluate_promotion_gate(
         + expected_pair_counts.get("lead_80", 0)
         if expected_pair_counts.get("lead_40") is not None
         and expected_pair_counts.get("lead_80") is not None
+        else None
+    )
+    expected_combined_clusters = (
+        expected_cluster_counts.get("lead_40", 0)
+        + expected_cluster_counts.get("lead_80", 0)
+        if expected_cluster_counts.get("lead_40") is not None
+        and expected_cluster_counts.get("lead_80") is not None
         else None
     )
     expected_combined_manifest = {
@@ -1231,6 +1610,7 @@ def evaluate_promotion_gate(
         *,
         expected_metric_name: str,
         expected_color_pairs: Optional[int],
+        expected_minimum_clusters: Optional[int],
         expected_position_ids: Any,
         source_artifact_hash: Any,
         source_manifest: Any,
@@ -1298,6 +1678,26 @@ def evaluate_promotion_gate(
             if isinstance(metric_name, str)
             else None
         )
+        valid_bootstrap_counts = (
+            isinstance(bootstrap_stratum_counts, list)
+            and all(
+                isinstance(entry, dict)
+                and _is_nonnegative_integer(entry.get("position_clusters"))
+                for entry in bootstrap_stratum_counts
+            )
+        )
+        bootstrap_cluster_total = (
+            sum(entry["position_clusters"] for entry in bootstrap_stratum_counts)
+            if valid_bootstrap_counts
+            else None
+        )
+        cluster_count_valid = (
+            clusters == expected_minimum_clusters
+            if v2_policy and expected_minimum_clusters is not None
+            else isinstance(clusters, int)
+            and not isinstance(clusters, bool)
+            and clusters >= 2
+        )
         well_formed = (
             isinstance(metric_name, str)
             and metric_name == expected_metric_name
@@ -1312,7 +1712,7 @@ def evaluate_promotion_gate(
             and color_pairs == expected_color_pairs
             and isinstance(clusters, int)
             and not isinstance(clusters, bool)
-            and clusters >= 2
+            and cluster_count_valid
             and isinstance(expected_position_ids, list)
             and clusters == len(expected_position_ids)
             and degrees_of_freedom == clusters - 1
@@ -1349,26 +1749,29 @@ def evaluate_promotion_gate(
             and replications == bootstrap_replications
             and bootstrap_seed == expected_bootstrap_seed
             and bootstrap_dimensions == ["schedule_id", "suite"]
-            and isinstance(bootstrap_stratum_counts, list)
-            and sum(
-                entry.get("position_clusters", -1)
-                for entry in bootstrap_stratum_counts
-                if isinstance(entry, dict)
+            and bootstrap_cluster_total == clusters
+        )
+        position_values = metric.get("position_values")
+        valid_position_values = (
+            isinstance(position_values, list)
+            and all(
+                isinstance(row, dict) and _nonempty(row.get("position_id"))
+                for row in position_values
             )
-            == clusters
         )
         metric_position_ids = (
-            sorted(
-                row.get("position_id")
-                for row in metric.get("position_values", [])
-                if isinstance(row, dict)
-            )
-            if isinstance(metric.get("position_values"), list)
+            sorted(row["position_id"] for row in position_values)
+            if valid_position_values
             else None
         )
+        one_pair_per_cluster = (
+            valid_position_values
+            and all(row.get("pair_count") == 1 for row in position_values)
+            and len(position_values) == color_pairs
+        )
         recomputed_strata: Dict[str, int] = {}
-        if isinstance(metric.get("position_values"), list):
-            for row in metric["position_values"]:
+        if isinstance(position_values, list):
+            for row in position_values:
                 if not isinstance(row, dict) or not isinstance(row.get("stratum"), dict):
                     recomputed_strata = {}
                     break
@@ -1389,6 +1792,7 @@ def evaluate_promotion_gate(
         well_formed = (
             well_formed
             and metric_position_ids == expected_position_ids
+            and (not v2_policy or one_pair_per_cluster)
             and bootstrap_stratum_counts == recomputed_stratum_counts
             and _is_sha256(source_artifact_hash)
             and isinstance(source_manifest, dict)
@@ -1407,6 +1811,7 @@ def evaluate_promotion_gate(
                 "upper_bound": upper_bound,
                 "color_pairs": color_pairs,
                 "position_clusters": clusters,
+                "one_pair_per_independent_position_cluster": one_pair_per_cluster,
                 "degrees_of_freedom": degrees_of_freedom,
                 "small_cluster_correction": correction,
                 "variance_multiplier": variance_multiplier,
@@ -1428,6 +1833,8 @@ def evaluate_promotion_gate(
                 "complete": True,
                 "finite_ordered_estimate_and_bounds": True,
                 "color_pairs": expected_color_pairs,
+                "minimum_independent_position_clusters": expected_minimum_clusters,
+                "one_pair_per_independent_position_cluster": v2_policy,
                 "position_ids": expected_position_ids,
                 "degrees_of_freedom": "position_clusters-1",
                 "small_cluster_correction": "CR1_BESSEL_WITH_STUDENT_T",
@@ -1447,6 +1854,124 @@ def evaluate_promotion_gate(
                 "bootstrap_stratum_cluster_counts": recomputed_stratum_counts,
             },
         )
+
+    def lower_margin_check(
+        code: str,
+        metric: Any,
+        threshold: float,
+    ) -> None:
+        lower = _path(metric, "lower_bound")
+        if lower is _MISSING or lower is None:
+            add(code, INCONCLUSIVE, expected=threshold, operator=">")
+            return
+        if not _is_finite_number(lower):
+            add(code, FAIL, actual=lower, expected=threshold, operator=">")
+            return
+        lower_value = float(lower)
+        if lower_value > threshold:
+            add(
+                code,
+                PASS,
+                actual=lower_value,
+                expected=threshold,
+                operator=">",
+            )
+            return
+        if not v2_policy:
+            add(
+                code,
+                FAIL,
+                actual=lower_value,
+                expected=threshold,
+                operator=">",
+            )
+            return
+
+        upper = _path(metric, "upper_bound")
+        conditional_power = _first_present(
+            _path(metric, "conditional_power_to_final_look"),
+            _path(metric, "conditional_power"),
+        )
+        futility_threshold = stage_3.get(
+            "low_conditional_power_stop_threshold"
+        )
+        futility_proven = False
+        if conditional_power is not _MISSING:
+            futility_code = code.removesuffix("_LOWER_BOUND") + "_CONDITIONAL_POWER"
+            if not (
+                _is_finite_number(conditional_power)
+                and 0.0 <= float(conditional_power) <= 1.0
+                and _is_finite_number(futility_threshold)
+            ):
+                add(
+                    futility_code,
+                    FAIL,
+                    actual=conditional_power,
+                    expected="finite probability in [0,1]",
+                )
+            else:
+                futility_proven = (
+                    look_number == 1
+                    and float(conditional_power) <= float(futility_threshold)
+                )
+                add(
+                    futility_code,
+                    FAIL if futility_proven else PASS,
+                    actual=float(conditional_power),
+                    expected=float(futility_threshold),
+                    operator=">",
+                    fail_reason=futility_code + "_STOP",
+                )
+
+        if upper is not _MISSING and upper is not None and not _is_finite_number(upper):
+            add(
+                code,
+                FAIL,
+                actual={"lower_bound": lower_value, "upper_bound": upper},
+                expected=threshold,
+                operator=">",
+            )
+        elif (
+            futility_proven
+            or (
+                _is_finite_number(upper)
+                and float(upper) <= threshold
+            )
+        ):
+            add(
+                code,
+                FAIL,
+                actual={
+                    "lower_bound": lower_value,
+                    "upper_bound": (
+                        float(upper) if _is_finite_number(upper) else None
+                    ),
+                    "conditional_power": (
+                        float(conditional_power)
+                        if _is_finite_number(conditional_power)
+                        else None
+                    ),
+                },
+                expected=threshold,
+                operator=">",
+                fail_reason=code + "_FUTILITY_OR_HARM_PROVEN",
+            )
+        else:
+            add(
+                code,
+                INCONCLUSIVE,
+                actual={
+                    "lower_bound": lower_value,
+                    "upper_bound": (
+                        float(upper) if _is_finite_number(upper) else None
+                    ),
+                },
+                expected=threshold,
+                operator=">",
+                missing_reason=code + "_MARGIN_NOT_ESTABLISHED",
+            )
+            if _is_finite_number(upper):
+                continuation_inconclusive_codes.add(code)
 
     optimization_metrics = (
         (
@@ -1497,11 +2022,13 @@ def evaluate_promotion_gate(
             source_hash = combined_artifact_hash
             source_manifest = combined_manifest
             source_pairs = expected_combined_pairs
+            source_minimum_clusters = expected_combined_clusters
             source_positions = combined_position_ids
         else:
             source_hash = _path(cells.get(source_cell, _MISSING), "statistics_artifact_hash")
             source_manifest = cell_statistics_manifests.get(source_cell)
             source_pairs = expected_pair_counts.get(source_cell)
+            source_minimum_clusters = expected_cluster_counts.get(source_cell)
             source_positions = _path(source_manifest, "position_ids")
         inference_check(
             code + "_INFERENCE",
@@ -1510,12 +2037,12 @@ def evaluate_promotion_gate(
             0.95,
             expected_metric_name=metric_name,
             expected_color_pairs=source_pairs,
+            expected_minimum_clusters=source_minimum_clusters,
             expected_position_ids=source_positions,
             source_artifact_hash=source_hash,
             source_manifest=source_manifest,
         )
-        lower = _path(metric, "lower_bound")
-        numeric_threshold(code + "_LOWER_BOUND", lower, ">", threshold)
+        lower_margin_check(code + "_LOWER_BOUND", metric, threshold)
 
     discovery = evidence.get("discovery", _MISSING)
     require_boolean(
@@ -1568,6 +2095,7 @@ def evaluate_promotion_gate(
             0.99,
             expected_metric_name=risk_name,
             expected_color_pairs=expected_pair_counts.get(source_cell),
+            expected_minimum_clusters=expected_cluster_counts.get(source_cell),
             expected_position_ids=_path(source_manifest, "position_ids"),
             source_artifact_hash=_path(
                 cells.get(source_cell, _MISSING), "statistics_artifact_hash"
@@ -1612,6 +2140,8 @@ def evaluate_promotion_gate(
                 operator="<=",
                 missing_reason=code + "_SAFETY_MARGIN_NOT_ESTABLISHED",
             )
+            if not proven_violation:
+                continuation_inconclusive_codes.add(code + "_UPPER_BOUND")
         require_equal(
             code + "_DIRECTION",
             _path(risk_metric, "direction"),
@@ -1661,7 +2191,10 @@ def evaluate_promotion_gate(
                 and clusters > 0
                 and _is_finite_number(catastrophe_alpha)
             ):
-                exact_zero_bound = 1.0 - float(catastrophe_alpha) ** (1.0 / clusters)
+                exact_zero_bound = exact_zero_event_upper_bound(
+                    float(catastrophe_alpha),
+                    clusters,
+                )
                 stored_zero_bound = _path(
                     risk_metric, "zero_event_uncertainty_upper_bound"
                 )
@@ -2025,6 +2558,15 @@ def evaluate_promotion_gate(
     else:
         add("DISCOVERY_CONFIRMATION_HASH_INDEPENDENCE", INCONCLUSIVE, expected=True)
 
+    if v2_policy:
+        for code, check in checks.items():
+            if (
+                check["status"] == INCONCLUSIVE
+                and code not in continuation_inconclusive_codes
+            ):
+                check["status"] = FAIL
+                reason_codes.append(code + "_FAIL_CLOSED")
+
     statuses = {check["status"] for check in checks.values()}
     if FAIL in statuses:
         decision = FAIL
@@ -2032,10 +2574,78 @@ def evaluate_promotion_gate(
         decision = INCONCLUSIVE
     else:
         decision = PASS
+    inconclusive_codes = {
+        code for code, check in checks.items() if check["status"] == INCONCLUSIVE
+    }
+    continuation_eligible = (
+        decision == INCONCLUSIVE
+        and v2_policy
+        and look_number == 1
+        and bool(inconclusive_codes)
+        and inconclusive_codes.issubset(continuation_inconclusive_codes)
+    )
+    if decision == PASS:
+        next_action = PROMOTE
+    elif decision == FAIL:
+        next_action = STOP_HARM
+    elif continuation_eligible:
+        next_action = CONTINUE_TO_LOOK_2
+    else:
+        next_action = STOP_MAXIMUM_INCONCLUSIVE
+
+    final_50_metric = _metric_from(
+        _path(powered_champion, "risk_differences"),
+        "final_50",
+    )
+    ranking_source_cell = "powered_candidate_vs_champion"
+    ranking_source = cells.get(ranking_source_cell, _MISSING)
+    ranking_source_bound = all(
+        checks.get(code, {}).get("status") == PASS
+        for code in (
+            "MATRIX_POWERED_CANDIDATE_VS_CHAMPION_STATISTICS_ARTIFACT_HASH",
+            "MATRIX_POWERED_CANDIDATE_VS_CHAMPION_STATISTICS_MANIFEST_HASH",
+            "POWERED_UTILITY_VS_CHAMPION_INFERENCE",
+            "RISK_FINAL_50_INFERENCE",
+            "RISK_FINAL_50_PUBLISHED_BINDING",
+        )
+    )
+    utility_ranking_bound = _path(utility_champion, "lower_bound")
+    final_50_ranking_bound = _path(final_50_metric, "upper_bound")
+    ranking_source_bound = (
+        ranking_source_bound
+        and _is_finite_number(utility_ranking_bound)
+        and _is_finite_number(final_50_ranking_bound)
+    )
+    realized_powered_utility_lower_bound = (
+        float(utility_ranking_bound) if ranking_source_bound else None
+    )
+    final50_risk_upper_bound = (
+        float(final_50_ranking_bound) if ranking_source_bound else None
+    )
+    ranking_summary = {
+        "schema_version": 1,
+        "source_bound": ranking_source_bound,
+        "source_cell": ranking_source_cell,
+        "candidate_hash": candidate_hash,
+        "look_number": look_number if isinstance(look_number, int) else None,
+        "statistics_artifact_hash": report_value(
+            _path(ranking_source, "statistics_artifact_hash")
+        ),
+        "statistics_manifest_hash": report_value(
+            _path(ranking_source, "statistics_manifest_hash")
+        ),
+        "realized_powered_utility_lower_bound": (
+            realized_powered_utility_lower_bound
+        ),
+        "final50_risk_upper_bound": final50_risk_upper_bound,
+        "final_50_risk_upper_bound": final50_risk_upper_bound,
+    }
     return {
         "schema_version": GATE_REPORT_SCHEMA_VERSION,
         "schema_name": "risk-seeking-promotion-gate-report",
         "decision": decision,
+        "next_action": next_action,
+        "continuation_eligible": continuation_eligible,
         "reason_codes": sorted(set(reason_codes)),
         "checks": [checks[code] for code in sorted(checks)],
         "finalized": True,
@@ -2049,6 +2659,11 @@ def evaluate_promotion_gate(
         "policy_hash": computed_policy_hash,
         "policy_version": active_policy["policy_version"],
         "look_number": look_number if look_number is not _MISSING else None,
+        "ranking_summary": ranking_summary,
+        "realized_powered_utility_lower_bound": (
+            realized_powered_utility_lower_bound
+        ),
+        "final50_risk_upper_bound": final50_risk_upper_bound,
         "alpha_allocation": {
             "method": active_policy["confidence"]["sequential_testing"][
                 "allocation_method"
