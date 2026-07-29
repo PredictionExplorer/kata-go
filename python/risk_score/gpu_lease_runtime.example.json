@@ -1,0 +1,68 @@
+{
+  "schemaVersion": 1,
+  "ownerId": "replace-with-controller-instance-id",
+  "mutationEnabled": false,
+  "pollIntervalSeconds": 0.5,
+  "paths": {
+    "runRoot": "/replace/me/katago-run",
+    "promotionRoot": "/replace/me/katago-run/promotion",
+    "leaseState": "/replace/me/katago-run/promotion/gpu-lease.json",
+    "eventLog": "/replace/me/katago-run/promotion/gpu-lease-events.jsonl"
+  },
+  "gpu": {
+    "index": 7,
+    "expectedUuid": "GPU-REPLACE-WITH-VERIFIED-UUID",
+    "cleanObservations": 3,
+    "cleanObservationIntervalSeconds": 2.0,
+    "inventoryCommand": [
+      "nvidia-smi",
+      "--query-gpu=uuid",
+      "--format=csv,noheader,nounits"
+    ],
+    "processQueryCommand": [
+      "nvidia-smi",
+      "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
+      "--format=csv,noheader,nounits"
+    ]
+  },
+  "trainer": {
+    "checkpointPath": "/replace/me/katago-run/train/riskb40/checkpoint.ckpt",
+    "launchCommand": [
+      "/replace/me/bin/start-bucket-limited-trainer",
+      "--checkpoint",
+      "{checkpoint_path}"
+    ],
+    "gracefulCommand": [
+      "/replace/me/bin/request-trainer-checkpoint-and-exit",
+      "--pid",
+      "{pid}",
+      "--process-group",
+      "{process_group_id}",
+      "--checkpoint",
+      "{checkpoint_path}"
+    ],
+    "drainTimeoutSeconds": 90.0,
+    "checkpointTimeoutSeconds": 90.0,
+    "checkpointStableSeconds": 2.0,
+    "requireCheckpointChange": true,
+    "startTimeoutSeconds": 30.0
+  },
+  "evaluator": {
+    "processCount": 8,
+    "launchCommand": [
+      "/replace/me/bin/run-promotion-evaluator-shard",
+      "--lease-id",
+      "{lease_id}",
+      "--worker-index",
+      "{worker_index}",
+      "--gpu-index",
+      "{gpu_index}",
+      "--expected-gpu-uuid",
+      "{gpu_uuid}",
+      "--promotion-root",
+      "{promotion_root}"
+    ],
+    "drainCommand": [],
+    "drainTimeoutSeconds": 30.0
+  }
+}

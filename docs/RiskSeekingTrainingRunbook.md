@@ -933,6 +933,8 @@ the live `models` directory. Do not start the stock win-rate-only gatekeeper.
 
 ```bash
 export NAME_PREFIX="$RUN_ID"
+export KATAGO_MODEL_PROBE_COMMAND_JSON='SET_ME'
+test "$KATAGO_MODEL_PROBE_COMMAND_JSON" != SET_ME
 
 set +m
 setsid bash -c '
@@ -949,8 +951,11 @@ test "$(ps -o pgid= -p "$export_pid" | tr -d ' ')" = "$export_pid"
 echo "$export_pid" > "$RUN_DIR/pids/export.pgid"
 ```
 
-The exporter writes atomically through `.exported` directories and places
-completed candidates in `modelstobetested`.
+Set `KATAGO_MODEL_PROBE_COMMAND_JSON` to a reviewed JSON argv array that loads
+`{model_file}` with the production CUDA binary and checks finite output. The
+hardened gated exporter publishes through a unique `.partial` directory,
+places completed candidates in `modelstobetested`, and archives the intact
+source under `torchmodels_exported`.
 
 ### 5. Evaluation and manual promotion
 

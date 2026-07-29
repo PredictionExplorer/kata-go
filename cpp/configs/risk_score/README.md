@@ -108,7 +108,7 @@ python3 python/risk_score/summarize_matches.py \
   --catastrophe-thresholds 20 50 \
   --score-power 1.5 \
   --score-scale 20 \
-  --win-weight 2
+  --win-weight 4
 ```
 
 Machine-readable JSON is written to stdout and a readable summary to stderr.
@@ -135,6 +135,31 @@ python3 python/risk_score/compare_moves.py \
 
 This reports top-move disagreement and, when both candidates are present,
 powered-utility and predicted-score differences between the selected moves.
+
+## Checkpoint promotion
+
+Promotion evaluation uses:
+
+- `promotion_powered_match.cfg`, where candidate and reference both use power
+  1.5, scale 20, and win weight 4; and
+- `promotion_standard_match.cfg`, where both use standard utility while all
+  objective parameters remain explicit.
+
+Always provide different `nnModelFile0` and `nnModelFile1` paths. The
+pair-safe Python runner verifies model, policy, config, and schedule hashes,
+splits only at complete `pairId` boundaries, and publishes a final bundle only
+after every shard validates:
+
+```sh
+cd python
+python3 -m risk_score.evaluation_runner --help
+```
+
+`promotion_selfplay_worker_19x19.cfg` is the generation-pinned one-GPU
+self-play template. Launch seven separate workers through the promotion
+controller/supervisor, each with an immutable one-model directory, distinct
+output root, and explicit `cudaDeviceToUseModel0Thread0`. It fixes
+`switchNetsMidGame=false`.
 
 ## Phase 2 self-play
 

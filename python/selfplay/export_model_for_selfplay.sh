@@ -30,6 +30,7 @@ else
 fi
 
 mkdir -p "$BASEDIR"/torchmodels_toexport
+mkdir -p "$BASEDIR"/torchmodels_exported
 mkdir -p "$BASEDIR"/torchmodels_toexport_extra
 mkdir -p "$BASEDIR"/modelstobetested
 mkdir -p "$BASEDIR"/models_extra
@@ -112,11 +113,88 @@ function exportStuff() {
     done
 }
 
+function exportGatedStuffHardened() {
+    FROMDIR="$1"
+    HARDENED_EXPORTER="${KATAGO_HARDENED_EXPORTER:-$(dirname "$0")/../risk_score/hardened_exporter.py}"
+    if [ ! -f "$HARDENED_EXPORTER" ]
+    then
+        echo "Hardened exporter not found: $HARDENED_EXPORTER" >&2
+        echo "Set KATAGO_HARDENED_EXPORTER to its absolute path." >&2
+        return 1
+    fi
+    if [ -z "${KATAGO_MODEL_PROBE_COMMAND_JSON:-}" ]
+    then
+        echo "KATAGO_MODEL_PROBE_COMMAND_JSON is required for gated publication." >&2
+        echo "Set it to a JSON argv array that loads the model and checks finite output." >&2
+        return 1
+    fi
+
+    # Keep the source checkpoint intact. Publication and duplicate handling
+    # are performed transactionally by the hardened Python exporter.
+    $PYTHON -W ignore "$(dirname "$0")/list_by_mtime.py" "$BASEDIR/$FROMDIR" | while read -r FILEPATH
+    do
+        if [ -z "$FILEPATH" ]
+        then
+            continue
+        fi
+        if [ "${FILEPATH: -4}" == ".tmp" ]
+        then
+            echo "Skipping tmp file:" "$FILEPATH"
+        elif [ "${FILEPATH: -9}" == ".exported" ]
+        then
+            echo "Skipping legacy self tmp file:" "$FILEPATH"
+        elif [ "${FILEPATH: -8}" == ".partial" ]
+        then
+            echo "Skipping partial file:" "$FILEPATH"
+        else
+            NAME="$(basename "$FILEPATH")"
+            SRC="$BASEDIR/$FROMDIR/$NAME"
+            echo "Found gated model to publish safely:" "$SRC"
+            if ! "$PYTHON" "$HARDENED_EXPORTER" \
+                --source-dir "$SRC" \
+                --destination-root "$BASEDIR/modelstobetested" \
+                --candidate-name "$NAME" \
+                --model-name "$NAMEPREFIX-$NAME" \
+                --python-executable "$PYTHON" \
+                --model-probe-command-json "$KATAGO_MODEL_PROBE_COMMAND_JSON"
+            then
+                exit 1
+            fi
+            PUBLISHED="$BASEDIR/modelstobetested/$NAME"
+            if [ ! -d "$PUBLISHED" ] || [ ! -f "$PUBLISHED/manifest.json" ]
+            then
+                echo "Hardened exporter returned without a complete publication: $PUBLISHED" >&2
+                exit 1
+            fi
+            ARCHIVE="$BASEDIR/torchmodels_exported/$NAME"
+            if [ -e "$ARCHIVE" ]
+            then
+                echo "Export archive already exists; refusing overwrite: $ARCHIVE" >&2
+                exit 1
+            fi
+            # Publication is complete and verified. Move the intact source
+            # directory out of the producer queue for retention-managed
+            # archival; never delete the checkpoint here.
+            if ! mv "$SRC" "$ARCHIVE"
+            then
+                echo "Failed to archive intact source checkpoint: $SRC" >&2
+                exit 1
+            fi
+            echo "Archived intact source checkpoint at:" "$ARCHIVE"
+        fi
+    done
+}
+
 if [ "$USEGATING" -eq 0 ]
 then
     exportStuff "torchmodels_toexport" "models"
 else
-    exportStuff "torchmodels_toexport" "modelstobetested"
+    exportGatedStuffHardened "torchmodels_toexport"
+    GATED_EXPORT_STATUS="$?"
+    if [ "$GATED_EXPORT_STATUS" -ne 0 ]
+    then
+        exit "$GATED_EXPORT_STATUS"
+    fi
 fi
 exportStuff "torchmodels_toexport_extra" "models_extra"
 

@@ -1,0 +1,118 @@
+{
+  "schemaVersion": 1,
+  "mutationEnabled": false,
+  "actor": "replace-with-controller-instance-id",
+  "hashes": {
+    "controller": "0000000000000000000000000000000000000000000000000000000000000000",
+    "source": "0000000000000000000000000000000000000000000000000000000000000000",
+    "original": "0000000000000000000000000000000000000000000000000000000000000000",
+    "policy": "0000000000000000000000000000000000000000000000000000000000000000",
+    "poweredConfig": "0000000000000000000000000000000000000000000000000000000000000000",
+    "standardConfig": "0000000000000000000000000000000000000000000000000000000000000000",
+    "discoveryOrdinarySchedule": "1111111111111111111111111111111111111111111111111111111111111111",
+    "confirmationOrdinarySchedule": "2222222222222222222222222222222222222222222222222222222222222222",
+    "auditSchedule": "3333333333333333333333333333333333333333333333333333333333333333",
+    "lead40Schedule": "4444444444444444444444444444444444444444444444444444444444444444",
+    "lead80Schedule": "5555555555555555555555555555555555555555555555555555555555555555",
+    "standardConfirmationSchedule": "2222222222222222222222222222222222222222222222222222222222222222",
+    "selfplayConfig": "0000000000000000000000000000000000000000000000000000000000000000",
+    "gpuLeaseConfig": "0000000000000000000000000000000000000000000000000000000000000000",
+    "suiteManifest": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "paths": {
+    "promotionRoot": "/replace/me/katago-run/promotion",
+    "controllerLock": "/replace/me/katago-run/promotion/controller.lock",
+    "champion": "/replace/me/katago-run/promotion/champion.json",
+    "candidateInbox": "/replace/me/katago-run/modelstobetested",
+    "candidateQuarantine": "/replace/me/katago-run/promotion/candidates/quarantined",
+    "candidateSuperseded": "/replace/me/katago-run/promotion/candidates/superseded",
+    "candidateRejected": "/replace/me/katago-run/promotion/candidates/rejected",
+    "candidateDeduplicated": "/replace/me/katago-run/promotion/candidates/deduplicated",
+    "acceptedModels": "/replace/me/katago-run/promotion/accepted",
+    "admittedSelfplay": "/replace/me/katago-run/selfplay",
+    "rolloutQuarantine": "/replace/me/katago-run/promotion/rollouts",
+    "rollbackQuarantine": "/replace/me/katago-run/promotion/rollback",
+    "trainerCheckpoint": "/replace/me/katago-run/train/riskb40/checkpoint.ckpt",
+    "evaluations": "/replace/me/katago-run/promotion/evaluations",
+    "reports": "/replace/me/katago-run/promotion/reports",
+    "suites": "/replace/me/katago-run/evaluation/promotion-suites-v1",
+    "policy": "/replace/me/kata-go/python/risk_score/promotion_policy_v1.json",
+    "poweredConfig": "/replace/me/kata-go/cpp/configs/risk_score/promotion_powered_match.cfg",
+    "standardConfig": "/replace/me/kata-go/cpp/configs/risk_score/promotion_standard_match.cfg",
+    "discoveryOrdinarySchedule": "/replace/me/katago-run/evaluation/promotion-suites-v1/schedules/discovery.jsonl",
+    "confirmationOrdinarySchedule": "/replace/me/katago-run/evaluation/promotion-suites-v1/schedules/confirmation.jsonl",
+    "auditSchedule": "/replace/me/katago-run/evaluation/promotion-suites-v1/schedules/audit.jsonl",
+    "lead40Schedule": "/replace/me/katago-run/evaluation/promotion-suites-v1/schedules/lead-40.jsonl",
+    "lead80Schedule": "/replace/me/katago-run/evaluation/promotion-suites-v1/schedules/lead-80.jsonl",
+    "standardConfirmationSchedule": "/replace/me/katago-run/evaluation/promotion-suites-v1/schedules/confirmation-standard.jsonl",
+    "selfplayConfig": "/replace/me/kata-go/cpp/configs/risk_score/promotion_selfplay_worker_19x19.cfg",
+    "gpuLeaseConfig": "/replace/me/katago-run/configs/gpu-lease-runtime.json",
+    "dataWatermark": "/replace/me/katago-run/promotion/watermarks/data.json",
+    "shuffleWatermark": "/replace/me/katago-run/promotion/watermarks/shuffle.json",
+    "workerAckInbox": "/replace/me/katago-run/promotion/ipc/worker-acks",
+    "rolloutReportInbox": "/replace/me/katago-run/promotion/ipc/rollout-reports",
+    "originalModel": "/replace/me/katago-run/original/model.bin.gz"
+  },
+  "commands": {
+    "trainer": [
+      "/replace/me/bin/start-bucket-limited-trainer",
+      "--checkpoint",
+      "{checkpoint}"
+    ],
+    "evaluator": [
+      "/replace/me/bin/run-promotion-evaluation-matrix",
+      "--plan",
+      "{plan}",
+      "--candidate",
+      "{candidate_model}",
+      "--evidence-output",
+      "{evidence_output}"
+    ],
+    "selfplay": [
+      "/replace/me/bin/start-generation-worker",
+      "--katago",
+      "/replace/me/kata-go/cpp/katago",
+      "--config",
+      "/replace/me/kata-go/cpp/configs/risk_score/promotion_selfplay_worker_19x19.cfg",
+      "--models-dir",
+      "{immutable_model_directory}",
+      "--output-dir",
+      "{worker_output_directory}",
+      "--gpu",
+      "{worker_id}",
+      "--generation",
+      "{generation_id}",
+      "--worker",
+      "{worker_id}"
+    ],
+    "drain": [
+      "/replace/me/bin/drain-generation-workers",
+      "--generation",
+      "{generation_id}",
+      "--manifest",
+      "{drain_manifest}"
+    ],
+    "rollback": [
+      "/replace/me/bin/stop-promotion-consumers",
+      "--generation",
+      "{generation_id}"
+    ]
+  },
+  "polling": {
+    "intervalSeconds": 30.0
+  },
+  "limits": {
+    "maxActiveQueue": 4,
+    "minFreeBytes": 536870912000
+  },
+  "backlog": {
+    "anchorIntervalSamples": 500000,
+    "anomalyNames": []
+  },
+  "rollout": {
+    "workerCount": 7,
+    "canaryWorkerCount": 1,
+    "intermediateWorkerCount": 3,
+    "threadsPerWorker": 100
+  }
+}
