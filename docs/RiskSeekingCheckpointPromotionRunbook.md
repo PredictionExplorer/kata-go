@@ -25,6 +25,7 @@ Freeze and hash these together:
 - the unchanged v1 policy and its hash when retaining historical v1 evidence;
 - `cpp/configs/risk_score/promotion_powered_match.cfg`;
 - `cpp/configs/risk_score/promotion_standard_match.cfg`;
+- `cpp/configs/risk_score/promotion_curation_analysis.cfg`;
 - `cpp/configs/risk_score/promotion_selfplay_worker_19x19.cfg`;
 - discovery, confirmation, and audit suite manifests and schedules;
 - the immutable original model;
@@ -51,6 +52,10 @@ The checked-in v2 policy prints
 Any other value is a different policy and requires a new review and suite
 freeze.
 
+Policy v1 is replay-only historical evidence. Its runner-v2 bundles remain
+readable without a synthetic visit field, but no new evaluation may be
+launched under v1; every new promotion plan uses policy v2 and runner v3.
+
 ## Installation and preflight
 
 From the repository root:
@@ -65,6 +70,7 @@ python3 -m risk_score.promotion_controller --help
 python3 -m risk_score.evaluation_runner --help
 python3 -m risk_score.promotion_evaluator --help
 python3 -m risk_score.promotion_evidence --help
+python3 -m risk_score.curate_position_bank --help
 python3 -m risk_score.build_evaluation_suites --help
 ```
 
@@ -109,6 +115,115 @@ monitoring index must be rebuildable from them.
 Confirm same-filesystem rename behavior and durable directory fsync on the live
 volume before claiming a real candidate. Do not substitute copy-and-delete for
 an atomic rename.
+
+## Curate the source position bank
+
+`risk_score.curate_position_bank` creates the reviewed input consumed by the
+suite builder. It is staged and fail-closed: discovery/confirmation/audit
+assignment does not happen during curation.
+
+Do not harvest the live training self-play corpus: those positions have already
+trained the candidates and would contaminate confirmation holdouts. Generate a
+separate original-model SGF corpus under
+`$RUN_DIR/evaluation/curation/quarantined-sgfs`, keep it outside every
+shuffler/trainer input root, and never admit those games to training.
+
+First publish an immutable harvest plan with the complete source inventory and
+training-root exclusions:
+
+```bash
+cd "$REPO/python"
+python3 -m risk_score.curate_position_bank harvest-plan \
+  --katago "$REPO/cpp/build-cuda/katago" \
+  --sgfs-dir "$RUN_DIR/evaluation/curation/quarantined-sgfs" \
+  --training-input-root "$TRAIN_BASE/selfplay" \
+  --output-dir "$RUN_DIR/evaluation/curation/harvested" \
+  --manifest "$RUN_DIR/evaluation/curation/harvest.json" \
+  --threads 1
+
+# After independent review of harvest.json:
+python3 -m risk_score.curate_position_bank harvest-execute \
+  "$RUN_DIR/evaluation/curation/harvest.json"
+```
+
+The curation harvester deliberately requires one parser thread so that SGF
+output order and source provenance are reproducible. Execution revalidates the
+complete source inventory before and after `samplesgfs`, writes into a
+temporary directory, and atomically publishes the output with a receipt.
+Query analysis is the GPU-bound stage and may be batched separately.
+
+Normalize and semantically deduplicate the harvested `*.startposes.txt`
+outputs, then create analysis queries bound to the immutable original model
+and frozen policy:
+
+```bash
+python3 -m risk_score.curate_position_bank normalize \
+  "$RUN_DIR"/evaluation/curation/harvested/*.startposes.txt \
+  --output "$RUN_DIR/evaluation/curation/normalized.jsonl" \
+  --manifest "$RUN_DIR/evaluation/curation/normalized-manifest.json"
+
+python3 -m risk_score.curate_position_bank queries \
+  "$RUN_DIR/evaluation/curation/normalized.jsonl" \
+  --output-dir "$RUN_DIR/evaluation/curation/query-bundle" \
+  --katago "$REPO/cpp/build-cuda/katago" \
+  --analysis-config "$REPO/cpp/configs/risk_score/promotion_curation_analysis.cfg" \
+  --reference-model "$ORIGINAL_MODEL" \
+  --policy "$REPO/python/risk_score/promotion_policy_v2.json"
+```
+
+Run each query role with the reviewed analysis config by using the
+`run-analysis` subcommand. The query bundle currently contains standard
+200/800/2,000-visit and powered 800/2,000-visit files. Pass every resulting
+`ROLE=PATH` file to `label`; missing, duplicate, or misbound IDs fail.
+Each run also publishes `<result>.manifest.json`, binding the query, model,
+binary, config, and result hashes, and `label` requires that sidecar:
+
+```bash
+python3 -m risk_score.curate_position_bank run-analysis \
+  --katago "$REPO/cpp/build-cuda/katago" \
+  --config "$REPO/cpp/configs/risk_score/promotion_curation_analysis.cfg" \
+  --model "$ORIGINAL_MODEL" \
+  --queries "$RUN_DIR/evaluation/curation/query-bundle/queries/standard-800.jsonl" \
+  --output "$RUN_DIR/evaluation/curation/results/standard-800.jsonl"
+
+# Repeat run-analysis for every role, then bind all five results:
+python3 -m risk_score.curate_position_bank label \
+  "$RUN_DIR/evaluation/curation/normalized.jsonl" \
+  --query-manifest "$RUN_DIR/evaluation/curation/query-bundle/manifest.json" \
+  --analysis standard-200="$RUN_DIR/evaluation/curation/results/standard-200.jsonl" \
+  --analysis standard-800="$RUN_DIR/evaluation/curation/results/standard-800.jsonl" \
+  --analysis standard-2000="$RUN_DIR/evaluation/curation/results/standard-2000.jsonl" \
+  --analysis powered-800="$RUN_DIR/evaluation/curation/results/powered-800.jsonl" \
+  --analysis powered-2000="$RUN_DIR/evaluation/curation/results/powered-2000.jsonl" \
+  --output-dir "$RUN_DIR/evaluation/curation/labeling"
+```
+
+Only stable ordinary/Lead-40/Lead-80 cases are auto-labeled. Every tactical,
+exploitability, bait, tail, sacrifice, small-gain/large-lead, adversarial, or
+unstable case remains in `review-queue.jsonl`. A reviewer must provide exactly
+one decision per queued semantic SHA:
+
+```json
+{"approved":true,"labels":["exploitability","baits"],"semantic_sha256":"..."}
+```
+
+Finalize only after review. The command rejects semantic duplicates,
+unreviewed rows, changed inputs, and pools below policy-v2 minima:
+
+```bash
+python3 -m risk_score.curate_position_bank finalize \
+  --auto "$RUN_DIR/evaluation/curation/labeling/auto-labeled.jsonl" \
+  --review-queue "$RUN_DIR/evaluation/curation/labeling/review-queue.jsonl" \
+  --decisions "$RUN_DIR/evaluation/curation/review-decisions.jsonl" \
+  --labeling-manifest "$RUN_DIR/evaluation/curation/labeling/manifest.json" \
+  --policy "$REPO/python/risk_score/promotion_policy_v2.json" \
+  --output "$RUN_DIR/evaluation/source-positions.jsonl" \
+  --manifest "$RUN_DIR/evaluation/source-positions.manifest.json"
+```
+
+Do not use promotion match output to curate the suite that evaluates those
+candidates. That would leak discovery or confirmation results into the frozen
+holdouts.
 
 ## Freeze evaluation suites
 

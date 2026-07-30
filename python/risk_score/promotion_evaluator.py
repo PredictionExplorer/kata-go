@@ -44,6 +44,7 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_SHARDS = 256
 _MAX_PARALLEL = 32
 _MAX_ATTEMPTS = 5
+_PLAN_CONTRACT = "risk-score-evaluation-plan-v2"
 
 _COMPARISON_TO_CELL = {
     "candidate-vs-champion-powered": "powered_candidate_vs_champion",
@@ -52,7 +53,6 @@ _COMPARISON_TO_CELL = {
     "candidate-vs-champion-powered-lead-40": "lead_40",
     "candidate-vs-champion-powered-lead-80": "lead_80",
 }
-_NONCONFIRMATION_CELLS = CELL_ORDER[:3]
 _SCHEDULE_ARGUMENTS = {
     "powered_candidate_vs_champion": "powered_champion",
     "powered_candidate_vs_original": "powered_original",
@@ -60,6 +60,29 @@ _SCHEDULE_ARGUMENTS = {
     "lead_40": "lead40",
     "lead_80": "lead80",
 }
+
+
+def _expected_cells(
+    stage: str, champion_hash: str, original_hash: str
+) -> Tuple[str, ...]:
+    if stage == "stage-0":
+        return ()
+    if stage == "stage-1":
+        return ("powered_candidate_vs_champion",)
+    if stage == "stage-2":
+        return (
+            "powered_candidate_vs_champion",
+            *(
+                ("powered_candidate_vs_original",)
+                if champion_hash != original_hash
+                else ()
+            ),
+            "lead_40",
+            "lead_80",
+        )
+    if stage == "stage-3":
+        return tuple(CELL_ORDER)
+    raise PromotionEvaluatorError(f"unsupported controller stage {stage!r}")
 
 
 class PromotionEvaluatorError(ValueError):
@@ -83,6 +106,8 @@ class ValidatedInputs:
     candidate_hash: str
     champion_hash: str
     original_hash: str
+    powered_config_hash: str
+    standard_config_hash: str
 
 
 def _reject_constant(value: str) -> None:
@@ -224,6 +249,7 @@ def _artifact_schedule(
         or plan_hash != spec.schedule_sha
         or plan_id != spec.schedule_id
         or artifact.get("suiteBankSha256") != spec.suite_bank_sha
+        or artifact.get("visits") != spec.max_visits
     ):
         raise PromotionEvaluatorError(
             f"{cell_name} schedule artifact contradicts EvaluationSpec"
@@ -243,6 +269,10 @@ def _validate_plan(args: argparse.Namespace) -> ValidatedInputs:
         )
     plan = _load_canonical_json(plan_path, "controller plan")
     required_plan_keys = {
+        "planContract",
+        "candidateModelSha256",
+        "championModelSha256",
+        "originalModelSha256",
         "evaluationKey",
         "configHash",
         "scheduleHash",
@@ -256,6 +286,7 @@ def _validate_plan(args: argparse.Namespace) -> ValidatedInputs:
         "suiteManifestPath",
         "suiteManifestHash",
         "scheduleArtifacts",
+        "cellOrder",
         "specs",
     }
     missing = sorted(required_plan_keys.difference(plan))
@@ -264,6 +295,17 @@ def _validate_plan(args: argparse.Namespace) -> ValidatedInputs:
     stage = plan.get("stage")
     if stage not in {"stage-0", "stage-1", "stage-2", "stage-3"}:
         raise PromotionEvaluatorError(f"unsupported controller stage {stage!r}")
+    if plan.get("planContract") != _PLAN_CONTRACT:
+        raise PromotionEvaluatorError("unsupported controller plan contract")
+    candidate_hash = _require_sha256(
+        plan.get("candidateModelSha256"), "plan candidate model hash"
+    )
+    champion_hash = _require_sha256(
+        plan.get("championModelSha256"), "plan champion model hash"
+    )
+    original_hash = _require_sha256(
+        plan.get("originalModelSha256"), "plan original model hash"
+    )
     for key in (
         "configHash",
         "scheduleHash",
@@ -291,9 +333,11 @@ def _validate_plan(args: argparse.Namespace) -> ValidatedInputs:
             raise PromotionEvaluatorError(
                 f"controller plan {key} must be a nonempty single-line string"
             )
-    expected_cells = (
-        tuple(CELL_ORDER) if stage == "stage-3" else tuple(_NONCONFIRMATION_CELLS)
-    )
+    expected_cells = _expected_cells(stage, champion_hash, original_hash)
+    if plan.get("cellOrder") != list(expected_cells):
+        raise PromotionEvaluatorError(
+            "controller plan cellOrder does not match its stage/model identities"
+        )
 
     raw_specs = plan.get("specs")
     if not isinstance(raw_specs, list):
@@ -308,16 +352,38 @@ def _validate_plan(args: argparse.Namespace) -> ValidatedInputs:
         raise PromotionEvaluatorError(f"invalid EvaluationSpec: {exc}") from exc
     if len(specs) != len(raw_specs) or len(specs) != len(expected_cells):
         raise PromotionEvaluatorError("controller plan has the wrong EvaluationSpec count")
-    if plan["evaluationKey"] != "matrix-" + canonical_sha256(raw_specs):
+    if stage == "stage-0":
+        expected_key = "probe-" + canonical_sha256(
+            {
+                "planContract": _PLAN_CONTRACT,
+                "candidateModelSha256": candidate_hash,
+                "championModelSha256": champion_hash,
+                "originalModelSha256": original_hash,
+                "configHash": plan["configHash"],
+                "scheduleHash": plan["scheduleHash"],
+                "policyHash": plan["policyHash"],
+                "suiteManifestHash": plan["suiteManifestHash"],
+                "stage": stage,
+                "look": plan["look"],
+                "topology": plan["topology"],
+            }
+        )
+        if plan["scheduleHash"] != canonical_sha256([]):
+            raise PromotionEvaluatorError(
+                "Stage-0 controller plan must not bind game schedules"
+            )
+    else:
+        expected_key = "matrix-" + canonical_sha256(raw_specs)
+        if plan["configHash"] != canonical_sha256(
+            sorted({spec.config_sha for spec in specs})
+        ):
+            raise PromotionEvaluatorError("controller plan configHash is invalid")
+        if plan["scheduleHash"] != canonical_sha256(
+            sorted({spec.schedule_sha for spec in specs})
+        ):
+            raise PromotionEvaluatorError("controller plan scheduleHash is invalid")
+    if plan["evaluationKey"] != expected_key:
         raise PromotionEvaluatorError("controller plan evaluationKey is invalid")
-    if plan["configHash"] != canonical_sha256(
-        sorted({spec.config_sha for spec in specs})
-    ):
-        raise PromotionEvaluatorError("controller plan configHash is invalid")
-    if plan["scheduleHash"] != canonical_sha256(
-        sorted({spec.schedule_sha for spec in specs})
-    ):
-        raise PromotionEvaluatorError("controller plan scheduleHash is invalid")
 
     by_cell: Dict[str, EvaluationSpec] = {}
     for spec in specs:
@@ -332,20 +398,6 @@ def _validate_plan(args: argparse.Namespace) -> ValidatedInputs:
             "controller plan does not contain the exact required evaluation matrix"
         )
 
-    candidate_hash = _single(
-        (spec.candidate_model_sha for spec in specs), "candidate model hash"
-    )
-    original_hash = _single(
-        (spec.original_model_sha for spec in specs), "original model hash"
-    )
-    champion_hash = _single(
-        (
-            spec.reference_model_sha
-            for spec in specs
-            if "champion" in spec.comparison
-        ),
-        "tested champion model hash",
-    )
     if any(
         spec.stage != stage
         or spec.look != plan["look"]
@@ -356,6 +408,18 @@ def _validate_plan(args: argparse.Namespace) -> ValidatedInputs:
     ):
         raise PromotionEvaluatorError(
             "EvaluationSpecs contradict plan stage/look/topology/policy/manifest"
+        )
+    if any(
+        spec.candidate_model_sha != candidate_hash
+        or spec.original_model_sha != original_hash
+        or (
+            "champion" in spec.comparison
+            and spec.reference_model_sha != champion_hash
+        )
+        for spec in specs
+    ):
+        raise PromotionEvaluatorError(
+            "EvaluationSpecs contradict explicit plan model identities"
         )
 
     policy_path_text = str(args.policy)
@@ -397,23 +461,48 @@ def _validate_plan(args: argparse.Namespace) -> ValidatedInputs:
     _verify_file(args.champion_model, champion_hash, "champion model")
     _verify_file(args.original_model, original_hash, "original model")
 
-    powered_hash = _single(
-        (
-            spec.config_sha
-            for spec in specs
-            if spec.comparison != "candidate-vs-original-standard"
-        ),
-        "powered config hash",
-    )
-    standard_hash = by_cell["standard_candidate_vs_original"].config_sha
-    _verify_supplied_hash(
-        args.powered_config_sha256, powered_hash, "powered config"
-    )
-    _verify_supplied_hash(
-        args.standard_config_sha256, standard_hash, "standard config"
-    )
-    _verify_file(args.powered_config, powered_hash, "powered config")
-    _verify_file(args.standard_config, standard_hash, "standard config")
+    if stage == "stage-0":
+        powered_hash = _require_sha256(
+            args.powered_config_sha256, "powered config supplied hash"
+        )
+        standard_hash = _require_sha256(
+            args.standard_config_sha256, "standard config supplied hash"
+        )
+        _verify_file(args.powered_config, powered_hash, "powered config")
+        _verify_file(args.standard_config, standard_hash, "standard config")
+        if plan["configHash"] != canonical_sha256(
+            sorted({powered_hash, standard_hash})
+        ):
+            raise PromotionEvaluatorError(
+                "Stage-0 plan configHash does not bind both probe configs"
+            )
+    else:
+        powered_hash = _single(
+            (
+                spec.config_sha
+                for spec in specs
+                if spec.comparison != "candidate-vs-original-standard"
+            ),
+            "powered config hash",
+        )
+        _verify_supplied_hash(
+            args.powered_config_sha256, powered_hash, "powered config"
+        )
+        _verify_file(args.powered_config, powered_hash, "powered config")
+        supplied_standard_hash = _require_sha256(
+            args.standard_config_sha256, "standard config supplied hash"
+        )
+        _verify_file(
+            args.standard_config, supplied_standard_hash, "standard config"
+        )
+        standard_spec = by_cell.get("standard_candidate_vs_original")
+        if standard_spec is not None:
+            standard_hash = standard_spec.config_sha
+            _verify_supplied_hash(
+                supplied_standard_hash, standard_hash, "standard config"
+            )
+        else:
+            standard_hash = supplied_standard_hash
 
     artifacts = plan.get("scheduleArtifacts")
     if not isinstance(artifacts, Mapping) or set(artifacts) != set(expected_cells):
@@ -469,6 +558,8 @@ def _validate_plan(args: argparse.Namespace) -> ValidatedInputs:
         candidate_hash=candidate_hash,
         champion_hash=champion_hash,
         original_hash=original_hash,
+        powered_config_hash=powered_hash,
+        standard_config_hash=standard_hash,
     )
 
 
@@ -507,6 +598,18 @@ def _load_stage0(
         "policy_version": inputs.plan["policyVersion"],
         "suite_manifest_path": inputs.plan["suiteManifestPath"],
         "suite_manifest_hash": inputs.plan["suiteManifestHash"],
+        "config_hash": canonical_sha256(
+            sorted(
+                {
+                    inputs.powered_config_hash,
+                    inputs.standard_config_hash,
+                }
+            )
+        ),
+        "powered_config_path": str(args.powered_config),
+        "powered_config_hash": inputs.powered_config_hash,
+        "standard_config_path": str(args.standard_config),
+        "standard_config_hash": inputs.standard_config_hash,
     }
     conflicts = [
         key

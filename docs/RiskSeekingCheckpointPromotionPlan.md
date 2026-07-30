@@ -23,18 +23,29 @@ management, and rollout control.
 
 ## Current state
 
-As of 2026-07-29:
+As of the 2026-07-29 read-only live inspection:
 
-- repository implementation is based on
-  `16e954ffa20327f56c3d910066195107f48bad4c` plus the currently reviewed
-  policy-v2 closure diff; the original training run remains rooted at
+- repository orchestration is based on
+  `c6205c0a7b3397dba5857708430d0c9b0c4aaf60` plus the current reviewed
+  Stage 0–2 execution-alignment and position-curation diff; the live checkout
+  is clean at the original training revision
   `a51c32967fdfb246923aebf12801812504cfbd40`;
+- the live run root is
+  `/home/ubuntu/kata-go-artifacts/runs/training-a51c3296-p15-w4`;
 - the active objective is `scorePower=1.5`, `scoreScale=20`,
   `winWeight=4`;
-- self-play uses the original b40 network on seven H100s;
-- GPU 7 trains a b40 Muon/BF16 model and is frequently data-bucket idle;
-- approximately 10 million fine-tuning samples have been consumed;
-- approximately 100 candidates are staged under `modelstobetested`;
+- one monolithic 700-thread self-play process uses the original b40 network
+  on GPUs 0–6 with `switchNetsMidGame=true`;
+- GPU 7 trains a b40 Muon/BF16 model, retains approximately 49 GB while
+  data-bucket idle, and was not launched with
+  `-stop-when-train-bucket-limited`;
+- the newest staged name shows approximately 19 million fine-tuning samples
+  consumed;
+- 186 candidates are staged under `modelstobetested`;
+- no live `promotion/` tree, frozen evaluation suite, or reviewed source
+  position bank exists;
+- the live `USEGATING=1` export loop still uses the legacy exporter, which
+  removes each source checkpoint before publishing to `modelstobetested`;
 - no trained candidate has been admitted to self-play; and
 - the stock KataGo gatekeeper is intentionally disabled because it promotes
   solely from conventional win points.
@@ -51,8 +62,10 @@ Checked items have repository evidence. Live-run items remain unchecked until
 they are verified on the actual training filesystem and H100 hosts.
 The repository-foundation checklist records implemented building blocks; it
 does not by itself establish an end-to-end automatic promotion path.
-Mutation-enabled deployment remains blocked until every repository-closure,
-final-audit hardening, and required live-environment item is checked.
+Repository Stage 0–2 execution alignment and position-bank curation tooling
+are complete. That does not establish a reviewed live bank or deployment.
+Mutation-enabled operation remains blocked until every required
+live-environment item is checked.
 
 ### Existing prerequisites
 
@@ -69,7 +82,8 @@ final-audit hardening, and required live-environment item is checked.
 ### Repository foundation
 
 - [x] Freeze promotion policy v1 and explicit powered/standard match configs.
-- [x] Build independent, content-addressed evaluation suite manifests.
+- [x] Build independent, content-addressed evaluation suite banks and exact
+  Stage 3 confirmation manifests.
 - [x] Implement paired, position-clustered statistics and promotion gates.
 - [x] Implement pair-safe evaluation sharding, validation, and recovery.
 - [x] Implement hash-chained lifecycle state and champion compare-and-swap.
@@ -90,14 +104,50 @@ final-audit hardening, and required live-environment item is checked.
   outputs through paired statistics to gate-grade promotion evidence.
 - [x] Bind finalist ranking to finalized statistics artifacts and make the
   prespecified second confirmation look executable and crash-recoverable.
-- [x] Execute and bind Stage 0 probes, schedule deep audits, and connect audit
-  failures to rollback.
+- [x] Bind Stage 0 request/probe evidence, schedule deep audits, and connect
+  audit failures to rollback.
 - [x] Complete reference-aware trash/grace handling, queue backpressure, and
   structured invariant/SLO status.
 - [x] Add the remaining failure-injection tests and run the Python promotion
   suite in CI.
 - [x] Pass final focused/full repository verification and record the exact
   commands below.
+
+### Repository execution alignment
+
+These items were discovered during the post-closure audit of actual Stage 0–2
+execution. They must be complete before shadow evaluation consumes a real
+position bank.
+
+- [x] Make Stage 0 probe-only so it launches no ordinary or audit match matrix.
+- [x] Bind Stage 1 to exactly 32 powered candidate-versus-champion discovery
+  pairs at 400 visits.
+- [x] Bind Stage 2 to 128 ordinary, 32 Lead-40, and 32 Lead-80 discovery pairs
+  at 800 visits, with an original-model comparison only when it is distinct
+  from the champion.
+- [x] Include the effective visit count in every evaluation identity, runner
+  command, and finalized runner artifact.
+- [x] Publish exact Stage 1 and Stage 2 manifest cells and schedule prefixes.
+- [x] Make the evaluator and evidence adapter validate the exact per-stage
+  cell set instead of one fixed nonconfirmation matrix.
+
+### Position-bank curation pipeline
+
+The suite builder deliberately consumes reviewed labeled positions; no such
+source bank currently exists in the repository or live run.
+
+- [x] Implement deterministic PositionSample normalization, C++-readable
+  output, semantic deduplication, and source provenance.
+- [x] Implement hash-bound analysis-query generation and result ingestion
+  against an immutable reference model.
+- [x] Implement conservative ordinary, Lead-40, and Lead-80 auto-labeling with
+  visit-stability checks.
+- [x] Implement explicit human-review queues for tactical, exploitability,
+  bait, score-tail, sacrifice, small-gain/large-lead, and adversarial cases.
+- [x] Publish a canonical curation manifest and fail closed when policy-v2 pool
+  minima or review approvals are missing.
+- [x] Cover deterministic curation and suite-builder handoff with automated
+  tests.
 
 Repository verification recorded so far:
 
@@ -148,6 +198,14 @@ Repository verification recorded so far:
 - Final `compileall`, v1/v2 policy and runtime JSON parsing, promotion CLI
   help smokes, exporter shell syntax, GitHub workflow YAML parsing, pinned
   policy validation, and `git diff --check` (2026-07-29): passed.
+- Stage 0–2 runner/evaluator/evidence/gate/recovery and position-curation
+  focused run (2026-07-29): 163 tests passed.
+- `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. uv run --with pytest pytest
+  -p no:cacheprovider -c /dev/null tests -q` (2026-07-29, execution-alignment
+  and curation run): 318 tests passed.
+- Final `compileall`, v1/v2 policy and runtime JSON parsing, promotion and
+  curation CLI help smokes, exporter shell syntax, and `git diff --check`
+  (2026-07-29): passed.
 
 ### Final audit hardening
 
@@ -184,7 +242,15 @@ Repository verification recorded so far:
 
 ### Live environment validation
 
+- [ ] Deploy a reviewed post-alignment source snapshot without modifying the
+  checkout used by the running export loop.
+- [ ] Install a production runtime configuration and Stage 0 probe command
+  with mutation disabled.
+- [ ] Switch the live exporter to the hardened, probed, backpressure-aware
+  path without losing an in-flight checkpoint.
 - [ ] Inventory and hash the staged candidate backlog.
+- [ ] Generate a quarantined original-model SGF corpus that is never admitted
+  to the shuffler or trainer, and bind its exclusion roots in the harvest plan.
 - [ ] Freeze real discovery, confirmation, audit, tactical, and exploitability
   position banks.
 - [ ] Validate atomic rename and fsync semantics on the training filesystem.
@@ -317,6 +383,13 @@ loading, and training-data generation remain the execution engines.
 - `python/risk_score/build_evaluation_suites.py`
   - frozen ordinary, Lead-40, Lead-80, tactical, and exploitability suites;
   - independent discovery, confirmation, and audit holdouts.
+- `python/risk_score/position_samples.py`
+  - shared PositionSample validation and gameplay-semantic identity;
+  - deterministic analysis query construction.
+- `python/risk_score/curate_position_bank.py`
+  - content-bound SGF harvest plans and analysis execution;
+  - conservative automatic labels and explicit specialized review queues;
+  - policy-minimum validation and canonical reviewed-bank publication.
 
 ### Configuration
 
@@ -327,6 +400,9 @@ loading, and training-data generation remain the execution engines.
 - `cpp/configs/risk_score/promotion_standard_match.cfg`
   - candidate and original both use standard KataGo utility;
   - ordinary-strength safety control.
+- `cpp/configs/risk_score/promotion_curation_analysis.cfg`
+  - deterministic standard/powered query baseline for position curation;
+  - one leased GPU with binary, config, model, query, and result hash binding.
 - `python/risk_score/promotion_policy_v1.json`
   - immutable historical policy and evidence identity.
 - `python/risk_score/promotion_policy_v2.json`
@@ -347,6 +423,7 @@ loading, and training-data generation remain the execution engines.
 - `python/tests/test_promotion_evidence.py`
 - `python/tests/test_hardened_exporter.py`
 - `python/tests/test_promotion_recovery.py`
+- `python/tests/test_curate_position_bank.py`
 
 No C++ change is required for the first production controller. Optional C++
 improvements are listed later.

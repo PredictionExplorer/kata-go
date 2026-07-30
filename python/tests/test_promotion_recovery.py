@@ -1171,6 +1171,11 @@ def test_confirmation_plan_selects_exact_authoritative_look_cells(tmp_path):
                         if cell_name == "lead_80"
                         else "confirmation"
                     ),
+                    "visits": (
+                        800
+                        if cell_name == "standard_candidate_vs_original"
+                        else 2000
+                    ),
                     "color_pairs": count,
                     "independent_cluster_ids_hash": digest(
                         f"{look}:{schedule_role}:clusters"
@@ -1179,6 +1184,80 @@ def test_confirmation_plan_selects_exact_authoritative_look_cells(tmp_path):
                     "schedule_path": str(path.relative_to(runtime.suites)),
                     "schedule_hash": schedule_hash,
                     "schedule_id": f"{look}-{schedule_role}",
+                }
+            )
+    for stage, stage_cells in (
+        (
+            "stage-1",
+            (
+                (
+                    "powered_candidate_vs_champion",
+                    "candidate-vs-champion-powered",
+                    "discovery",
+                    400,
+                ),
+            ),
+        ),
+        (
+            "stage-2",
+            (
+                (
+                    "powered_candidate_vs_champion",
+                    "candidate-vs-champion-powered",
+                    "discovery",
+                    800,
+                ),
+                (
+                    "powered_candidate_vs_original",
+                    "candidate-vs-original-powered",
+                    "discovery",
+                    800,
+                ),
+                (
+                    "lead_40",
+                    "candidate-vs-champion-powered-lead-40",
+                    "lead-40",
+                    800,
+                ),
+                (
+                    "lead_80",
+                    "candidate-vs-champion-powered-lead-80",
+                    "lead-80",
+                    800,
+                ),
+            ),
+        ),
+    ):
+        for cell_name, comparison, suite, visits in stage_cells:
+            schedule_role = (
+                "ordinary" if suite == "discovery" else suite
+            )
+            key = (stage, schedule_role)
+            if key not in artifacts:
+                path = (
+                    runtime.suites
+                    / "schedules"
+                    / f"{stage}-{schedule_role}.jsonl"
+                )
+                path.write_text(f"{stage}:{schedule_role}\n", encoding="utf-8")
+                artifacts[key] = (path, sha256_file(path))
+            path, schedule_hash = artifacts[key]
+            cells.append(
+                {
+                    "cell_name": cell_name,
+                    "stage": stage,
+                    "look": "automatic",
+                    "comparison": comparison,
+                    "suite": suite,
+                    "visits": visits,
+                    "color_pairs": 1,
+                    "independent_cluster_ids_hash": digest(
+                        f"{stage}:{schedule_role}:clusters"
+                    ),
+                    "bank_hash": digest(f"{stage}:{suite}:bank"),
+                    "schedule_path": str(path.relative_to(runtime.suites)),
+                    "schedule_hash": schedule_hash,
+                    "schedule_id": f"{stage}-{schedule_role}",
                 }
             )
     payload = {
@@ -1237,6 +1316,62 @@ def test_confirmation_plan_selects_exact_authoritative_look_cells(tmp_path):
                 ]["path"]
                 == str(runtime.suites / selected["schedule_path"])
             )
+
+    stage0 = controller.build_evaluation_plan(
+        digest("candidate"),
+        digest("champion"),
+        suite="integrity",
+        stage="integrity",
+        look="automatic",
+        topology="7-workers-100-threads",
+    )
+    assert stage0.specs == ()
+    assert stage0.schedule_artifacts == {}
+    assert stage0.evaluation_key.startswith("probe-")
+
+    stage1 = controller.build_evaluation_plan(
+        digest("candidate"),
+        digest("champion"),
+        suite="screen",
+        stage="screen",
+        look="automatic",
+        topology="7-workers-100-threads",
+    )
+    assert [spec.comparison for spec in stage1.specs] == [
+        "candidate-vs-champion-powered"
+    ]
+    assert stage1.specs[0].max_visits == 400
+    assert stage1.schedule_artifacts[
+        "powered_candidate_vs_champion"
+    ]["pairCount"] == 1
+
+    stage2 = controller.build_evaluation_plan(
+        digest("candidate"),
+        digest("champion"),
+        suite="finalist",
+        stage="finalist",
+        look="automatic",
+        topology="7-workers-100-threads",
+    )
+    assert [spec.comparison for spec in stage2.specs] == [
+        "candidate-vs-champion-powered",
+        "candidate-vs-original-powered",
+        "candidate-vs-champion-powered-lead-40",
+        "candidate-vs-champion-powered-lead-80",
+    ]
+    assert {spec.max_visits for spec in stage2.specs} == {800}
+
+    stage2_original_champion = controller.build_evaluation_plan(
+        digest("candidate"),
+        runtime.controller.original_hash,
+        suite="finalist",
+        stage="finalist",
+        look="automatic",
+        topology="7-workers-100-threads",
+    )
+    assert "candidate-vs-original-powered" not in {
+        spec.comparison for spec in stage2_original_champion.specs
+    }
 
 
 def test_finalize_gate_report_rejects_bare_and_stale_pass(tmp_path):
@@ -1830,7 +1965,7 @@ def test_only_one_confirmation_attempt_is_allocated_per_champion(tmp_path):
     def execute(plan, candidate):
         controller = holder["controller"]
         return {
-            "controller_stage": plan.specs[0].stage,
+            "controller_stage": plan.stage,
             "candidate_hash": candidate.model_hash,
             "tested_champion_hash": controller.registry.reconstruct().current_champion_hash,
             "original_hash": runtime.controller.original_hash,
@@ -2012,11 +2147,7 @@ def test_configured_evaluator_adapter_is_shell_free_and_identity_checked(tmp_pat
         plan_path = Path(argv[argv.index("--plan") + 1])
         evidence_path = Path(argv[argv.index("--evidence") + 1])
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
-        champion = next(
-            spec["reference_model_sha"]
-            for spec in plan["specs"]
-            if spec["comparison"] == "candidate-vs-champion-powered"
-        )
+        champion = plan["championModelSha256"]
         metadata = {
             "finalized": True,
             "controller_stage": "integrity",

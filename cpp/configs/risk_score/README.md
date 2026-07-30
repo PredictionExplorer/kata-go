@@ -166,6 +166,13 @@ The promotion evaluator executes the exact manifest-bound cells; the evidence
 assembler then binds finalized runner output to paired statistics and the
 five-cell gate. An external PASS marker is not promotion evidence.
 
+`promotion_curation_analysis.cfg` is the deterministic one-GPU analysis
+template for `risk_score.curate_position_bank`. Query files override visits
+and powered/standard utility per position; the curation manifest binds this
+config, the KataGo binary, and the immutable original-model hash. It enables
+KataGo's deterministic test seed and one analysis worker. Run it only under
+the same exclusive GPU lease used for other promotion analysis.
+
 `promotion_selfplay_worker_19x19.cfg` is the generation-pinned one-GPU
 self-play template. Launch seven separate workers through the promotion
 controller/supervisor, each with an immutable one-model directory, distinct

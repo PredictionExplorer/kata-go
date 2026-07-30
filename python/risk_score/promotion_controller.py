@@ -58,6 +58,7 @@ _IGNORED_SUFFIXES = (".tmp", ".partial", ".exported")
 _CANDIDATE_FILES = {"model.bin.gz", "model.ckpt"}
 _OPTIONAL_CANDIDATE_FILES = {"manifest.json", "exporter_manifest.json"}
 _HARDENED_EXPORT_CONTRACT = "katago-hardened-candidate-publication-v1"
+EVALUATION_PLAN_CONTRACT = "risk-score-evaluation-plan-v2"
 
 PROMOTION_FAILURE_STEPS = (
     "promotion-intent-written",
@@ -487,6 +488,9 @@ class EvaluationMatrixPlan:
     """Immutable matrix plus aggregate hashes used by lifecycle events."""
 
     specs: Tuple[Any, ...]
+    candidate_hash: str
+    champion_hash: str
+    original_hash: str
     evaluation_key: str
     config_hash: str
     schedule_hash: str
@@ -503,6 +507,10 @@ class EvaluationMatrixPlan:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "planContract": EVALUATION_PLAN_CONTRACT,
+            "candidateModelSha256": self.candidate_hash,
+            "championModelSha256": self.champion_hash,
+            "originalModelSha256": self.original_hash,
             "evaluationKey": self.evaluation_key,
             "configHash": self.config_hash,
             "scheduleHash": self.schedule_hash,
@@ -519,6 +527,7 @@ class EvaluationMatrixPlan:
                 key: dict(value)
                 for key, value in sorted(self.schedule_artifacts.items())
             },
+            "cellOrder": list(self.schedule_artifacts),
             "specs": [spec.to_dict() for spec in self.specs],
         }
 
@@ -1374,6 +1383,7 @@ class PromotionController:
             "minimum_independent_position_clusters",
             "minimumIndependentPositionClusters",
         )
+        visits = self._cell_value(cell, "visits", "max_visits", "maxVisits")
         if not isinstance(relative, str) or not relative:
             raise SafetyHalt("authoritative manifest cell has no schedule path")
         _hash(expected_hash, "authoritative manifest schedule hash")
@@ -1408,6 +1418,10 @@ class PromotionController:
         ):
             raise SafetyHalt(
                 "authoritative manifest independent cluster minimum is invalid"
+            )
+        if type(visits) is not int or visits <= 0:
+            raise SafetyHalt(
+                "authoritative manifest cell has no positive visit count"
             )
         for key, expected in (
             ("policy_hash", self.runtime.controller.policy_hash),
@@ -1448,6 +1462,7 @@ class PromotionController:
             "suiteBankSha256": bank_hash,
             "independentClusterIdsSha256": cluster_hash,
             "minimumIndependentPositionClusters": minimum_clusters,
+            "visits": visits,
         }
 
     def validate_static_inputs(self) -> None:
@@ -1712,6 +1727,50 @@ class PromotionController:
             self.runtime.frozen_policy.get("policy_version"),
             "frozen policy version",
         )
+        if canonical_stage == "stage-0":
+            config_hash = canonical_sha256(
+                sorted(
+                    {
+                        config.powered_config_hash,
+                        config.standard_config_hash,
+                    }
+                )
+            )
+            schedule_hash = canonical_sha256([])
+            evaluation_key = "probe-" + canonical_sha256(
+                {
+                    "planContract": EVALUATION_PLAN_CONTRACT,
+                    "candidateModelSha256": candidate_hash,
+                    "championModelSha256": champion_hash,
+                    "originalModelSha256": config.original_hash,
+                    "configHash": config_hash,
+                    "scheduleHash": schedule_hash,
+                    "policyHash": config.policy_hash,
+                    "suiteManifestHash": config.suite_manifest_hash,
+                    "stage": canonical_stage,
+                    "look": canonical_look,
+                    "topology": required_topology,
+                }
+            )
+            return EvaluationMatrixPlan(
+                specs=(),
+                candidate_hash=candidate_hash,
+                champion_hash=champion_hash,
+                original_hash=config.original_hash,
+                evaluation_key=evaluation_key,
+                config_hash=config_hash,
+                schedule_hash=schedule_hash,
+                policy_hash=config.policy_hash,
+                selfplay_config_hash=config.selfplay_config_hash,
+                topology=required_topology,
+                stage=canonical_stage,
+                look=canonical_look,
+                policy_path=str(self.runtime.policy_path),
+                policy_version=policy_version,
+                suite_manifest_path=str(manifest_path),
+                suite_manifest_hash=config.suite_manifest_hash,
+                schedule_artifacts={},
+            )
         look_policy: Optional[Mapping[str, Any]] = None
         if confirmation:
             policy_looks = _policy_get(
@@ -1742,34 +1801,117 @@ class PromotionController:
                 raise SafetyHalt(
                     f"frozen policy does not define {canonical_look}"
                 )
-        ordinary_bank_name = (
-            "confirmation"
-            if confirmation
-            else "audit"
-            if stage == "integrity"
-            else "discovery"
+        stage_1_policy = _policy_get(
+            self.runtime.frozen_policy,
+            "evaluation_stages",
+            "stage_1_cheap_paired_screen",
         )
-        ordinary_schedule_hash = (
-            config.confirmation_schedule_hash
-            if confirmation
-            else config.audit_schedule_hash
-            if stage == "integrity"
-            else config.discovery_schedule_hash
+        stage_2_policy = _policy_get(
+            self.runtime.frozen_policy,
+            "evaluation_stages",
+            "stage_2_finalist_selection",
         )
-        schedule_artifacts: Dict[str, Mapping[str, Any]] = {}
-        matrix_kwargs: Dict[str, Any] = {}
-        if confirmation and authoritative_cells:
-            cell_coordinates = {
-                "powered_candidate_vs_champion":
+        stage_3_policy = _policy_get(
+            self.runtime.frozen_policy,
+            "evaluation_stages",
+            "stage_3_promotion_confirmation",
+        )
+        v2_policy = self.runtime.frozen_policy.get("schema_version") == 2
+        if canonical_stage == "stage-1":
+            if not isinstance(stage_1_policy, Mapping):
+                if v2_policy:
+                    raise SafetyHalt("frozen policy has no Stage-1 execution contract")
+                stage_1_policy = {}
+            powered_visits = stage_1_policy.get("visits", 400)
+            standard_visits = powered_visits
+            include_powered_original = False
+            include_standard_original = False
+            lead_visits = powered_visits
+            cell_coordinates = (
+                (
+                    "powered_candidate_vs_champion",
                     "candidate-vs-champion-powered",
-                "powered_candidate_vs_original":
+                ),
+            )
+        elif canonical_stage == "stage-2":
+            if not isinstance(stage_2_policy, Mapping):
+                if v2_policy:
+                    raise SafetyHalt("frozen policy has no Stage-2 execution contract")
+                stage_2_policy = {}
+            powered_visits = stage_2_policy.get("ordinary_visits", 800)
+            standard_visits = powered_visits
+            include_powered_original = champion_hash != config.original_hash
+            include_standard_original = False
+            lead_visits = stage_2_policy.get("lead_visits", 800)
+            cell_coordinates = (
+                (
+                    "powered_candidate_vs_champion",
+                    "candidate-vs-champion-powered",
+                ),
+                *(
+                    (
+                        (
+                            "powered_candidate_vs_original",
+                            "candidate-vs-original-powered",
+                        ),
+                    )
+                    if include_powered_original
+                    else ()
+                ),
+                (
+                    "lead_40",
+                    "candidate-vs-champion-powered-lead-40",
+                ),
+                (
+                    "lead_80",
+                    "candidate-vs-champion-powered-lead-80",
+                ),
+            )
+        else:
+            if not isinstance(stage_3_policy, Mapping):
+                if v2_policy:
+                    raise SafetyHalt("frozen policy has no Stage-3 execution contract")
+                stage_3_policy = {}
+            powered_visits = stage_3_policy.get("powered_visits", 2000)
+            standard_visits = stage_3_policy.get("standard_visits", 800)
+            include_powered_original = True
+            include_standard_original = True
+            lead_visits = powered_visits
+            cell_coordinates = (
+                (
+                    "powered_candidate_vs_champion",
+                    "candidate-vs-champion-powered",
+                ),
+                (
+                    "powered_candidate_vs_original",
                     "candidate-vs-original-powered",
-                "standard_candidate_vs_original":
+                ),
+                (
+                    "standard_candidate_vs_original",
                     "candidate-vs-original-standard",
-                "lead_40": "candidate-vs-champion-powered-lead-40",
-                "lead_80": "candidate-vs-champion-powered-lead-80",
-            }
-            for cell_name, comparison in cell_coordinates.items():
+                ),
+                ("lead_40", "candidate-vs-champion-powered-lead-40"),
+                ("lead_80", "candidate-vs-champion-powered-lead-80"),
+            )
+        for value, role in (
+            (powered_visits, "powered visits"),
+            (standard_visits, "standard visits"),
+            (lead_visits, "lead visits"),
+        ):
+            if type(value) is not int or value <= 0:
+                raise SafetyHalt(f"frozen policy {role} must be a positive integer")
+
+        ordinary_bank_name = "confirmation" if confirmation else "discovery"
+        schedule_artifacts: Dict[str, Mapping[str, Any]] = {}
+        matrix_kwargs: Dict[str, Any] = {
+            "powered_visits": powered_visits,
+            "standard_visits": standard_visits,
+            "lead_visits": lead_visits,
+            "include_powered_original": include_powered_original,
+            "include_standard_original": include_standard_original,
+        }
+        if authoritative_cells:
+            for cell_name, comparison in cell_coordinates:
                 artifact = self._resolve_manifest_schedule(
                     manifest,
                     stage=canonical_stage,
@@ -1782,31 +1924,72 @@ class PromotionController:
                         "authoritative suite manifest unexpectedly has no cells"
                     )
                 schedule_artifacts[cell_name] = artifact
-            powered_cells = (
-                schedule_artifacts["powered_candidate_vs_champion"],
-                schedule_artifacts["powered_candidate_vs_original"],
+
+            powered = schedule_artifacts["powered_candidate_vs_champion"]
+            powered_original = schedule_artifacts.get(
+                "powered_candidate_vs_original"
             )
-            for field in (
-                "path",
-                "sha256",
-                "scheduleId",
-                "pairCount",
-                "suiteBankSha256",
-                "independentClusterIdsSha256",
-                "minimumIndependentPositionClusters",
-            ):
-                if powered_cells[0].get(field) != powered_cells[1].get(field):
-                    raise SafetyHalt(
-                        "powered ordinary confirmation cells must share the "
-                        f"exact cumulative schedule ({field})"
-                    )
-            powered = powered_cells[0]
-            standard = schedule_artifacts["standard_candidate_vs_original"]
-            lead40 = schedule_artifacts["lead_40"]
-            lead80 = schedule_artifacts["lead_80"]
+            if powered_original is not None:
+                for field in (
+                    "path",
+                    "sha256",
+                    "scheduleId",
+                    "pairCount",
+                    "suiteBankSha256",
+                    "independentClusterIdsSha256",
+                    "minimumIndependentPositionClusters",
+                    "visits",
+                ):
+                    if powered.get(field) != powered_original.get(field):
+                        raise SafetyHalt(
+                            "powered ordinary cells must share the exact "
+                            f"schedule and visit contract ({field})"
+                        )
             ordinary_schedule_hash = str(powered["sha256"])
             ordinary_bank_hash = str(powered["suiteBankSha256"])
             ordinary_schedule_id = str(powered["scheduleId"])
+
+            expected_pairs: Dict[str, Any]
+            expected_minima: Mapping[str, Any] = {}
+            expected_visits = {
+                name: (
+                    standard_visits
+                    if name == "standard_candidate_vs_original"
+                    else lead_visits
+                    if name in {"lead_40", "lead_80"}
+                    else powered_visits
+                )
+                for name in schedule_artifacts
+            }
+            if canonical_stage == "stage-1":
+                expected_pairs = {
+                    "powered_candidate_vs_champion":
+                        stage_1_policy.get("ordinary_color_pairs")
+                }
+            elif canonical_stage == "stage-2":
+                expected_pairs = {
+                    "powered_candidate_vs_champion":
+                        stage_2_policy.get("ordinary_color_pairs"),
+                    "powered_candidate_vs_original":
+                        stage_2_policy.get("ordinary_color_pairs"),
+                    "lead_40": stage_2_policy.get("lead_40_color_pairs"),
+                    "lead_80": stage_2_policy.get("lead_80_color_pairs"),
+                }
+            else:
+                assert look_policy is not None
+                expected_pairs = {
+                    "powered_candidate_vs_champion":
+                        look_policy.get("powered_ordinary_color_pairs_per_matchup"),
+                    "powered_candidate_vs_original":
+                        look_policy.get("powered_ordinary_color_pairs_per_matchup"),
+                    "standard_candidate_vs_original":
+                        look_policy.get("standard_ordinary_color_pairs"),
+                    "lead_40": look_policy.get("lead_40_color_pairs"),
+                    "lead_80": look_policy.get("lead_80_color_pairs"),
+                }
+                minima = look_policy.get("minimum_independent_position_clusters")
+                expected_minima = minima if isinstance(minima, Mapping) else {}
+
             for name, artifact in schedule_artifacts.items():
                 _hash(
                     artifact.get("suiteBankSha256"),
@@ -1816,57 +1999,62 @@ class PromotionController:
                     artifact.get("independentClusterIdsSha256"),
                     f"authoritative {name} independent cluster hash",
                 )
-                if look_policy is not None:
-                    pair_key = {
-                        "powered_candidate_vs_champion":
-                            "powered_ordinary_color_pairs_per_matchup",
-                        "powered_candidate_vs_original":
-                            "powered_ordinary_color_pairs_per_matchup",
-                        "standard_candidate_vs_original":
-                            "standard_ordinary_color_pairs",
-                        "lead_40": "lead_40_color_pairs",
-                        "lead_80": "lead_80_color_pairs",
-                    }[name]
-                    expected_pairs = look_policy.get(pair_key)
-                    if (
-                        expected_pairs is not None
-                        and artifact.get("pairCount") != expected_pairs
-                    ):
-                        raise SafetyHalt(
-                            f"authoritative {name} pair count contradicts policy"
-                        )
-                    minima = look_policy.get(
-                        "minimum_independent_position_clusters"
+                expected_pair_count = expected_pairs.get(name)
+                if (
+                    expected_pair_count is not None
+                    and artifact.get("pairCount") != expected_pair_count
+                ):
+                    raise SafetyHalt(
+                        f"authoritative {name} pair count contradicts policy"
                     )
-                    expected_minimum = (
-                        minima.get(name)
-                        if isinstance(minima, Mapping)
-                        else None
+                if artifact.get("visits") != expected_visits[name]:
+                    raise SafetyHalt(
+                        f"authoritative {name} visit count contradicts policy"
                     )
-                    if (
-                        expected_minimum is not None
-                        and artifact.get(
-                            "minimumIndependentPositionClusters"
-                        )
-                        != expected_minimum
-                    ):
-                        raise SafetyHalt(
-                            f"authoritative {name} cluster minimum "
-                            "contradicts policy"
-                        )
-            matrix_kwargs.update(
-                {
-                    "lead_40_schedule_sha": lead40["sha256"],
-                    "lead_80_schedule_sha": lead80["sha256"],
-                    "lead_40_suite_bank_sha": lead40["suiteBankSha256"],
-                    "lead_80_suite_bank_sha": lead80["suiteBankSha256"],
-                    "lead_40_schedule_id": lead40["scheduleId"],
-                    "lead_80_schedule_id": lead80["scheduleId"],
-                }
+                expected_minimum = expected_minima.get(name)
+                if (
+                    expected_minimum is not None
+                    and artifact.get("minimumIndependentPositionClusters")
+                    != expected_minimum
+                ):
+                    raise SafetyHalt(
+                        f"authoritative {name} cluster minimum contradicts policy"
+                    )
+
+            standard = schedule_artifacts.get("standard_candidate_vs_original")
+            standard_schedule_hash = str(
+                standard["sha256"] if standard is not None else powered["sha256"]
             )
-            standard_schedule_hash = str(standard["sha256"])
-            standard_schedule_id = str(standard["scheduleId"])
+            standard_schedule_id = str(
+                standard["scheduleId"]
+                if standard is not None
+                else powered["scheduleId"]
+            )
+            lead40 = schedule_artifacts.get("lead_40")
+            lead80 = schedule_artifacts.get("lead_80")
+            if (lead40 is None) != (lead80 is None):
+                raise SafetyHalt("evaluation plan has only one Lead discovery cell")
+            if lead40 is not None and lead80 is not None:
+                matrix_kwargs.update(
+                    {
+                        "lead_40_schedule_sha": lead40["sha256"],
+                        "lead_80_schedule_sha": lead80["sha256"],
+                        "lead_40_suite_bank_sha": lead40["suiteBankSha256"],
+                        "lead_80_suite_bank_sha": lead80["suiteBankSha256"],
+                        "lead_40_schedule_id": lead40["scheduleId"],
+                        "lead_80_schedule_id": lead80["scheduleId"],
+                    }
+                )
         else:
+            if v2_policy and canonical_stage in {"stage-1", "stage-2"}:
+                raise SafetyHalt(
+                    "Stage 1 and Stage 2 require exact authoritative manifest cells"
+                )
+            ordinary_schedule_hash = (
+                config.confirmation_schedule_hash
+                if confirmation
+                else config.discovery_schedule_hash
+            )
             ordinary_bank_hash, ordinary_schedule_id = bank_binding(
                 ordinary_bank_name, ordinary_schedule_hash
             )
@@ -1879,14 +2067,7 @@ class PromotionController:
             ordinary_path = (
                 self.runtime.confirmation_schedule_path
                 if confirmation
-                else self.runtime.audit_schedule_path
-                if stage in {"integrity", "stage-0"}
                 else self.runtime.discovery_schedule_path
-            )
-            standard_path = (
-                self.runtime.standard_confirmation_schedule_path
-                if confirmation
-                else ordinary_path
             )
             base_artifact = {
                 "stage": canonical_stage,
@@ -1895,48 +2076,47 @@ class PromotionController:
                 "sha256": ordinary_schedule_hash,
                 "scheduleId": ordinary_schedule_id,
                 "suiteBankSha256": ordinary_bank_hash,
+                "visits": powered_visits,
             }
-            for name, comparison in (
-                (
-                    "powered_candidate_vs_champion",
-                    "candidate-vs-champion-powered",
-                ),
-                (
-                    "powered_candidate_vs_original",
-                    "candidate-vs-original-powered",
-                ),
-            ):
+            for name, comparison in cell_coordinates:
+                if name in {
+                    "standard_candidate_vs_original",
+                    "lead_40",
+                    "lead_80",
+                }:
+                    continue
                 schedule_artifacts[name] = {
                     **base_artifact,
                     "cell": name,
                     "comparison": comparison,
                 }
-            schedule_artifacts["standard_candidate_vs_original"] = {
-                **base_artifact,
-                "cell": "standard_candidate_vs_original",
-                "comparison": "candidate-vs-original-standard",
-                "path": str(standard_path),
-                "sha256": standard_schedule_hash,
-            }
-        if confirmation and not authoritative_cells:
-            lead40_bank_hash, lead40_schedule_id = bank_binding(
-                "lead-40", config.lead40_schedule_hash
-            )
-            lead80_bank_hash, lead80_schedule_id = bank_binding(
-                "lead-80", config.lead80_schedule_hash
-            )
-            matrix_kwargs.update(
-                {
-                    "lead_40_schedule_sha": config.lead40_schedule_hash,
-                    "lead_80_schedule_sha": config.lead80_schedule_hash,
-                    "lead_40_suite_bank_sha": lead40_bank_hash,
-                    "lead_80_suite_bank_sha": lead80_bank_hash,
-                    "lead_40_schedule_id": lead40_schedule_id,
-                    "lead_80_schedule_id": lead80_schedule_id,
+            if include_standard_original:
+                schedule_artifacts["standard_candidate_vs_original"] = {
+                    **base_artifact,
+                    "cell": "standard_candidate_vs_original",
+                    "comparison": "candidate-vs-original-standard",
+                    "path": str(self.runtime.standard_confirmation_schedule_path),
+                    "sha256": standard_schedule_hash,
+                    "visits": standard_visits,
                 }
-            )
-            schedule_artifacts.update(
-                {
+            if canonical_stage in {"stage-2", "stage-3"}:
+                lead40_bank_hash, lead40_schedule_id = bank_binding(
+                    "lead-40", config.lead40_schedule_hash
+                )
+                lead80_bank_hash, lead80_schedule_id = bank_binding(
+                    "lead-80", config.lead80_schedule_hash
+                )
+                matrix_kwargs.update(
+                    {
+                        "lead_40_schedule_sha": config.lead40_schedule_hash,
+                        "lead_80_schedule_sha": config.lead80_schedule_hash,
+                        "lead_40_suite_bank_sha": lead40_bank_hash,
+                        "lead_80_suite_bank_sha": lead80_bank_hash,
+                        "lead_40_schedule_id": lead40_schedule_id,
+                        "lead_80_schedule_id": lead80_schedule_id,
+                    }
+                )
+                schedule_artifacts.update({
                     "lead_40": {
                         "cell": "lead_40",
                         "comparison":
@@ -1947,6 +2127,7 @@ class PromotionController:
                         "sha256": config.lead40_schedule_hash,
                         "scheduleId": lead40_schedule_id,
                         "suiteBankSha256": lead40_bank_hash,
+                        "visits": lead_visits,
                     },
                     "lead_80": {
                         "cell": "lead_80",
@@ -1958,9 +2139,9 @@ class PromotionController:
                         "sha256": config.lead80_schedule_hash,
                         "scheduleId": lead80_schedule_id,
                         "suiteBankSha256": lead80_bank_hash,
+                        "visits": lead_visits,
                     },
-                }
-            )
+                })
         specs = tuple(
             build_evaluation_matrix(
                 candidate_model_sha=candidate_hash,
@@ -1996,6 +2177,7 @@ class PromotionController:
                 spec.schedule_sha != artifact["sha256"]
                 or spec.schedule_id != artifact["scheduleId"]
                 or spec.suite_bank_sha != artifact["suiteBankSha256"]
+                or spec.max_visits != artifact["visits"]
                 or spec.look != canonical_look
                 or spec.stage != canonical_stage
             ):
@@ -2009,20 +2191,23 @@ class PromotionController:
             [spec.to_dict() for spec in specs]
         )
         return EvaluationMatrixPlan(
-            specs,
-            evaluation_key,
-            config_hash,
-            schedule_hash,
-            config.policy_hash,
-            config.selfplay_config_hash,
-            required_topology,
-            canonical_stage,
-            canonical_look,
-            str(self.runtime.policy_path),
-            policy_version,
-            str(manifest_path),
-            config.suite_manifest_hash,
-            schedule_artifacts,
+            specs=specs,
+            candidate_hash=candidate_hash,
+            champion_hash=champion_hash,
+            original_hash=config.original_hash,
+            evaluation_key=evaluation_key,
+            config_hash=config_hash,
+            schedule_hash=schedule_hash,
+            policy_hash=config.policy_hash,
+            selfplay_config_hash=config.selfplay_config_hash,
+            topology=required_topology,
+            stage=canonical_stage,
+            look=canonical_look,
+            policy_path=str(self.runtime.policy_path),
+            policy_version=policy_version,
+            suite_manifest_path=str(manifest_path),
+            suite_manifest_hash=config.suite_manifest_hash,
+            schedule_artifacts=schedule_artifacts,
         )
 
     def evaluate_or_recommend(
@@ -2030,7 +2215,7 @@ class PromotionController:
     ) -> Mapping[str, Any]:
         """Return plans in recommendation mode or injected gate output in automatic mode."""
 
-        if not plan.specs:
+        if not plan.specs and plan.stage != "stage-0":
             return {"decision": "INCONCLUSIVE", "reason": "missing-evaluation-matrix"}
         if self.recommendation_only:
             return {"decision": "RECOMMEND", "plan": plan.to_dict()}
@@ -2093,6 +2278,11 @@ class PromotionController:
             "policy_version": plan.policy_version,
             "suite_manifest_path": plan.suite_manifest_path,
             "suite_manifest_hash": plan.suite_manifest_hash,
+            "config_hash": plan.config_hash,
+            "powered_config_path": str(self.runtime.powered_config_path),
+            "powered_config_hash": self.runtime.controller.powered_config_hash,
+            "standard_config_path": str(self.runtime.standard_config_path),
+            "standard_config_hash": self.runtime.controller.standard_config_hash,
             "evaluation_key": plan.evaluation_key,
             "stage": plan.stage,
             "look": plan.look,
@@ -2199,6 +2389,20 @@ class PromotionController:
                     str(self.runtime.suites / "manifest.json"),
                 "suite_manifest_hash":
                     self.runtime.controller.suite_manifest_hash,
+                "config_hash": canonical_sha256(
+                    sorted(
+                        {
+                            self.runtime.controller.powered_config_hash,
+                            self.runtime.controller.standard_config_hash,
+                        }
+                    )
+                ),
+                "powered_config_path": str(self.runtime.powered_config_path),
+                "powered_config_hash":
+                    self.runtime.controller.powered_config_hash,
+                "standard_config_path": str(self.runtime.standard_config_path),
+                "standard_config_hash":
+                    self.runtime.controller.standard_config_hash,
             }
             if (
                 not isinstance(request, dict)
@@ -2325,8 +2529,13 @@ class PromotionController:
 
         if self.recommendation_only:
             raise SafetyHalt("configured evaluation execution requires automatic mode")
-        if not plan.specs:
+        if not plan.specs and plan.stage != "stage-0":
             raise SafetyHalt("configured evaluation has no matrix specifications")
+        if (
+            plan.candidate_hash != candidate.model_hash
+            or plan.original_hash != self.runtime.controller.original_hash
+        ):
+            raise SafetyHalt("configured evaluation model identities contradict plan")
         root = self.runtime.evaluations / "controller-adapter" / plan.evaluation_key
         root.mkdir(parents=True, exist_ok=True)
         plan_path = root / "plan.json"
@@ -2340,25 +2549,32 @@ class PromotionController:
             ),
             None,
         )
-        if champion_spec is None:
+        if champion_spec is None and plan.stage != "stage-0":
             raise SafetyHalt("evaluation matrix has no champion comparison")
+        tested_champion_hash = (
+            plan.champion_hash
+            if champion_spec is None
+            else champion_spec.reference_model_sha
+        )
+        if tested_champion_hash != plan.champion_hash:
+            raise SafetyHalt("champion comparison contradicts plan identity")
         champion_model_path = self._resolve_tested_champion_model_path(
-            champion_spec.reference_model_sha
+            tested_champion_hash
         )
         stage0_request = self._stage0_request(
-            plan, candidate, champion_spec.reference_model_sha
+            plan, candidate, tested_champion_hash
         )
 
         if not evidence_path.exists():
-            powered_champion = plan.schedule_artifacts[
+            powered_champion = plan.schedule_artifacts.get(
                 "powered_candidate_vs_champion"
-            ]
-            powered_original = plan.schedule_artifacts[
+            )
+            powered_original = plan.schedule_artifacts.get(
                 "powered_candidate_vs_original"
-            ]
-            standard_original = plan.schedule_artifacts[
+            )
+            standard_original = plan.schedule_artifacts.get(
                 "standard_candidate_vs_original"
-            ]
+            )
             lead40 = plan.schedule_artifacts.get("lead_40")
             lead80 = plan.schedule_artifacts.get("lead_80")
 
@@ -2389,7 +2605,7 @@ class PromotionController:
                     self._configured_stage0_probe(
                         plan,
                         candidate,
-                        champion_hash=champion_spec.reference_model_sha,
+                        champion_hash=tested_champion_hash,
                         champion_model_path=champion_model_path,
                         request_path=stage0_request_path,
                         request_hash=stage0_request_hash,
@@ -2424,7 +2640,7 @@ class PromotionController:
                     request_path=stage0_request_path,
                     request_hash=stage0_request_hash,
                     candidate_hash=candidate.model_hash,
-                    champion_hash=champion_spec.reference_model_sha,
+                    champion_hash=tested_champion_hash,
                 )
 
             stage1_evidence_path: Any = ""
@@ -2516,7 +2732,7 @@ class PromotionController:
                     "candidate_model": candidate.path / "model.bin.gz",
                     "candidate_hash": candidate.model_hash,
                     "champion_model": champion_model_path,
-                    "champion_hash": champion_spec.reference_model_sha,
+                    "champion_hash": tested_champion_hash,
                     "original_model": self.runtime.original_model_path,
                     "original_hash": self.runtime.controller.original_hash,
                     "policy": plan.policy_path,
@@ -2530,30 +2746,36 @@ class PromotionController:
                     "standard_config": self.runtime.standard_config_path,
                     "standard_config_hash":
                         self.runtime.controller.standard_config_hash,
-                    "powered_schedule": powered_champion["path"],
-                    "powered_schedule_hash": powered_champion["sha256"],
-                    "powered_schedule_id": powered_champion["scheduleId"],
+                    "powered_schedule":
+                        schedule_value(powered_champion, "path"),
+                    "powered_schedule_hash":
+                        schedule_value(powered_champion, "sha256"),
+                    "powered_schedule_id":
+                        schedule_value(powered_champion, "scheduleId"),
                     "powered_champion_schedule":
-                        powered_champion["path"],
+                        schedule_value(powered_champion, "path"),
                     "powered_champion_schedule_hash":
-                        powered_champion["sha256"],
+                        schedule_value(powered_champion, "sha256"),
                     "powered_champion_schedule_id":
-                        powered_champion["scheduleId"],
-                    "powered_original_schedule": powered_original["path"],
+                        schedule_value(powered_champion, "scheduleId"),
+                    "powered_original_schedule":
+                        schedule_value(powered_original, "path"),
                     "powered_original_schedule_hash":
-                        powered_original["sha256"],
+                        schedule_value(powered_original, "sha256"),
                     "powered_original_schedule_id":
-                        powered_original["scheduleId"],
-                    "standard_schedule": standard_original["path"],
-                    "standard_schedule_hash": standard_original["sha256"],
+                        schedule_value(powered_original, "scheduleId"),
+                    "standard_schedule":
+                        schedule_value(standard_original, "path"),
+                    "standard_schedule_hash":
+                        schedule_value(standard_original, "sha256"),
                     "standard_schedule_id":
-                        standard_original["scheduleId"],
+                        schedule_value(standard_original, "scheduleId"),
                     "standard_original_schedule":
-                        standard_original["path"],
+                        schedule_value(standard_original, "path"),
                     "standard_original_schedule_hash":
-                        standard_original["sha256"],
+                        schedule_value(standard_original, "sha256"),
                     "standard_original_schedule_id":
-                        standard_original["scheduleId"],
+                        schedule_value(standard_original, "scheduleId"),
                     "lead40_schedule": schedule_value(lead40, "path"),
                     "lead40_schedule_hash":
                         schedule_value(lead40, "sha256"),
@@ -2612,7 +2834,7 @@ class PromotionController:
             "finalized": True,
             "controller_stage": controller_stage,
             "candidate_hash": candidate.model_hash,
-            "tested_champion_hash": champion_spec.reference_model_sha,
+            "tested_champion_hash": tested_champion_hash,
             "original_hash": self.runtime.controller.original_hash,
             "evaluation_key": plan.evaluation_key,
             "config_hash": plan.config_hash,
@@ -2716,7 +2938,7 @@ class PromotionController:
             request_path=evidence_request_path,
             request_hash=evidence_request_hash,
             candidate_hash=candidate.model_hash,
-            champion_hash=champion_spec.reference_model_sha,
+            champion_hash=tested_champion_hash,
         )
         if stage0_request is not None:
             request_path, request_hash = stage0_request
@@ -3370,7 +3592,7 @@ class PromotionController:
         )
         if canonical_sha256(gpu_handoff) != gpu_handoff_hash:
             raise SafetyHalt("gate GPU handoff proof hash mismatch")
-        if not plan.specs:
+        if not plan.specs and plan.stage != "stage-0":
             decision = "INCONCLUSIVE"
         path = self.runtime.reports / f"{plan.evaluation_key}.final.json"
         stable_fields = {

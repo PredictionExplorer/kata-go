@@ -32,7 +32,9 @@ from risk_score.build_evaluation_suites import semantic_position_sha256
 from risk_score.generate_schedule import validate_position
 
 SCHEMA_VERSION = 1
-RUNNER_CONTRACT = "risk-score-pair-safe-evaluation-runner-v2"
+RUNNER_CONTRACT_V2 = "risk-score-pair-safe-evaluation-runner-v2"
+RUNNER_CONTRACT_V3 = "risk-score-pair-safe-evaluation-runner-v3"
+RUNNER_CONTRACT = RUNNER_CONTRACT_V3
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _REQUIRED_SCHEDULE_FIELDS = (
     "schemaVersion",
@@ -113,6 +115,7 @@ class EvaluationSpec:
     stage: str
     look: str
     topology: str
+    max_visits: int
     suite_manifest_sha: Optional[str] = None
     suite_bank_sha: Optional[str] = None
     schedule_id: Optional[str] = None
@@ -149,6 +152,8 @@ class EvaluationSpec:
                 or "\r" in value
             ):
                 raise ValueError(f"{field_name} must be a nonempty single-line string")
+        if type(self.max_visits) is not int or self.max_visits <= 0:
+            raise ValueError("max_visits must be a positive integer")
         if self.schedule_id is not None:
             _nonempty_string(self.schedule_id, "schedule_id")
 
@@ -311,6 +316,7 @@ def compute_evaluation_key(spec: EvaluationSpec) -> str:
             "stage": spec.stage,
             "look": spec.look,
             "topology": spec.topology,
+            "maxVisits": spec.max_visits,
             "suiteManifestSha256": spec.suite_manifest_sha,
             "suiteBankSha256": spec.suite_bank_sha,
             "scheduleId": spec.schedule_id,
@@ -1021,6 +1027,7 @@ def build_match_command(
     result_path: Path,
     *,
     game_count: int,
+    max_visits: int,
     move_path: Optional[Path] = None,
     candidate_name: str = "candidate",
     reference_name: str = "reference",
@@ -1030,6 +1037,8 @@ def build_match_command(
 
     if type(game_count) is not int or game_count <= 0:
         raise ValueError("game_count must be a positive integer")
+    if type(max_visits) is not int or max_visits <= 0:
+        raise ValueError("max_visits must be a positive integer")
     overrides = [
         "numBots=2",
         f"botName0={_override_value(candidate_name, 'candidate_name')}",
@@ -1039,6 +1048,7 @@ def build_match_command(
         f"deterministicScheduleFile={_override_value(schedule_path, 'schedule_path')}",
         f"matchResultJsonlFile={_override_value(result_path, 'result_path')}",
         f"numGamesTotal={game_count}",
+        f"maxVisits={max_visits}",
     ]
     if move_path is None:
         overrides.append("matchMoveJsonlFile=")
@@ -1296,6 +1306,7 @@ def resolve_manifest_cell(
     pair_count = cell.get("color_pairs")
     row_count = cell.get("schedule_row_count")
     minimum_clusters = cell.get("minimum_independent_position_clusters")
+    visits = cell.get("visits")
     if (
         type(pair_count) is not int
         or pair_count <= 0
@@ -1304,9 +1315,11 @@ def resolve_manifest_cell(
         or type(minimum_clusters) is not int
         or minimum_clusters <= 0
         or minimum_clusters > pair_count
+        or type(visits) is not int
+        or visits <= 0
     ):
         raise EvaluationValidationError(
-            "suite manifest cell has invalid pair/row/cluster quotas"
+            "suite manifest cell has invalid pair/row/cluster/visit quotas"
         )
     cluster_ids = cell.get("independent_cluster_ids")
     if not (
@@ -1357,6 +1370,10 @@ def build_evaluation_matrix(
     stage: str,
     look: str,
     topology: str,
+    powered_visits: int,
+    standard_visits: int,
+    include_powered_original: bool = True,
+    include_standard_original: bool = True,
     include_standard_champion: bool = False,
     lead_40_schedule_sha: Optional[str] = None,
     lead_80_schedule_sha: Optional[str] = None,
@@ -1368,8 +1385,20 @@ def build_evaluation_matrix(
     standard_schedule_id: Optional[str] = None,
     lead_40_schedule_id: Optional[str] = None,
     lead_80_schedule_id: Optional[str] = None,
+    lead_visits: Optional[int] = None,
 ) -> Tuple[EvaluationSpec, ...]:
     """Construct the policy-independent powered/standard comparison matrix."""
+
+    for value, role in (
+        (powered_visits, "powered_visits"),
+        (standard_visits, "standard_visits"),
+    ):
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"{role} must be a positive integer")
+    if lead_visits is None:
+        lead_visits = powered_visits
+    if type(lead_visits) is not int or lead_visits <= 0:
+        raise ValueError("lead_visits must be a positive integer")
 
     coordinates = [
         (
@@ -1380,8 +1409,11 @@ def build_evaluation_matrix(
             powered_schedule_sha,
             ordinary_suite_bank_sha,
             powered_schedule_id,
+            powered_visits,
         ),
-        (
+    ]
+    if include_powered_original:
+        coordinates.append((
             "candidate-vs-original-powered",
             suite,
             original_model_sha,
@@ -1389,8 +1421,8 @@ def build_evaluation_matrix(
             powered_schedule_sha,
             ordinary_suite_bank_sha,
             powered_schedule_id,
-        ),
-    ]
+            powered_visits,
+        ))
     if include_standard_champion:
         coordinates.append(
             (
@@ -1401,10 +1433,11 @@ def build_evaluation_matrix(
                 standard_schedule_sha,
                 ordinary_suite_bank_sha,
                 standard_schedule_id,
+                standard_visits,
             )
         )
-    coordinates.append(
-        (
+    if include_standard_original:
+        coordinates.append((
             "candidate-vs-original-standard",
             suite,
             original_model_sha,
@@ -1412,8 +1445,8 @@ def build_evaluation_matrix(
             standard_schedule_sha,
             ordinary_suite_bank_sha,
             standard_schedule_id,
-        )
-    )
+            standard_visits,
+        ))
     if (lead_40_schedule_sha is None) != (lead_80_schedule_sha is None):
         raise ValueError(
             "confirmation requires both Lead-40 and Lead-80 schedule hashes"
@@ -1421,10 +1454,12 @@ def build_evaluation_matrix(
     if lead_40_schedule_sha is not None and lead_80_schedule_sha is not None:
         normalized_stage = stage.lower().replace("_", "-")
         if "confirmation" not in normalized_stage and normalized_stage not in (
+            "stage-2",
             "stage-3",
+            "2",
             "3",
         ):
-            raise ValueError("Lead confirmation cells require a confirmation stage")
+            raise ValueError("Lead cells require a finalist or confirmation stage")
         coordinates.extend(
             (
                 (
@@ -1435,6 +1470,7 @@ def build_evaluation_matrix(
                     lead_40_schedule_sha,
                     lead_40_suite_bank_sha,
                     lead_40_schedule_id,
+                    lead_visits,
                 ),
                 (
                     "candidate-vs-champion-powered-lead-80",
@@ -1444,6 +1480,7 @@ def build_evaluation_matrix(
                     lead_80_schedule_sha,
                     lead_80_suite_bank_sha,
                     lead_80_schedule_id,
+                    lead_visits,
                 ),
             )
         )
@@ -1460,6 +1497,7 @@ def build_evaluation_matrix(
             stage=stage,
             look=look,
             topology=topology,
+            max_visits=max_visits,
             suite_manifest_sha=suite_manifest_sha,
             suite_bank_sha=suite_bank_sha,
             schedule_id=schedule_id,
@@ -1472,6 +1510,7 @@ def build_evaluation_matrix(
             schedule_sha,
             suite_bank_sha,
             schedule_id,
+            max_visits,
         ) in coordinates
     )
 
@@ -1570,6 +1609,7 @@ class EvaluationRunner:
         candidate_model_path: Path,
         reference_model_path: Path,
         attempt: int,
+        max_visits: int,
     ) -> CommandPlan:
         schedule_path, result_path, move_path = self._paths_for_shard(
             partial_dir, shard, attempt
@@ -1585,6 +1625,7 @@ class EvaluationRunner:
                 schedule_path,
                 result_path,
                 game_count=len(shard.rows),
+                max_visits=max_visits,
                 move_path=move_path,
                 extra_args=self.extra_args,
             ),
@@ -1689,9 +1730,9 @@ class EvaluationRunner:
                 raise EvaluationValidationError(
                     "suite manifest has duplicate exact evaluation coordinates"
                 )
-            if not matching_exact and spec.stage == "stage-3":
+            if not matching_exact and spec.stage in {"stage-1", "stage-2", "stage-3"}:
                 raise EvaluationValidationError(
-                    "suite manifest has no exact Stage-3 evaluation cell"
+                    f"suite manifest has no exact {spec.stage} evaluation cell"
                 )
         else:
             matching_exact = []
@@ -1720,6 +1761,7 @@ class EvaluationRunner:
                 "schedule_row_count": len(schedule_rows),
                 "color_pairs": len({row["pairId"] for row in schedule_rows}),
                 "bank_hash": spec.suite_bank_sha,
+                "visits": spec.max_visits,
             }
             actual_values = {key: cell.get(key) for key in expected_values}
             if actual_values != expected_values:
@@ -1895,6 +1937,7 @@ class EvaluationRunner:
                 candidate_model_path,
                 reference_model_path,
                 1,
+                spec.max_visits,
             )
             for shard in shards
         )
@@ -2127,6 +2170,7 @@ class EvaluationRunner:
                 candidate_model_path,
                 reference_model_path,
                 attempt,
+                plan.spec.max_visits,
             )
             failure_path = (
                 plan.partial_dir
@@ -2234,6 +2278,7 @@ class EvaluationRunner:
                 "suite": plan.spec.suite,
                 "stage": plan.spec.stage,
                 "look": plan.spec.look,
+                "maxVisits": plan.spec.max_visits,
                 "gameCount": len(plan.schedule_rows),
                 "colorPairCount": len({row["pairId"] for row in plan.schedule_rows}),
             },
@@ -2316,6 +2361,7 @@ class EvaluationRunner:
             "suite": plan.spec.suite,
             "stage": plan.spec.stage,
             "look": plan.spec.look,
+            "maxVisits": plan.spec.max_visits,
             "gameCount": len(plan.schedule_rows),
             "colorPairCount": len({row["pairId"] for row in plan.schedule_rows}),
         }

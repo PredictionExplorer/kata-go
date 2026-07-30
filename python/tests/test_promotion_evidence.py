@@ -13,6 +13,7 @@ from risk_score.build_evaluation_suites import (
 from risk_score.evaluation_runner import (
     EvaluationRunner,
     EvaluationSpec,
+    RUNNER_CONTRACT_V2,
     canonical_json,
     canonical_sha256,
     file_sha256,
@@ -31,6 +32,7 @@ from risk_score.promotion_evidence import (
     derive_discovery_evidence,
     main,
     publish_controller_evidence,
+    _load_generic_runner_cell,
 )
 
 DEFAULT_V2 = Path(__file__).parents[1] / "risk_score" / "promotion_policy_v2.json"
@@ -70,8 +72,8 @@ def small_policy(path):
     stages["stage_2_finalist_selection"].update(
         {
             "ordinary_color_pairs": 2,
-            "lead_40_color_pairs": 1,
-            "lead_80_color_pairs": 1,
+            "lead_40_color_pairs": 2,
+            "lead_80_color_pairs": 2,
         }
     )
     stages["deep_audit"].update(
@@ -222,8 +224,8 @@ def build_fixture(tmp_path):
     source = tmp_path / "positions.jsonl"
     rows = (
         [position(index, "ordinary") for index in range(6)]
-        + [position(100 + index, "lead-40") for index in range(5)]
-        + [position(200 + index, "lead-80") for index in range(6)]
+        + [position(100 + index, "lead-40") for index in range(6)]
+        + [position(200 + index, "lead-80") for index in range(7)]
         + [position(300, "tactical"), position(301, "exploitability")]
     )
     source.write_text("".join(suite_json(row) + "\n" for row in rows), encoding="utf-8")
@@ -272,6 +274,7 @@ def build_fixture(tmp_path):
             stage=cell["stage"],
             look=cell["look"],
             topology="7-workers-100-threads",
+            max_visits=cell["visits"],
             suite_manifest_sha=suites.manifest_sha256,
             suite_bank_sha=cell["bank_hash"],
             schedule_id=cell["schedule_id"],
@@ -308,6 +311,7 @@ def build_fixture(tmp_path):
             "pairCount": cell["color_pairs"],
             "suiteBankSha256": cell["bank_hash"],
             "independentClusterIdsSha256": cell["independent_cluster_ids_hash"],
+            "visits": cell["visits"],
         }
 
     discovery_bank = next(
@@ -416,6 +420,10 @@ def build_fixture(tmp_path):
         sorted({spec["schedule_sha"] for spec in runner_specs})
     )
     plan = {
+        "planContract": "risk-score-evaluation-plan-v2",
+        "candidateModelSha256": file_sha256(candidate),
+        "championModelSha256": file_sha256(champion),
+        "originalModelSha256": file_sha256(original),
         "evaluationKey": "matrix-" + canonical_sha256(runner_specs),
         "configHash": config_hash,
         "scheduleHash": schedule_hash,
@@ -429,6 +437,7 @@ def build_fixture(tmp_path):
         "suiteManifestPath": str(suites.manifest_path),
         "suiteManifestHash": suites.manifest_sha256,
         "scheduleArtifacts": schedule_artifacts,
+        "cellOrder": list(CELL_ORDER),
         "specs": runner_specs,
     }
     return {
@@ -555,72 +564,56 @@ def test_missing_or_malformed_stage0_probe_fails_closed(tmp_path):
 
 def test_nonconfirmation_stage_gate_is_derived_from_runner_statistics(tmp_path):
     fixture = build_fixture(tmp_path)
-    discovery_bank = next(
-        bank
-        for bank in fixture["suites"].manifest["banks"]
-        if bank["qualifiedName"] == "discovery"
+    cell = resolve_manifest_cell(
+        fixture["suites"].manifest,
+        stage="stage-1",
+        look="automatic",
+        comparison="candidate-vs-champion-powered",
+        suite="discovery",
     )
-    schedule_path = fixture["suites"].output_dir / discovery_bank["schedule"]["path"]
-    definitions = (
-        (
-            "powered_candidate_vs_champion",
-            "candidate-vs-champion-powered",
-            fixture["champion"],
-            fixture["powered"],
-        ),
-        (
-            "powered_candidate_vs_original",
-            "candidate-vs-original-powered",
-            fixture["original"],
-            fixture["powered"],
-        ),
-        (
-            "standard_candidate_vs_original",
-            "candidate-vs-original-standard",
-            fixture["original"],
-            fixture["standard"],
-        ),
+    schedule_path = fixture["suites"].output_dir / cell["schedule_path"]
+    spec = EvaluationSpec(
+        candidate_model_sha=file_sha256(fixture["candidate"]),
+        reference_model_sha=file_sha256(fixture["champion"]),
+        original_model_sha=file_sha256(fixture["original"]),
+        config_sha=file_sha256(fixture["powered"]),
+        schedule_sha=cell["schedule_hash"],
+        policy_sha=suite_hash(fixture["policy"]),
+        comparison=cell["comparison"],
+        suite=cell["suite"],
+        stage="stage-1",
+        look="automatic",
+        topology="7-workers-100-threads",
+        max_visits=cell["visits"],
+        suite_manifest_sha=fixture["suites"].manifest_sha256,
+        suite_bank_sha=cell["bank_hash"],
+        schedule_id=cell["schedule_id"],
     )
-    manifests = {}
-    specs = []
-    for name, comparison, reference, config in definitions:
-        spec = EvaluationSpec(
-            candidate_model_sha=file_sha256(fixture["candidate"]),
-            reference_model_sha=file_sha256(reference),
-            original_model_sha=file_sha256(fixture["original"]),
-            config_sha=file_sha256(config),
-            schedule_sha=discovery_bank["schedule"]["sha256"],
-            policy_sha=suite_hash(fixture["policy"]),
-            comparison=comparison,
-            suite="discovery",
-            stage="stage-1",
-            look="screen",
-            topology="7-workers-100-threads",
-            suite_manifest_sha=fixture["suites"].manifest_sha256,
-            suite_bank_sha=discovery_bank["positions"]["sha256"],
-            schedule_id=discovery_bank["schedule"]["scheduleId"],
-        )
-        outcome = EvaluationRunner(
-            katago_binary=fixture["binary"],
-            config_path=config,
-            output_root=tmp_path / "stage-1-evaluations",
-            shard_count=1,
-            max_parallel=1,
-            max_attempts=1,
-            include_move_traces=True,
-            subprocess_runner=FakeMatch(),
-        ).run(
-            spec,
-            schedule_path,
-            fixture["candidate"],
-            reference,
-            original_model_path=fixture["original"],
-            policy_path=fixture["policy_path"],
-            suite_manifest_path=fixture["suites"].manifest_path,
-        )
-        manifests[name] = outcome.manifest_path
-        specs.append(spec.to_dict())
+    outcome = EvaluationRunner(
+        katago_binary=fixture["binary"],
+        config_path=fixture["powered"],
+        output_root=tmp_path / "stage-1-evaluations",
+        shard_count=1,
+        max_parallel=1,
+        max_attempts=1,
+        include_move_traces=True,
+        subprocess_runner=FakeMatch(),
+    ).run(
+        spec,
+        schedule_path,
+        fixture["candidate"],
+        fixture["champion"],
+        original_model_path=fixture["original"],
+        policy_path=fixture["policy_path"],
+        suite_manifest_path=fixture["suites"].manifest_path,
+    )
+    manifests = {"powered_candidate_vs_champion": outcome.manifest_path}
+    specs = [spec.to_dict()]
     plan = {
+        "planContract": "risk-score-evaluation-plan-v2",
+        "candidateModelSha256": file_sha256(fixture["candidate"]),
+        "championModelSha256": file_sha256(fixture["champion"]),
+        "originalModelSha256": file_sha256(fixture["original"]),
         "evaluationKey": "matrix-" + canonical_sha256(specs),
         "configHash": canonical_sha256(sorted({spec["config_sha"] for spec in specs})),
         "scheduleHash": canonical_sha256(
@@ -632,10 +625,28 @@ def test_nonconfirmation_stage_gate_is_derived_from_runner_statistics(tmp_path):
         "selfplayConfigHash": "4" * 64,
         "topology": "7-workers-100-threads",
         "stage": "stage-1",
-        "look": "screen",
+        "look": "automatic",
         "suiteManifestPath": str(fixture["suites"].manifest_path),
         "suiteManifestHash": fixture["suites"].manifest_sha256,
-        "scheduleArtifacts": {},
+        "scheduleArtifacts": {
+            "powered_candidate_vs_champion": {
+                "cell": "powered_candidate_vs_champion",
+                "comparison": cell["comparison"],
+                "stage": "stage-1",
+                "look": "automatic",
+                "path": str(schedule_path),
+                "sha256": cell["schedule_hash"],
+                "scheduleId": cell["schedule_id"],
+                "pairCount": cell["color_pairs"],
+                "suiteBankSha256": cell["bank_hash"],
+                "independentClusterIdsSha256":
+                    cell["independent_cluster_ids_hash"],
+                "minimumIndependentPositionClusters":
+                    cell["minimum_independent_position_clusters"],
+                "visits": cell["visits"],
+            }
+        },
+        "cellOrder": ["powered_candidate_vs_champion"],
         "specs": specs,
     }
     evidence = build_nonconfirmation_controller_evidence(
@@ -654,6 +665,41 @@ def test_nonconfirmation_stage_gate_is_derived_from_runner_statistics(tmp_path):
         }
     )
     assert "derived_artifacts" in evidence["stage_gate"]
+
+    incomplete_stage_2 = copy.deepcopy(plan)
+    incomplete_stage_2["stage"] = "stage-2"
+    with pytest.raises(PromotionEvidenceError, match="cellOrder"):
+        build_nonconfirmation_controller_evidence(
+            incomplete_stage_2,
+            runner_manifests=manifests,
+            policy_path=fixture["policy_path"],
+            bootstrap_replications=9,
+        )
+
+
+def test_historical_runner_v2_bundle_remains_replayable(tmp_path):
+    fixture = build_fixture(tmp_path)
+    current_path = fixture["runner_manifests"][
+        "powered_candidate_vs_champion"
+    ]
+    legacy = json.loads(current_path.read_text(encoding="utf-8"))
+    legacy["runnerContract"] = RUNNER_CONTRACT_V2
+    legacy["evaluationSpec"].pop("max_visits")
+    legacy["cell"].pop("maxVisits")
+    payload = dict(legacy)
+    payload.pop("manifestPayloadSha256")
+    legacy["manifestPayloadSha256"] = canonical_sha256(payload)
+    legacy_path = current_path.parent / "legacy-v2-manifest.json"
+    write_json(legacy_path, legacy)
+
+    loaded = _load_generic_runner_cell(
+        legacy_path,
+        cell_name="powered_candidate_vs_champion",
+        policy_hash=suite_hash(fixture["policy"]),
+        runner_contract=RUNNER_CONTRACT_V2,
+    )
+    assert loaded.manifest["runnerContract"] == RUNNER_CONTRACT_V2
+    assert "max_visits" not in loaded.manifest["evaluationSpec"]
 
 
 def test_atomic_cli_publication_is_canonical_and_idempotent(tmp_path):

@@ -136,6 +136,11 @@ def passing_evidence(
     )
     routine_alpha = alpha_look["routine_one_sided_alpha"]
     catastrophe_alpha = alpha_look["catastrophe_one_sided_alpha"]
+    runner_contract = (
+        "risk-score-pair-safe-evaluation-runner-v3"
+        if policy.get("schema_version") == 2
+        else "risk-score-pair-safe-evaluation-runner-v2"
+    )
     powered_pairs = stage_look["powered_ordinary_color_pairs_per_matchup"]
     standard_pairs = stage_look["standard_ordinary_color_pairs"]
     lead_40_pairs = stage_look["lead_40_color_pairs"]
@@ -231,6 +236,7 @@ def passing_evidence(
             "comparison": definitions[cell_name]["comparison"],
             "suite": definitions[cell_name]["suite"],
             "search_mode": definitions[cell_name]["search_mode"],
+            "visits": definitions[cell_name]["visits"],
             "color_pairs": definitions[cell_name]["pairs"],
             "minimum_independent_position_clusters": definitions[cell_name][
                 "minimum_clusters"
@@ -327,6 +333,8 @@ def passing_evidence(
             "suite_bank_sha": suite_hash,
             "schedule_id": schedule_id,
         }
+        if policy.get("schema_version") == 2:
+            runner_spec["max_visits"] = definition["visits"]
         execution_manifest = {
             "katagoBinarySha256": binary_hash,
             "moveTraces": True,
@@ -341,14 +349,14 @@ def passing_evidence(
         }
         runner_evaluation_key = "eval-" + canonical_hash(
             {
-                "runnerContract": "risk-score-pair-safe-evaluation-runner-v2",
+                "runnerContract": runner_contract,
                 "evaluationSpec": runner_spec,
                 "execution": execution_manifest,
             }
         )
         runner_payload = {
             "schemaVersion": 1,
-            "runnerContract": "risk-score-pair-safe-evaluation-runner-v2",
+            "runnerContract": runner_contract,
             "evaluationKey": runner_evaluation_key,
             "evaluationSpec": runner_spec,
             "execution": execution_manifest,
@@ -390,6 +398,8 @@ def passing_evidence(
             },
             "shards": [],
         }
+        if policy.get("schema_version") == 2:
+            runner_payload["cell"]["maxVisits"] = definition["visits"]
         runner_manifest = dict(runner_payload)
         runner_manifest["manifestPayloadSha256"] = canonical_hash(runner_payload)
         runner_manifest_hash = canonical_file_hash(runner_manifest)

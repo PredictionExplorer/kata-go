@@ -20,6 +20,10 @@ from risk_score.generate_schedule import (
     build_schedule,
     validate_position,
 )
+from risk_score.position_samples import (
+    semantic_position as _shared_semantic_position,
+    semantic_position_sha256 as _shared_semantic_position_sha256,
+)
 
 SCHEMA_VERSION = 2
 GENERATOR_CONTRACT = "risk-score-content-addressed-evaluation-suites-v2"
@@ -48,6 +52,13 @@ STAGE_3_CELL_ORDER = (
     "powered_candidate_vs_champion",
     "powered_candidate_vs_original",
     "standard_candidate_vs_original",
+    "lead_40",
+    "lead_80",
+)
+STAGE_1_CELL_ORDER = ("powered_candidate_vs_champion",)
+STAGE_2_CELL_ORDER = (
+    "powered_candidate_vs_champion",
+    "powered_candidate_vs_original",
     "lead_40",
     "lead_80",
 )
@@ -156,23 +167,11 @@ def semantic_position(position: Mapping[str, Any]) -> Dict[str, Any]:
     by changing annotations.
     """
 
-    validate_position(dict(position), "semantic position")
-    return {
-        key: position[key]
-        for key in (
-            "xSize",
-            "ySize",
-            "board",
-            "nextPla",
-            "moveLocs",
-            "movePlas",
-            "initialTurnNumber",
-        )
-    }
+    return _shared_semantic_position(position)
 
 
 def semantic_position_sha256(position: Mapping[str, Any]) -> str:
-    return canonical_sha256(semantic_position(position))
+    return _shared_semantic_position_sha256(position)
 
 
 def file_sha256(path: Path) -> str:
@@ -1101,6 +1100,10 @@ def build_evaluation_suites(
             return artifact
 
         if policy_plan.exact_quota_contract:
+            stages = policy_plan.policy["evaluation_stages"]
+            stage_1 = stages["stage_1_cheap_paired_screen"]
+            stage_2 = stages["stage_2_finalist_selection"]
+            stage_3 = stages["stage_3_promotion_confirmation"]
             matrix = policy_plan.policy.get("required_confirmation_matrix")
             if not isinstance(matrix, dict) or set(matrix) != set(STAGE_3_CELL_ORDER):
                 raise ValueError(
@@ -1108,6 +1111,162 @@ def build_evaluation_suites(
                     "the five Stage-3 cells"
                 )
             latest_look_number = policy_plan.stage_3_looks[-1]["look_number"]
+
+            def append_cell(
+                *,
+                cell_name: str,
+                stage: str,
+                look: str,
+                comparison: str,
+                suite: str,
+                search_mode: str,
+                qualified_bank_name: str,
+                pair_count: int,
+                minimum_clusters: int,
+                visits: int,
+                maximal_look_schedule: bool,
+            ) -> None:
+                for value, source in (
+                    (comparison, "comparison"),
+                    (suite, "suite"),
+                    (search_mode, "search_mode"),
+                ):
+                    if not isinstance(value, str) or not value:
+                        raise ValueError(
+                            f"{stage} {cell_name} {source} must be nonempty"
+                        )
+                visits = _positive_policy_count(
+                    visits, f"{stage} {cell_name} visits"
+                )
+                artifact = schedule_prefix(qualified_bank_name, pair_count)
+                prefix_rows = artifact["rows"]
+                pair_ids = list(dict.fromkeys(row["pairId"] for row in prefix_rows))
+                position_ids = sorted(set(row["positionId"] for row in prefix_rows))
+                independent_cluster_ids = list(
+                    dict.fromkeys(
+                        row["independentClusterId"] for row in prefix_rows
+                    )
+                )
+                if len(pair_ids) != pair_count:
+                    raise AssertionError(f"{stage} prefix has wrong pair count")
+                if len(independent_cluster_ids) != pair_count:
+                    raise ValueError(
+                        f"{stage} {cell_name} does not use one pair per "
+                        "independent gameplay-semantic cluster"
+                    )
+                if len(independent_cluster_ids) < minimum_clusters:
+                    raise ValueError(
+                        f"{stage} {cell_name} has only "
+                        f"{len(independent_cluster_ids)} independent clusters; "
+                        f"policy requires {minimum_clusters}"
+                    )
+                bank = bank_artifacts[qualified_bank_name]
+                cell_payload = {
+                    "cell_name": cell_name,
+                    "stage": stage,
+                    "look": look,
+                    "comparison": comparison,
+                    "suite": suite,
+                    "search_mode": search_mode,
+                    "visits": visits,
+                    "color_pairs": pair_count,
+                    "minimum_independent_position_clusters": minimum_clusters,
+                    "independent_cluster_ids": independent_cluster_ids,
+                    "independent_cluster_ids_hash": canonical_sha256(
+                        independent_cluster_ids
+                    ),
+                    "position_ids": position_ids,
+                    "position_ids_hash": canonical_sha256(position_ids),
+                    "bank_name": qualified_bank_name,
+                    "bank_path": bank["positions"]["path"],
+                    "bank_hash": bank["positions"]["sha256"],
+                    "schedule_path": artifact["path"],
+                    "schedule_hash": artifact["sha256"],
+                    "schedule_id": artifact["scheduleId"],
+                    "schedule_row_count": artifact["rowCount"],
+                    "maximal_look_schedule": maximal_look_schedule,
+                    "policy_hash": policy_plan.policy_hash,
+                    "policy_version": policy_plan.policy_version,
+                    "source_revision": policy_plan.source_revision,
+                }
+                cell_manifest.append(
+                    {
+                        "cell_id": "suite-cell-" + canonical_sha256(cell_payload),
+                        **cell_payload,
+                    }
+                )
+
+            stage_1_pairs = _positive_policy_count(
+                stage_1.get("ordinary_color_pairs"),
+                "Stage-1 ordinary_color_pairs",
+            )
+            append_cell(
+                cell_name="powered_candidate_vs_champion",
+                stage="stage-1",
+                look="automatic",
+                comparison="candidate-vs-champion-powered",
+                suite="discovery",
+                search_mode="powered",
+                qualified_bank_name="discovery",
+                pair_count=stage_1_pairs,
+                minimum_clusters=stage_1_pairs,
+                visits=stage_1.get("visits"),
+                maximal_look_schedule=False,
+            )
+
+            stage_2_ordinary_pairs = _positive_policy_count(
+                stage_2.get("ordinary_color_pairs"),
+                "Stage-2 ordinary_color_pairs",
+            )
+            stage_2_lead_40_pairs = _positive_policy_count(
+                stage_2.get("lead_40_color_pairs"),
+                "Stage-2 lead_40_color_pairs",
+            )
+            stage_2_lead_80_pairs = _positive_policy_count(
+                stage_2.get("lead_80_color_pairs"),
+                "Stage-2 lead_80_color_pairs",
+            )
+            for cell_name, comparison in (
+                (
+                    "powered_candidate_vs_champion",
+                    "candidate-vs-champion-powered",
+                ),
+                (
+                    "powered_candidate_vs_original",
+                    "candidate-vs-original-powered",
+                ),
+            ):
+                append_cell(
+                    cell_name=cell_name,
+                    stage="stage-2",
+                    look="automatic",
+                    comparison=comparison,
+                    suite="discovery",
+                    search_mode="powered",
+                    qualified_bank_name="discovery",
+                    pair_count=stage_2_ordinary_pairs,
+                    minimum_clusters=stage_2_ordinary_pairs,
+                    visits=stage_2.get("ordinary_visits"),
+                    maximal_look_schedule=True,
+                )
+            for cell_name, suite, pair_count in (
+                ("lead_40", "lead-40", stage_2_lead_40_pairs),
+                ("lead_80", "lead-80", stage_2_lead_80_pairs),
+            ):
+                append_cell(
+                    cell_name=cell_name,
+                    stage="stage-2",
+                    look="automatic",
+                    comparison=f"candidate-vs-champion-powered-{suite}",
+                    suite=suite,
+                    search_mode="powered",
+                    qualified_bank_name=f"{suite}-discovery",
+                    pair_count=pair_count,
+                    minimum_clusters=pair_count,
+                    visits=stage_2.get("lead_visits"),
+                    maximal_look_schedule=True,
+                )
+
             for look in policy_plan.stage_3_looks:
                 look_number = look["look_number"]
                 for cell_name in STAGE_3_CELL_ORDER:
@@ -1122,15 +1281,6 @@ def build_evaluation_suites(
                     search_mode = policy_cell.get(
                         "search_mode", defaults["search_mode"]
                     )
-                    for value, source in (
-                        (comparison, "comparison"),
-                        (suite, "suite"),
-                        (search_mode, "search_mode"),
-                    ):
-                        if not isinstance(value, str) or not value:
-                            raise ValueError(
-                                f"Stage-3 {cell_name} {source} must be nonempty"
-                            )
                     qualified_bank_name = (
                         "confirmation"
                         if cell_name
@@ -1145,62 +1295,24 @@ def build_evaluation_suites(
                     minimum_clusters = look["minimum_independent_position_clusters"][
                         cell_name
                     ]
-                    artifact = schedule_prefix(qualified_bank_name, pair_count)
-                    prefix_rows = artifact["rows"]
-                    pair_ids = list(dict.fromkeys(row["pairId"] for row in prefix_rows))
-                    position_ids = sorted(set(row["positionId"] for row in prefix_rows))
-                    independent_cluster_ids = list(
-                        dict.fromkeys(
-                            row["independentClusterId"] for row in prefix_rows
-                        )
-                    )
-                    if len(pair_ids) != pair_count:
-                        raise AssertionError("Stage-3 prefix has wrong pair count")
-                    if len(independent_cluster_ids) != pair_count:
-                        raise ValueError(
-                            f"Stage-3 {cell_name} look {look_number} does not "
-                            "use one pair per independent gameplay-semantic cluster"
-                        )
-                    if len(independent_cluster_ids) < minimum_clusters:
-                        raise ValueError(
-                            f"Stage-3 {cell_name} look {look_number} has only "
-                            f"{len(independent_cluster_ids)} independent clusters; "
-                            f"policy requires {minimum_clusters}"
-                        )
-                    bank = bank_artifacts[qualified_bank_name]
-                    cell_payload = {
-                        "cell_name": cell_name,
-                        "stage": "stage-3",
-                        "look": f"look-{look_number}",
-                        "look_number": look_number,
-                        "comparison": comparison,
-                        "suite": suite,
-                        "search_mode": search_mode,
-                        "color_pairs": pair_count,
-                        "minimum_independent_position_clusters": minimum_clusters,
-                        "independent_cluster_ids": independent_cluster_ids,
-                        "independent_cluster_ids_hash": canonical_sha256(
-                            independent_cluster_ids
+                    append_cell(
+                        cell_name=cell_name,
+                        stage="stage-3",
+                        look=f"look-{look_number}",
+                        comparison=comparison,
+                        suite=suite,
+                        search_mode=search_mode,
+                        qualified_bank_name=qualified_bank_name,
+                        pair_count=pair_count,
+                        minimum_clusters=minimum_clusters,
+                        visits=(
+                            stage_3["powered_visits"]
+                            if search_mode == "powered"
+                            else stage_3["standard_visits"]
                         ),
-                        "position_ids": position_ids,
-                        "position_ids_hash": canonical_sha256(position_ids),
-                        "bank_name": qualified_bank_name,
-                        "bank_path": bank["positions"]["path"],
-                        "bank_hash": bank["positions"]["sha256"],
-                        "schedule_path": artifact["path"],
-                        "schedule_hash": artifact["sha256"],
-                        "schedule_id": artifact["scheduleId"],
-                        "schedule_row_count": artifact["rowCount"],
-                        "maximal_look_schedule": (look_number == latest_look_number),
-                        "policy_hash": policy_plan.policy_hash,
-                        "policy_version": policy_plan.policy_version,
-                        "source_revision": policy_plan.source_revision,
-                    }
-                    cell_manifest.append(
-                        {
-                            "cell_id": "suite-cell-" + canonical_sha256(cell_payload),
-                            **cell_payload,
-                        }
+                        maximal_look_schedule=(
+                            look_number == latest_look_number
+                        ),
                     )
 
         unassigned_rows = [

@@ -1072,7 +1072,11 @@ def evaluate_promotion_gate(
             require_equal(
                 code_prefix + "_RUNNER_CONTRACT",
                 runner_manifest.get("runnerContract", _MISSING),
-                "risk-score-pair-safe-evaluation-runner-v2",
+                (
+                    "risk-score-pair-safe-evaluation-runner-v3"
+                    if v2_policy
+                    else "risk-score-pair-safe-evaluation-runner-v2"
+                ),
             )
             runner_payload = dict(runner_manifest)
             runner_payload_hash = runner_payload.pop("manifestPayloadSha256", None)
@@ -1098,26 +1102,31 @@ def evaluate_promotion_gate(
                 "suite_bank_sha": cell.get("suite_hash"),
                 "schedule_id": cell.get("schedule_id"),
             }
+            if v2_policy:
+                expected_runner_spec["max_visits"] = cell.get("visits")
             require_equal(
                 code_prefix + "_RUNNER_EVALUATION_SPEC",
                 runner_spec,
                 expected_runner_spec,
             )
+            expected_runner_cell = {
+                "comparison": CELL_COMPARISONS[cell_name],
+                "suite": CELL_SUITES[cell_name],
+                "stage": cell.get("stage"),
+                "look": cell.get("look"),
+                "gameCount": (
+                    2 * expected_pair_counts[cell_name]
+                    if expected_pair_counts.get(cell_name) is not None
+                    else None
+                ),
+                "colorPairCount": expected_pair_counts.get(cell_name),
+            }
+            if v2_policy:
+                expected_runner_cell["maxVisits"] = cell.get("visits")
             require_equal(
                 code_prefix + "_RUNNER_CELL",
                 runner_manifest.get("cell", _MISSING),
-                {
-                    "comparison": CELL_COMPARISONS[cell_name],
-                    "suite": CELL_SUITES[cell_name],
-                    "stage": cell.get("stage"),
-                    "look": cell.get("look"),
-                    "gameCount": (
-                        2 * expected_pair_counts[cell_name]
-                        if expected_pair_counts.get(cell_name) is not None
-                        else None
-                    ),
-                    "colorPairCount": expected_pair_counts.get(cell_name),
-                },
+                expected_runner_cell,
             )
             require_equal(
                 code_prefix + "_RUNNER_SCHEDULE_HASH",

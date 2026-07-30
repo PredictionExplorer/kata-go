@@ -352,6 +352,7 @@ def evaluation_files(tmp_path, pair_count=4, candidate_name="candidate.bin"):
         stage="stage-1",
         look="look-1",
         topology="2-processes",
+        max_visits=400,
     )
     return {
         "candidate": candidate,
@@ -424,6 +425,9 @@ def test_evaluation_key_is_deterministic_and_covers_coordinates(tmp_path):
     assert spec.evaluation_key.startswith("eval-")
     assert len(spec.evaluation_key) == len("eval-") + 64
     assert spec.evaluation_key != EvaluationSpec(**changed).evaluation_key
+    assert spec.evaluation_key != EvaluationSpec(
+        **dict(spec.to_dict(), max_visits=800)
+    ).evaluation_key
 
 
 def test_runner_execution_key_binds_every_execution_coordinate(tmp_path):
@@ -519,6 +523,7 @@ def test_command_is_argv_only_and_shell_metacharacters_are_not_executed(tmp_path
     assert isinstance(dry_plan, EvaluationPlan)
     assert not files["output"].exists()
     assert ";touch SHOULD_NOT_EXIST" in dry_plan.commands[0].argv[5]
+    assert "maxVisits=400" in dry_plan.commands[0].argv[5]
 
     outcome = run_runner(runner, files)
     assert isinstance(outcome, EvaluationResult)
@@ -537,6 +542,7 @@ def test_command_is_argv_only_and_shell_metacharacters_are_not_executed(tmp_path
             files["schedule"],
             tmp_path / "results.jsonl",
             game_count=2,
+            max_visits=400,
         )
 
 
@@ -730,6 +736,8 @@ def test_matrix_helper_builds_powered_and_standard_controls():
         stage="stage-3",
         look="look-1",
         topology="8-processes",
+        powered_visits=2000,
+        standard_visits=800,
     )
     assert [spec.comparison for spec in matrix] == [
         "candidate-vs-champion-powered",
@@ -756,6 +764,8 @@ def test_matrix_helper_builds_powered_and_standard_controls():
         stage="stage-3",
         look="look-1",
         topology="8-processes",
+        powered_visits=2000,
+        standard_visits=800,
     )
     assert len(confirmation) == 5
     assert [(spec.comparison, spec.suite) for spec in confirmation[-2:]] == [
@@ -779,6 +789,8 @@ def test_matrix_helper_builds_powered_and_standard_controls():
         stage="deep-audit",
         look="final",
         topology="8-processes",
+        powered_visits=2000,
+        standard_visits=800,
         include_standard_champion=True,
     )
     assert len(full_matrix) == 4
@@ -907,6 +919,7 @@ def test_runner_binds_suite_manifest_bank_and_schedule_metadata(tmp_path):
         stage="stage-3",
         look="look-1",
         topology="2-processes",
+        max_visits=2000,
         suite_manifest_sha=suites.manifest_sha256,
         suite_bank_sha=bank["positions"]["sha256"],
         schedule_id=bank["schedule"]["scheduleId"],
@@ -1011,7 +1024,36 @@ def test_v2_policy_builds_exact_disjoint_holdouts_and_cumulative_prefixes(tmp_pa
     assert first.manifest == second.manifest
     assert first.manifest["policy_hash"] == suite_canonical_sha256(policy)
     assert first.manifest["exactPolicyQuotas"] is True
-    assert len(first.manifest["cells"]) == 10
+    assert len(first.manifest["cells"]) == 15
+
+    stage_1 = resolve_manifest_cell(
+        first.manifest,
+        stage="stage-1",
+        look="automatic",
+        comparison="candidate-vs-champion-powered",
+        suite="discovery",
+    )
+    assert stage_1["color_pairs"] == 1
+    assert stage_1["visits"] == 400
+    stage_2_ordinary = resolve_manifest_cell(
+        first.manifest,
+        stage="stage-2",
+        look="automatic",
+        comparison="candidate-vs-champion-powered",
+        suite="discovery",
+    )
+    assert stage_2_ordinary["color_pairs"] == 2
+    assert stage_2_ordinary["visits"] == 800
+    for suite in ("lead-40", "lead-80"):
+        stage_2_lead = resolve_manifest_cell(
+            first.manifest,
+            stage="stage-2",
+            look="automatic",
+            comparison=f"candidate-vs-champion-powered-{suite}",
+            suite=suite,
+        )
+        assert stage_2_lead["color_pairs"] == 1
+        assert stage_2_lead["visits"] == 800
 
     banks = {bank["qualifiedName"]: bank for bank in first.manifest["banks"]}
     for label in ("ordinary", "lead-40", "lead-80"):
@@ -1157,6 +1199,7 @@ def test_runner_resolves_exact_manifest_cell_and_records_provenance(tmp_path):
         stage=cell["stage"],
         look=cell["look"],
         topology="2-processes",
+        max_visits=cell["visits"],
         suite_manifest_sha=suites.manifest_sha256,
         suite_bank_sha=cell["bank_hash"],
         schedule_id=cell["schedule_id"],

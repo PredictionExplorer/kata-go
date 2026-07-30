@@ -17,6 +17,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from risk_score.evaluation_runner import (
     RUNNER_CONTRACT,
+    RUNNER_CONTRACT_V2,
     canonical_json,
     canonical_sha256,
     file_sha256,
@@ -35,6 +36,7 @@ EVIDENCE_CONTRACT = "risk-score-promotion-evidence-adapter-v1"
 STAGE0_PROBE_CONTRACT = "risk-score-stage-0-probe-output-v1"
 DISCOVERY_CONTRACT = "risk-score-derived-discovery-evidence-v1"
 STAGE_EVIDENCE_CONTRACT = "risk-score-derived-stage-evidence-v1"
+EVALUATION_PLAN_CONTRACT = "risk-score-evaluation-plan-v2"
 CELL_ORDER = (
     "powered_candidate_vs_champion",
     "powered_candidate_vs_original",
@@ -66,6 +68,27 @@ RISK_CELL_BINDINGS = {
     "targeted_lead_80_suite_loss": "lead_80",
 }
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _nonconfirmation_cells(
+    stage: str, champion_hash: str, original_hash: str
+) -> Tuple[str, ...]:
+    if stage == "stage-0":
+        return ()
+    if stage == "stage-1":
+        return ("powered_candidate_vs_champion",)
+    if stage == "stage-2":
+        return (
+            "powered_candidate_vs_champion",
+            *(
+                ("powered_candidate_vs_original",)
+                if champion_hash != original_hash
+                else ()
+            ),
+            "lead_40",
+            "lead_80",
+        )
+    raise PromotionEvidenceError(f"unsupported nonconfirmation stage {stage!r}")
 
 
 class PromotionEvidenceError(ValueError):
@@ -355,6 +378,7 @@ def load_finalized_runner_cell(
     cell_name: str,
     suite_manifest_path: Path,
     policy_hash: str,
+    runner_contract: str = RUNNER_CONTRACT,
 ) -> FinalizedRunnerCell:
     """Load one finalized runner bundle and recheck immutable artifact bindings."""
 
@@ -365,7 +389,7 @@ def load_finalized_runner_cell(
     _verify_manifest_payload(manifest, f"{cell_name} runner manifest")
     if manifest.get("schemaVersion") != 1:
         raise PromotionEvidenceError(f"{cell_name} runner schemaVersion is unsupported")
-    if manifest.get("runnerContract") != RUNNER_CONTRACT:
+    if manifest.get("runnerContract") != runner_contract:
         raise PromotionEvidenceError(f"{cell_name} runner contract is unsupported")
     spec = manifest.get("evaluationSpec")
     execution = manifest.get("execution")
@@ -573,6 +597,7 @@ def _load_generic_runner_cell(
     *,
     cell_name: str,
     policy_hash: str,
+    runner_contract: str = RUNNER_CONTRACT,
 ) -> FinalizedRunnerCell:
     """Load a non-confirmation runner bundle whose bank binding is legacy-flat."""
 
@@ -580,7 +605,7 @@ def _load_generic_runner_cell(
     manifest = _load_canonical_json(path, f"{cell_name} runner manifest")
     _verify_manifest_payload(manifest, f"{cell_name} runner manifest")
     if (
-        manifest.get("runnerContract") != RUNNER_CONTRACT
+        manifest.get("runnerContract") != runner_contract
         or manifest.get("schemaVersion") != 1
     ):
         raise PromotionEvidenceError(f"{cell_name} runner contract is unsupported")
@@ -686,22 +711,45 @@ def build_nonconfirmation_controller_evidence(
     if stage not in stage_to_controller:
         raise PromotionEvidenceError("non-confirmation plan stage is unsupported")
     specs = plan.get("specs")
-    if not isinstance(specs, list) or not specs:
-        raise PromotionEvidenceError("controller plan has no EvaluationSpecs")
-    candidate_hash = specs[0].get("candidate_model_sha")
-    original_hash = specs[0].get("original_model_sha")
-    champion_spec = next(
-        (
-            spec
-            for spec in specs
-            if isinstance(spec, dict)
-            and spec.get("comparison") == "candidate-vs-champion-powered"
-        ),
-        None,
-    )
-    if not isinstance(champion_spec, dict):
-        raise PromotionEvidenceError("controller plan has no champion comparison")
-    champion_hash = champion_spec.get("reference_model_sha")
+    if not isinstance(specs, list) or (stage != "stage-0" and not specs):
+        raise PromotionEvidenceError("controller plan has invalid EvaluationSpecs")
+    candidate_hash = plan.get("candidateModelSha256")
+    original_hash = plan.get("originalModelSha256")
+    champion_hash = plan.get("championModelSha256")
+    if plan.get("planContract") != EVALUATION_PLAN_CONTRACT:
+        raise PromotionEvidenceError("controller plan contract is unsupported")
+    expected_cells = _nonconfirmation_cells(stage, champion_hash, original_hash)
+    if plan.get("cellOrder") != list(expected_cells):
+        raise PromotionEvidenceError(
+            "controller plan cellOrder contradicts its stage/model identities"
+        )
+    schedule_artifacts = plan.get("scheduleArtifacts")
+    if (
+        not isinstance(schedule_artifacts, Mapping)
+        or set(schedule_artifacts) != set(expected_cells)
+    ):
+        raise PromotionEvidenceError(
+            "controller plan schedule artifacts do not match the exact stage matrix"
+        )
+    if stage == "stage-0" and specs:
+        raise PromotionEvidenceError("Stage-0 controller plan must be probe-only")
+    if stage != "stage-0":
+        champion_spec = next(
+            (
+                spec
+                for spec in specs
+                if isinstance(spec, dict)
+                and spec.get("comparison") == "candidate-vs-champion-powered"
+            ),
+            None,
+        )
+        if (
+            not isinstance(champion_spec, dict)
+            or champion_spec.get("reference_model_sha") != champion_hash
+        ):
+            raise PromotionEvidenceError(
+                "controller plan champion comparison contradicts plan identity"
+            )
     for value, source in (
         (candidate_hash, "candidate hash"),
         (original_hash, "original hash"),
@@ -714,6 +762,11 @@ def build_nonconfirmation_controller_evidence(
     ):
         _require_sha256(value, source)
     policy = load_policy(Path(policy_path))
+    expected_runner_contract = (
+        RUNNER_CONTRACT
+        if policy.get("schema_version") == 2
+        else RUNNER_CONTRACT_V2
+    )
     if canonical_sha256(policy) != plan["policyHash"]:
         raise PromotionEvidenceError("non-confirmation policy contradicts plan")
     if str(Path(policy_path)) != plan["policyPath"]:
@@ -724,6 +777,59 @@ def build_nonconfirmation_controller_evidence(
             "non-confirmation suite manifest hash contradicts plan"
         )
     load_suite_manifest(suite_manifest_path)
+
+    comparison_to_cell = {
+        value: key for key, value in CELL_COMPARISONS.items()
+    }
+    actual_cells = []
+    for spec in specs:
+        if not isinstance(spec, Mapping):
+            raise PromotionEvidenceError("controller EvaluationSpec is malformed")
+        cell_name = comparison_to_cell.get(spec.get("comparison"))
+        if cell_name is None:
+            raise PromotionEvidenceError(
+                "controller EvaluationSpec has an unknown comparison"
+            )
+        actual_cells.append(cell_name)
+        expected_reference = (
+            champion_hash
+            if "champion" in spec["comparison"]
+            else original_hash
+        )
+        expected_suite = (
+            "lead-40"
+            if cell_name == "lead_40"
+            else "lead-80"
+            if cell_name == "lead_80"
+            else "discovery"
+        )
+        expected_visits = (
+            policy["evaluation_stages"]["stage_1_cheap_paired_screen"]["visits"]
+            if stage == "stage-1"
+            else policy["evaluation_stages"]["stage_2_finalist_selection"][
+                "lead_visits"
+                if cell_name in {"lead_40", "lead_80"}
+                else "ordinary_visits"
+            ]
+            if stage == "stage-2"
+            else None
+        )
+        if (
+            spec.get("candidate_model_sha") != candidate_hash
+            or spec.get("original_model_sha") != original_hash
+            or spec.get("reference_model_sha") != expected_reference
+            or spec.get("stage") != stage
+            or spec.get("look") != plan.get("look")
+            or spec.get("suite") != expected_suite
+            or spec.get("max_visits") != expected_visits
+        ):
+            raise PromotionEvidenceError(
+                f"{cell_name} EvaluationSpec contradicts the frozen stage contract"
+            )
+    if tuple(actual_cells) != expected_cells:
+        raise PromotionEvidenceError(
+            "controller EvaluationSpecs do not match the exact stage matrix"
+        )
 
     derived_artifacts: Dict[str, Any] = {}
     reason_codes: List[str] = []
@@ -745,13 +851,19 @@ def build_nonconfirmation_controller_evidence(
             reason_codes.append("STAGE_0_PROBE_FAILED")
         derived_artifacts["stage_0"] = stage0
     else:
-        if not isinstance(runner_manifests, Mapping) or not runner_manifests:
+        if (
+            not isinstance(runner_manifests, Mapping)
+            or set(runner_manifests) != set(expected_cells)
+        ):
             raise PromotionEvidenceError(
-                "non-confirmation game stages require runner manifests"
+                "non-confirmation runner manifests do not match the exact stage matrix"
             )
         cells = {
             name: _load_generic_runner_cell(
-                Path(path), cell_name=name, policy_hash=plan["policyHash"]
+                Path(path),
+                cell_name=name,
+                policy_hash=plan["policyHash"],
+                runner_contract=expected_runner_contract,
             )
             for name, path in sorted(runner_manifests.items())
         }
@@ -799,18 +911,33 @@ def build_nonconfirmation_controller_evidence(
             )
         artifact = champion_cell["statistics_artifact"]
         metric = artifact.get("metrics", {}).get("realized_utility")
-        valid = artifact.get("validation", {}).get("promotion_valid") is True
-        available = (
-            isinstance(metric, dict)
-            and metric.get("available") is True
-            and metric.get("complete") is True
-        )
-        if not valid:
+        invalid_cells = []
+        unavailable_cells = []
+        for name, value in finalized.items():
+            statistics = value["statistics_artifact"]
+            cell_metric = statistics.get("metrics", {}).get("realized_utility")
+            if statistics.get("validation", {}).get("promotion_valid") is not True:
+                invalid_cells.append(name)
+            if not (
+                isinstance(cell_metric, dict)
+                and cell_metric.get("available") is True
+                and cell_metric.get("complete") is True
+            ):
+                unavailable_cells.append(name)
+        if invalid_cells:
             decision = "FAIL"
             reason_codes.append("MATCH_VALIDATION_FAILED")
-        elif not available:
+            reason_codes.extend(
+                f"MATCH_VALIDATION_FAILED_{name.upper()}"
+                for name in invalid_cells
+            )
+        elif unavailable_cells:
             decision = "INCONCLUSIVE"
             reason_codes.append("UTILITY_INFERENCE_UNAVAILABLE")
+            reason_codes.extend(
+                f"UTILITY_INFERENCE_UNAVAILABLE_{name.upper()}"
+                for name in unavailable_cells
+            )
         elif stage == "stage-1":
             threshold = policy["evaluation_stages"]["stage_1_cheap_paired_screen"][
                 "utility_futility_upper_bound"
@@ -1375,6 +1502,8 @@ def build_promotion_evidence(
         )
     policy = load_policy(Path(policy_path))
     policy_hash = canonical_sha256(policy)
+    v2_policy = policy.get("schema_version") == 2
+    expected_runner_contract = RUNNER_CONTRACT if v2_policy else RUNNER_CONTRACT_V2
     suite_manifest_path = Path(suite_manifest_path)
     suite_manifest = load_suite_manifest(suite_manifest_path)
     suite_manifest_hash = file_sha256(suite_manifest_path)
@@ -1382,15 +1511,28 @@ def build_promotion_evidence(
         raise PromotionEvidenceError(
             "suite manifest is bound to a different promotion policy"
         )
-    cells = {
-        name: load_finalized_runner_cell(
-            Path(runner_manifests[name]),
-            cell_name=name,
-            suite_manifest_path=suite_manifest_path,
-            policy_hash=policy_hash,
-        )
-        for name in CELL_ORDER
-    }
+    cells = (
+        {
+            name: load_finalized_runner_cell(
+                Path(runner_manifests[name]),
+                cell_name=name,
+                suite_manifest_path=suite_manifest_path,
+                policy_hash=policy_hash,
+                runner_contract=expected_runner_contract,
+            )
+            for name in CELL_ORDER
+        }
+        if v2_policy
+        else {
+            name: _load_generic_runner_cell(
+                Path(runner_manifests[name]),
+                cell_name=name,
+                policy_hash=policy_hash,
+                runner_contract=expected_runner_contract,
+            )
+            for name in CELL_ORDER
+        }
+    )
     specs = [cells[name].manifest["evaluationSpec"] for name in CELL_ORDER]
     candidates = {spec["candidate_model_sha"] for spec in specs}
     originals = {spec["original_model_sha"] for spec in specs}
@@ -1489,6 +1631,15 @@ def build_promotion_evidence(
         statistics = finalized[name]
         search_mode = policy_matrix[name]["search_mode"]
         settings = _search_settings(policy, search_mode == "powered")
+        expected_visits = (
+            stage_3["powered_visits"]
+            if search_mode == "powered"
+            else stage_3["standard_visits"]
+        )
+        if v2_policy and spec.get("max_visits") != expected_visits:
+            raise PromotionEvidenceError(
+                f"{name} runner visits contradict the frozen Stage-3 policy"
+            )
         matrix[name] = {
             "comparison": spec["comparison"],
             "suite": spec["suite"],
@@ -1498,11 +1649,7 @@ def build_promotion_evidence(
             "search_mode": search_mode,
             "candidate_hash": spec["candidate_model_sha"],
             "reference_hash": spec["reference_model_sha"],
-            "visits": (
-                stage_3["powered_visits"]
-                if search_mode == "powered"
-                else stage_3["standard_visits"]
-            ),
+            "visits": expected_visits,
             "color_pairs": cell.manifest_cell["color_pairs"],
             "config_hash": spec["config_sha"],
             "schedule_id": spec["schedule_id"],
