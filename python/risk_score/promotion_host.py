@@ -172,6 +172,25 @@ def same_process(identity: Mapping[str, Any]) -> bool:
     )
 
 
+def capture_spawned_process(
+    process: subprocess.Popen[Any], *, timeout: float = 5.0
+) -> Dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    last_error: Optional[BaseException] = None
+    while True:
+        if process.poll() is not None:
+            raise HostCommandError(
+                f"spawned process exited before identity capture: {process.returncode}"
+            ) from last_error
+        try:
+            return capture_process_identity(process.pid)
+        except HostCommandError as exc:
+            last_error = exc
+        if time.monotonic() >= deadline:
+            raise HostCommandError("spawned process identity capture timed out") from last_error
+        time.sleep(0.01)
+
+
 def _group_alive(pgid: int) -> bool:
     try:
         os.killpg(pgid, 0)
@@ -300,7 +319,7 @@ def trainer_start(
         shell=False,
     )
     try:
-        identity = capture_process_identity(process.pid)
+        identity = capture_spawned_process(process)
         value = {
             "schema_version": 1,
             "role": "trainer",
@@ -570,7 +589,7 @@ def worker_start(
     )
     log.close()
     try:
-        identity = capture_process_identity(process.pid)
+        identity = capture_spawned_process(process)
     except BaseException:
         with contextlib.suppress(OSError):
             os.killpg(process.pid, signal.SIGTERM)
@@ -771,7 +790,7 @@ def _start_active_worker(
     )
     log.close()
     try:
-        identity = capture_process_identity(process.pid)
+        identity = capture_spawned_process(process)
         atomic_write_json(
             record_path,
             {
