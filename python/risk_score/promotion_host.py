@@ -1074,6 +1074,13 @@ def reconcile_trainer(
         return {"status": "adopted", "process_identity": identities[0]}
     if _lease_blocks_trainer(runtime):
         return {"status": "lease-handoff"}
+    export_root = runtime.promotion_root.parent / "torchmodels_toexport"
+    if export_root.is_dir() and any(
+        path.is_dir()
+        and not path.name.endswith((".tmp", ".partial", ".exported"))
+        for path in export_root.iterdir()
+    ):
+        return {"status": "waiting-for-hardened-export"}
     value = trainer_start(
         spec_path=trainer_spec,
         checkpoint_path=checkpoint,

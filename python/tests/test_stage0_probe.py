@@ -102,6 +102,7 @@ def test_model_probe_requires_finite_analysis(tmp_path):
         config=config,
         model=model,
         expected_model_sha256=file_sha256(model),
+        require_idle_gpu=False,
         subprocess_runner=fake_analysis,
     )
     assert result["finite"] is True

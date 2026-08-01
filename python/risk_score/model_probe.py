@@ -37,6 +37,46 @@ def _finite_analysis(record: Mapping[str, Any]) -> bool:
     return 0.0 <= float(root["winrate"]) <= 1.0
 
 
+def _require_gpu_idle(gpu_index: int) -> str:
+    inventory = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-gpu=uuid",
+            "--format=csv,noheader,nounits",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        shell=False,
+    )
+    if inventory.returncode != 0:
+        raise HostCommandError("cannot inventory CUDA GPUs for model probe")
+    uuids = [line.strip() for line in inventory.stdout.splitlines() if line.strip()]
+    if not 0 <= gpu_index < len(uuids):
+        raise HostCommandError("model probe GPU index is absent")
+    expected_uuid = uuids[gpu_index]
+    processes = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-compute-apps=gpu_uuid,pid,process_name",
+            "--format=csv,noheader,nounits",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        shell=False,
+    )
+    if processes.returncode != 0:
+        raise HostCommandError("cannot query CUDA processes for model probe")
+    if any(
+        line.split(",", 1)[0].strip() == expected_uuid
+        for line in processes.stdout.splitlines()
+        if line.strip()
+    ):
+        raise HostCommandError("model probe GPU is not exclusively idle")
+    return expected_uuid
+
+
 def probe_model(
     *,
     katago: Path,
@@ -45,11 +85,13 @@ def probe_model(
     expected_model_sha256: Optional[str] = None,
     output: Optional[Path] = None,
     gpu_index: int = 7,
+    require_idle_gpu: bool = True,
     subprocess_runner: Any = subprocess.run,
 ) -> Mapping[str, Any]:
     model_path = Path(model)
     if type(gpu_index) is not int or gpu_index < 0:
         raise HostCommandError("model probe GPU index must be nonnegative")
+    gpu_uuid = _require_gpu_idle(gpu_index) if require_idle_gpu else None
     validate_deterministic_analysis_config(Path(config))
     actual_hash = file_sha256(model_path)
     if expected_model_sha256 is not None and actual_hash != expected_model_sha256:
@@ -102,6 +144,7 @@ def probe_model(
             "katago_sha256": file_sha256(Path(katago)),
             "config_sha256": file_sha256(Path(config)),
             "finite": True,
+            "gpu_uuid": gpu_uuid,
         }
     if output is not None:
         atomic_write_json(Path(output), result)
