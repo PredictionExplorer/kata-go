@@ -762,9 +762,11 @@ def test_runtime_example_is_safe_and_uses_repository_evidence_cli():
     example = load_json(example_path)
     assert example["mutationEnabled"] is False
     assert "risk_score.promotion_evaluator" in example["commands"]["evaluator"]
-    assert example["commands"]["stage0Probe"][0].endswith(
-        "run-risk-score-stage0-probe"
-    )
+    assert "risk_score.stage0_probe" in example["commands"]["stage0Probe"]
+    assert "risk_score.promotion_host" in example["commands"]["selfplay"]
+    assert "worker-start" in example["commands"]["selfplay"]
+    assert "workers-drain" in example["commands"]["drain"]
+    assert "consumers-stop" in example["commands"]["rollback"]
     assert example["paths"]["policy"].endswith(
         "risk_score/promotion_policy_v2.json"
     )
@@ -776,7 +778,11 @@ def test_runtime_example_is_safe_and_uses_repository_evidence_cli():
         "promotion-suites-v2/schedules/lead-80-confirmation.jsonl"
     )
     assert example["paths"]["standardConfirmationSchedule"].endswith(
-        "promotion-suites-v2/schedules/prefixes/confirmation-pairs-128.jsonl"
+        "configs/standard-confirmation.jsonl"
+    )
+    assert (
+        example["hashes"]["standardConfirmationSchedule"]
+        == example["hashes"]["confirmationOrdinarySchedule"]
     )
 
 

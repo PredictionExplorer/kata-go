@@ -776,6 +776,8 @@ def _validate_limits(args: argparse.Namespace) -> None:
             )
     if args.max_parallel > args.shards:
         raise PromotionEvaluatorError("max parallelism may not exceed shard count")
+    if type(args.gpu_index) is not int or args.gpu_index < 0:
+        raise PromotionEvaluatorError("GPU index must be a nonnegative integer")
 
 
 def evaluate(
@@ -823,6 +825,7 @@ def evaluate(
             max_parallel=args.max_parallel,
             max_attempts=args.max_attempts,
             include_move_traces=True,
+            env={"CUDA_VISIBLE_DEVICES": str(args.gpu_index)},
             subprocess_runner=subprocess_runner,
         )
         result = runner.run(
@@ -989,6 +992,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--shards", type=int, default=1)
     parser.add_argument("--max-parallel", type=int, default=1)
     parser.add_argument("--max-attempts", type=int, default=2)
+    parser.add_argument("--gpu-index", type=int, default=7)
     parser.add_argument("--bootstrap-replications", type=int)
     parser.add_argument("--bootstrap-seed", type=int)
     parser.add_argument("-o", "--output", required=True, type=Path)

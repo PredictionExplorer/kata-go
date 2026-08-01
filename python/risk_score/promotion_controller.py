@@ -2265,6 +2265,26 @@ class PromotionController:
                 "legacy_adapter_compatibility": True,
                 "required_checks": [],
             }
+        executable_bindings: Dict[str, Any] = {}
+        stage0_command = self.runtime.commands.get("stage0Probe", ())
+        for flag, path_key, hash_key in (
+            ("--katago", "katago_binary_path", "katago_binary_hash"),
+            (
+                "--analysis-config",
+                "analysis_config_path",
+                "analysis_config_hash",
+            ),
+        ):
+            if flag not in stage0_command:
+                continue
+            index = stage0_command.index(flag) + 1
+            if index >= len(stage0_command) or "{" in stage0_command[index]:
+                raise SafetyHalt(f"Stage-0 {flag} must be a fixed immutable path")
+            executable = Path(stage0_command[index])
+            if executable.is_symlink() or not executable.is_file():
+                raise SafetyHalt(f"Stage-0 {flag} path is not a regular file")
+            executable_bindings[path_key] = str(executable)
+            executable_bindings[hash_key] = sha256_file(executable)
         request = {
             "schema_version": 1,
             "contract": "risk-score-stage-0-request-v1",
@@ -2291,6 +2311,7 @@ class PromotionController:
                 key: dict(value)
                 for key, value in sorted(plan.schedule_artifacts.items())
             },
+            **executable_bindings,
         }
         request_hash = canonical_sha256(request)
         root = self.runtime.evaluations / "stage-0" / "requests"
@@ -5767,10 +5788,11 @@ class PromotionController:
                     self.runtime.shuffle_watermark_path
                 ),
             }
+            ingested = self._ingest_rollout_ipc()
             first = self.promote(
                 candidate.candidate_hash, generation_id, **kwargs
             )
-            ingested = self._ingest_rollout_ipc()
+            ingested = self._ingest_rollout_ipc() or ingested
             if first.get("status") != "ACTIVE" and ingested:
                 first = self.promote(
                     candidate.candidate_hash, generation_id, **kwargs
@@ -7621,12 +7643,31 @@ def configured_gpu_lease_factory(
 ) -> Iterable[Mapping[str, Any]]:
     """Adapt gpu_lease's exclusive handoff into controller provenance."""
 
-    from risk_score.gpu_lease import GpuLeaseManager, RuntimeConfig as GpuRuntimeConfig
+    from risk_score.gpu_lease import (
+        GpuLeaseManager,
+        ProcessIdentity,
+        RuntimeConfig as GpuRuntimeConfig,
+    )
+    from risk_score.promotion_host import same_process
 
     config = GpuRuntimeConfig.from_json_file(config_path)
     manager = GpuLeaseManager(config)
     proof: Dict[str, Any] = {}
-    with manager.exclusive_handoff() as record:
+    trainer_identity = None
+    if manager.read_record() is None:
+        identity_path = (
+            config.promotion_root / "supervisor" / "trainer.json"
+        )
+        if identity_path.is_symlink() or not identity_path.is_file():
+            raise SafetyHalt(
+                "first GPU handoff requires promotion/supervisor/trainer.json"
+            )
+        identity_value = json.loads(identity_path.read_text(encoding="utf-8"))
+        identity = identity_value.get("process_identity")
+        if not isinstance(identity, Mapping) or not same_process(identity):
+            raise SafetyHalt("recorded trainer identity is absent or stale")
+        trainer_identity = ProcessIdentity.capture(identity["pid"])
+    with manager.exclusive_handoff(trainer_identity) as record:
         proof.update(
             {
                 "lease_id": record.lease_id,
@@ -7730,7 +7771,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
         if args.interval is not None and args.interval <= 0:
             raise ConfigurationError("--interval must be positive")
+        verify_live_dependencies: Optional[Callable[[], None]] = None
         if args.automatic:
+            from risk_score.build_live_runtime import verify_deployment_manifest
+            from risk_score.promotion_host import same_process
+
+            def verify_live_dependencies() -> None:
+                verify_deployment_manifest(
+                    Path(args.runtime_config).parent / "deployment-manifest.json"
+                )
+                service_path = (
+                    runtime.promotion_root / "supervisor" / "service.json"
+                )
+                if service_path.is_symlink() or not service_path.is_file():
+                    raise SafetyHalt(
+                        "automatic mode requires the host supervisor service"
+                    )
+                service = json.loads(service_path.read_text(encoding="utf-8"))
+                if (
+                    not same_process(service.get("process_identity", {}))
+                    or service.get("runtime_config")
+                    != str(Path(args.runtime_config).resolve())
+                    or service.get("mutation_enabled") is not True
+                    or not isinstance(
+                        service.get("updated_at_unix"), (int, float)
+                    )
+                    or time.time() - float(service["updated_at_unix"]) > 30.0
+                ):
+                    raise SafetyHalt("host supervisor service heartbeat is stale")
+
+            verify_live_dependencies()
             instance_lock = ControllerLock(
                 runtime.lock_path, owner=runtime.controller.actor
             ).acquire()
@@ -7741,6 +7811,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             command_executor=default_command_executor if args.automatic else None,
             gpu_lease_factory=(
                 configured_gpu_lease_factory if args.automatic else None
+            ),
+            process_identity_verifier=(
+                same_process if args.automatic else None
             ),
             held_controller_lock=instance_lock,
         )
@@ -7761,6 +7834,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
         interval = args.interval or runtime.controller.poll_interval_seconds
         while True:
+            if verify_live_dependencies is not None:
+                verify_live_dependencies()
             if args.mode == "reconcile":
                 result = controller.run_reconcile()
             else:

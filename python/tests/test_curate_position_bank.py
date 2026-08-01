@@ -518,6 +518,7 @@ def test_finalize_requires_review_and_policy_minima_then_feeds_suite_builder(tmp
         {
             "semantic_sha256": reviewed_hash,
             "approved": True,
+            "hint_loc": "D4",
             "labels": [
                 "tactical",
                 "exploitability",

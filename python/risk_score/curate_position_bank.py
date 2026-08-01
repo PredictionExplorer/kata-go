@@ -249,7 +249,7 @@ def _source_inventory(
     return inventory
 
 
-def _require_deterministic_analysis_config(path: Path) -> None:
+def validate_deterministic_analysis_config(path: Path) -> None:
     values = {}
     for raw_line in Path(path).read_text(encoding="utf-8").splitlines():
         line = raw_line.split("#", 1)[0].strip()
@@ -620,7 +620,7 @@ def generate_query_bundle(
         source = Path(path)
         if source.is_symlink() or not source.is_file():
             raise ValueError(f"{role} must be a regular non-symlink file")
-    _require_deterministic_analysis_config(Path(analysis_config))
+    validate_deterministic_analysis_config(Path(analysis_config))
     model = Path(reference_model)
     positions = _normalized_positions(Path(normalized_path))
     policy = load_policy(Path(policy_path))
@@ -694,6 +694,7 @@ def run_analysis(
     model: Path,
     queries: Path,
     output: Path,
+    env: Optional[Mapping[str, str]] = None,
     subprocess_runner: Any = subprocess.run,
 ) -> Mapping[str, Any]:
     for path, role in (
@@ -735,6 +736,7 @@ def run_analysis(
             stderr=subprocess.PIPE,
             shell=False,
             check=False,
+            env=(None if env is None else dict(env)),
         )
         destination.flush()
         os.fsync(destination.fileno())
@@ -1192,6 +1194,17 @@ def finalize_reviewed_bank(
         position = normalize_position_sample(
             queue[semantic_hash]["position"], f"reviewed {semantic_hash}"
         )
+        hint_loc = decision.get("hint_loc")
+        if any(label in {"tactical", "exploitability"} for label in labels):
+            if not isinstance(hint_loc, str) or not hint_loc:
+                raise ValueError(
+                    "tactical/exploitability review requires an explicit hint_loc"
+                )
+        if hint_loc is not None:
+            position["hintLoc"] = hint_loc
+            position = normalize_position_sample(
+                position, f"reviewed hint {semantic_hash}"
+            )
         position.pop("metadata", None)
         if semantic_position_sha256(position) != semantic_hash:
             raise ValueError("review decision semantic identity changed")

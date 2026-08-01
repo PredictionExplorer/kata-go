@@ -1278,6 +1278,15 @@ def validate_stage0_probe(
             raise PromotionEvidenceError(
                 "Stage-0 request probe contract contradicts policy"
             )
+        for hash_field in ("katago_binary_hash", "analysis_config_hash"):
+            if hash_field in request:
+                expected = _require_sha256(
+                    request.get(hash_field), f"Stage-0 request {hash_field}"
+                )
+                if probe.get(hash_field) != expected:
+                    raise PromotionEvidenceError(
+                        f"Stage-0 probe {hash_field} contradicts request"
+                    )
         if not isinstance(request.get("schedule_artifacts"), dict):
             raise PromotionEvidenceError(
                 "Stage-0 request schedule artifacts are missing"

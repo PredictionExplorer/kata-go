@@ -26,9 +26,9 @@ management, and rollout control.
 As of the 2026-07-29 read-only live inspection:
 
 - repository orchestration is based on
-  `c6205c0a7b3397dba5857708430d0c9b0c4aaf60` plus the current reviewed
-  Stage 0–2 execution-alignment and position-curation diff; the live checkout
-  is clean at the original training revision
+  `b6517702064aae869a6b762d6a90dd7d6f033948` plus the current reviewed
+  production host-integration diff; the live checkout is clean at the
+  original training revision
   `a51c32967fdfb246923aebf12801812504cfbd40`;
 - the live run root is
   `/home/ubuntu/kata-go-artifacts/runs/training-a51c3296-p15-w4`;
@@ -149,6 +149,23 @@ source bank currently exists in the repository or live run.
 - [x] Cover deterministic curation and suite-builder handoff with automated
   tests.
 
+### Production host integration
+
+- [x] Implement request-bound Stage 0 and hardened-export CUDA model probes.
+- [x] Implement bucket-limited trainer launch/drain with verified process
+  identity and GPU-lease bootstrap.
+- [x] Implement finite rollout workers, automatic completion
+  acknowledgements, quiescent drain proofs, and persistent active-generation
+  workers.
+- [x] Implement dynamic all-role rollback identities, supervisor pause
+  barriers, continuous-output quarantine, and trainer restoration.
+- [x] Implement live filesystem/source/candidate preflight evidence and
+  hash-pinned runtime/deployment manifest generation.
+- [x] Require a live supervisor heartbeat and revalidate deployment hashes on
+  every automatic controller iteration.
+- [x] Cover host command, Stage 0, preflight, and runtime materialization
+  contracts with automated tests.
+
 Repository verification recorded so far:
 
 - `uv run --with pytest pytest tests/test_evaluation_runner.py -q`
@@ -206,6 +223,9 @@ Repository verification recorded so far:
 - Final `compileall`, v1/v2 policy and runtime JSON parsing, promotion and
   curation CLI help smokes, exporter shell syntax, and `git diff --check`
   (2026-07-29): passed.
+- Production host integration run (2026-08-01): 326 tests passed and 2
+  Linux-procfs process-lifecycle tests were skipped on macOS; those tests
+  remain required on the H100 host before deployment.
 
 ### Final audit hardening
 
@@ -390,6 +410,19 @@ loading, and training-data generation remain the execution engines.
   - content-bound SGF harvest plans and analysis execution;
   - conservative automatic labels and explicit specialized review queues;
   - policy-minimum validation and canonical reviewed-bank publication.
+- `python/risk_score/model_probe.py`
+  - deterministic CUDA model-load and finite-output publication probe.
+- `python/risk_score/stage0_probe.py`
+  - request-bound fixed-position, tactical, exploitability, perspective,
+    clamp, decomposition, and visit-stability checks.
+- `python/risk_score/promotion_host.py`
+  - trainer, rollout-worker, active-worker, rollback, and feedback
+    supervision with PID-reuse protection.
+- `python/risk_score/promotion_preflight.py`
+  - run-volume semantics, deployment snapshot, and candidate inventory.
+- `python/risk_score/build_live_runtime.py`
+  - strict host runtime materialization and continuous deployment hash
+    verification.
 
 ### Configuration
 
@@ -424,6 +457,10 @@ loading, and training-data generation remain the execution engines.
 - `python/tests/test_hardened_exporter.py`
 - `python/tests/test_promotion_recovery.py`
 - `python/tests/test_curate_position_bank.py`
+- `python/tests/test_stage0_probe.py`
+- `python/tests/test_promotion_host.py`
+- `python/tests/test_promotion_preflight.py`
+- `python/tests/test_build_live_runtime.py`
 
 No C++ change is required for the first production controller. Optional C++
 improvements are listed later.

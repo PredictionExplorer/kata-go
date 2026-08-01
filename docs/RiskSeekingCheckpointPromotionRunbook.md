@@ -32,6 +32,10 @@ Freeze and hash these together:
 - the current champion model;
 - the current trainer checkpoint; and
 - the reviewed runtime configuration.
+- `promotion/supervisor/trainer.json`, the dynamic consumer identity snapshot,
+  and the live supervisor heartbeat;
+- `configs/deployment-manifest.json`, `trainer-launch.json`,
+  `consumer-stop.json`, and `promotion-services.json`.
 
 Keep the live runtime configuration outside Git. Start from
 `python/risk_score/promotion_runtime.example.json` for controller paths and
@@ -72,6 +76,11 @@ python3 -m risk_score.promotion_evaluator --help
 python3 -m risk_score.promotion_evidence --help
 python3 -m risk_score.curate_position_bank --help
 python3 -m risk_score.build_evaluation_suites --help
+python3 -m risk_score.model_probe --help
+python3 -m risk_score.stage0_probe --help
+python3 -m risk_score.promotion_host --help
+python3 -m risk_score.promotion_preflight --help
+python3 -m risk_score.build_live_runtime --help
 ```
 
 Run the Python tests before deploying the source snapshot:
@@ -83,6 +92,48 @@ pytest
 
 On a host with the production KataGo binary, run bounded model-load and match
 smokes separately. Unit tests do not establish CUDA compatibility.
+
+Before touching live processes, deploy a clean versioned checkout rather than
+updating the checkout used by existing loops. Capture an immutable snapshot
+and prove run-volume rename/fsync semantics:
+
+```bash
+python3 -m risk_score.promotion_preflight snapshot \
+  --run-root "$TRAIN_BASE" --repo "$DEPLOY_REPO" \
+  --output "$RUN_DIR/manifest/promotion-deployment-snapshot.json"
+python3 -m risk_score.promotion_preflight filesystem-test \
+  --root "$TRAIN_BASE/promotion" \
+  --output "$RUN_DIR/manifest/promotion-filesystem-test.json"
+python3 -m risk_score.promotion_preflight candidate-inventory \
+  --inbox "$TRAIN_BASE/modelstobetested" \
+  --output "$RUN_DIR/manifest/promotion-candidate-inventory.json"
+```
+
+Materialize runtime JSON only after suites, trainer/consumer specs, the CUDA
+binary, and the deployment Python environment are frozen. The builder rejects
+a dirty or mismatched source revision and writes a deployment manifest that
+automatic mode rechecks on every poll:
+
+```bash
+python3 -m risk_score.build_live_runtime \
+  --repo "$DEPLOY_REPO" --run-root "$TRAIN_BASE" \
+  --suite-dir "$RUN_DIR/evaluation/promotion-suites-v2" \
+  --katago-binary "$DEPLOY_REPO/cpp/build-cuda/katago" \
+  --python-executable "$DEPLOY_REPO/python/.venv/bin/python" \
+  --trainer-spec "$RUN_DIR/configs/trainer-launch.json" \
+  --consumer-spec "$RUN_DIR/configs/consumer-stop.json" \
+  --original-model "$ORIGINAL_MODEL" \
+  --trainer-checkpoint "$TRAIN_BASE/train/$TRAINING_NAME/checkpoint.ckpt" \
+  --gpu-uuid "$GPU7_UUID" --actor "$CONTROLLER_ID" \
+  --source-revision "$(git -C "$DEPLOY_REPO" rev-parse HEAD)" \
+  --output-dir "$RUN_DIR/configs"
+```
+
+The host supervisor is safe to start with mutation disabled: it publishes
+identity snapshots and a heartbeat but launches no process. After reviewed
+runtime regeneration with mutation enabled, it adopts or starts exactly one
+trainer, respects every GPU-lease phase, supervises rollout acknowledgements,
+and keeps seven continuous workers synchronized to `champion.json`.
 
 ## Promotion filesystem
 

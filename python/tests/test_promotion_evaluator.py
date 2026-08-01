@@ -50,9 +50,11 @@ class CountingMatch(FakeMatch):
     def __init__(self, *, fail_suite=None):
         self.calls = 0
         self.fail_suite = fail_suite
+        self.gpus = []
 
     def __call__(self, argv, **kwargs):
         self.calls += 1
+        self.gpus.append(kwargs["env"]["CUDA_VISIBLE_DEVICES"])
         override = argv[argv.index("-override-config") + 1]
         values = {
             item.split("=", 1)[0]: item.split("=", 1)[1]
@@ -392,6 +394,7 @@ def test_cli_executes_confirmation_matrix_and_reuses_finalized_cells(tmp_path):
     assert evidence["promotion_evidence"]["validity"]["promotion_valid"] is True
     assert evidence["runner_manifests_hash"] == file_sha256(runner_map_path)
     assert first_call_count > 0
+    assert set(fake.gpus) == {"7"}
 
     assert main(argv, subprocess_runner=fake) == 0
     assert fake.calls == first_call_count

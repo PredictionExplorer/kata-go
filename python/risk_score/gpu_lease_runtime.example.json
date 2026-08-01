@@ -28,12 +28,20 @@
   "trainer": {
     "checkpointPath": "/replace/me/katago-run/train/riskb40/checkpoint.ckpt",
     "launchCommand": [
-      "/replace/me/bin/start-bucket-limited-trainer",
+      "/replace/me/kata-go/python/.venv/bin/python",
+      "-m",
+      "risk_score.promotion_host",
+      "trainer-launch",
+      "--spec",
+      "/replace/me/katago-run/configs/trainer-launch.json",
       "--checkpoint",
       "{checkpoint_path}"
     ],
     "gracefulCommand": [
-      "/replace/me/bin/request-trainer-checkpoint-and-exit",
+      "/replace/me/kata-go/python/.venv/bin/python",
+      "-m",
+      "risk_score.promotion_host",
+      "trainer-drain",
       "--pid",
       "{pid}",
       "--process-group",
