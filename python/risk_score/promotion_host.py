@@ -636,7 +636,9 @@ def worker_watch_once(state_root: Path, *, stable_seconds: float) -> Mapping[str
     completed = []
     running = []
     for record_path in sorted((state / "workers").glob("*/*.json")):
-        if record_path.name.endswith(".complete.json"):
+        if record_path.name.endswith(
+            (".complete.json", ".run-intent.json", ".run-completion.json")
+        ):
             continue
         record = _load_canonical_json(record_path, "worker record")
         if record.get("contract") != WORKER_RECORD_CONTRACT:
@@ -661,7 +663,9 @@ def workers_drain(
     if plan.get("generation_id") != generation:
         raise HostCommandError("worker drain generation mismatch")
     for record_path in sorted((Path(state_root) / "workers" / generation).glob("*.json")):
-        if record_path.name.endswith(".complete.json"):
+        if record_path.name.endswith(
+            (".complete.json", ".run-intent.json", ".run-completion.json")
+        ):
             continue
         record = _load_canonical_json(record_path, "worker record")
         identity = record["process_identity"]
