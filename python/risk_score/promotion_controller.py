@@ -56,7 +56,12 @@ _SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 _COUNTER_RE = re.compile(r"(?:^|-)s([0-9]+)-d([0-9]+)(?:-|$)")
 _IGNORED_SUFFIXES = (".tmp", ".partial", ".exported")
 _CANDIDATE_FILES = {"model.bin.gz", "model.ckpt"}
-_OPTIONAL_CANDIDATE_FILES = {"manifest.json", "exporter_manifest.json"}
+_OPTIONAL_CANDIDATE_FILES = {
+    "manifest.json",
+    "exporter_manifest.json",
+    "metadata.json",
+    "log.txt",
+}
 _HARDENED_EXPORT_CONTRACT = "katago-hardened-candidate-publication-v1"
 EVALUATION_PLAN_CONTRACT = "risk-score-evaluation-plan-v2"
 

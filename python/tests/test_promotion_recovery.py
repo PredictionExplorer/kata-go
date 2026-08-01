@@ -809,6 +809,11 @@ def test_candidate_validation_counters_and_incomplete_exports(tmp_path):
     assert complete.sample_count == 500000
     assert complete.data_count == 900000
     assert parse_candidate_counters(complete.name) == (500000, 900000)
+    (complete.path / "metadata.json").write_text(
+        '{"global_step_samples":500000,"total_num_data_rows":900000}\n',
+        encoding="utf-8",
+    )
+    (complete.path / "log.txt").write_text("legacy export log\n", encoding="utf-8")
 
     partial = inbox / "net-s600000-d1000000.partial"
     partial.mkdir()
@@ -818,6 +823,12 @@ def test_candidate_validation_counters_and_incomplete_exports(tmp_path):
     (unfinished / "model.bin.gz").write_bytes(b"incomplete")
     candidates, ignored = inventory_candidates(inbox)
     assert [item.name for item in candidates] == [complete.name]
+    assert {name for name, _, _ in candidates[0].files} == {
+        "log.txt",
+        "metadata.json",
+        "model.bin.gz",
+        "model.ckpt",
+    }
     assert set(ignored) == {partial.name, unfinished.name}
 
     (complete.path / "leftover.tmp").write_bytes(b"bad")
