@@ -767,6 +767,9 @@ def run_analysis(
         "katago_sha256": file_sha256(Path(katago)),
         "config_sha256": file_sha256(Path(config)),
         "model_sha256": file_sha256(Path(model)),
+        "cuda_visible_devices": (
+            None if env is None else env.get("CUDA_VISIBLE_DEVICES")
+        ),
         "query_path": str(Path(queries).resolve()),
         "query_sha256": file_sha256(Path(queries)),
         "output_path": str(output.resolve()),
@@ -1313,6 +1316,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     analyze.add_argument("--model", required=True, type=Path)
     analyze.add_argument("--queries", required=True, type=Path)
     analyze.add_argument("-o", "--output", required=True, type=Path)
+    analyze.add_argument("--gpu-index", type=int, default=0)
 
     label = subparsers.add_parser("label")
     label.add_argument("normalized", type=Path)
@@ -1359,12 +1363,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 policy_path=args.policy,
             )
         elif args.command == "run-analysis":
+            if args.gpu_index < 0:
+                raise ValueError("GPU index must be nonnegative")
             result = run_analysis(
                 katago=args.katago,
                 config=args.config,
                 model=args.model,
                 queries=args.queries,
                 output=args.output,
+                env={
+                    **os.environ,
+                    "CUDA_VISIBLE_DEVICES": str(args.gpu_index),
+                },
             )
         elif args.command == "label":
             result = label_positions(

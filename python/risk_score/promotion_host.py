@@ -315,6 +315,8 @@ def trainer_start(
     process = subprocess.Popen(
         argv,
         cwd=str(Path(__file__).resolve().parents[1]),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         start_new_session=True,
         shell=False,
     )
