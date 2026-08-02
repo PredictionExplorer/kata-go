@@ -784,6 +784,142 @@ def run_analysis(
     return {**manifest, "manifest_path": str(manifest_path.resolve())}
 
 
+def split_queries(
+    query_path: Path, output_dir: Path, *, shard_count: int
+) -> Mapping[str, Any]:
+    if type(shard_count) is not int or not 1 <= shard_count <= 64:
+        raise ValueError("query shard count must be between 1 and 64")
+    rows = _load_jsonl(query_path, "analysis query file")
+    shards: list[list[Mapping[str, Any]]] = [[] for _ in range(shard_count)]
+    seen = set()
+    for row in rows:
+        query_id = row.get("id")
+        if not isinstance(query_id, str) or not query_id or query_id in seen:
+            raise ValueError("analysis query IDs must be unique nonempty strings")
+        seen.add(query_id)
+        index = int(hashlib.sha256(query_id.encode("utf-8")).hexdigest(), 16) % shard_count
+        shards[index].append(row)
+    files: Dict[str, bytes] = {}
+    manifest_shards = []
+    for index, shard in enumerate(shards):
+        if not shard:
+            raise ValueError("query sharding produced an empty shard")
+        shard.sort(key=lambda row: row["id"])
+        relative = f"shard-{index:03d}.jsonl"
+        data = _canonical_jsonl(shard)
+        files[relative] = data
+        manifest_shards.append(
+            {
+                "index": index,
+                "path": relative,
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "row_count": len(shard),
+                "ids_sha256": canonical_sha256([row["id"] for row in shard]),
+            }
+        )
+    manifest = {
+        "schema_version": 1,
+        "contract": "risk-score-analysis-query-shards-v1",
+        "source_path": str(Path(query_path).resolve()),
+        "source_sha256": file_sha256(query_path),
+        "source_row_count": len(rows),
+        "shard_count": shard_count,
+        "shards": manifest_shards,
+    }
+    manifest["manifest_sha256"] = canonical_sha256(manifest)
+    files["manifest.json"] = (canonical_json(manifest) + "\n").encode("utf-8")
+    _publish_bundle(output_dir, files)
+    return manifest
+
+
+def merge_analysis(
+    *,
+    query_path: Path,
+    shard_outputs: Sequence[Path],
+    output: Path,
+) -> Mapping[str, Any]:
+    queries = _load_jsonl(query_path, "full analysis query file")
+    expected_ids = {row.get("id") for row in queries}
+    if (
+        None in expected_ids
+        or len(expected_ids) != len(queries)
+        or not all(isinstance(value, str) and value for value in expected_ids)
+    ):
+        raise ValueError("full query file IDs are invalid")
+    merged = {}
+    execution_manifests = []
+    identity = None
+    for shard_output in map(Path, shard_outputs):
+        manifest_path = Path(str(shard_output) + ".manifest.json")
+        manifest = _load_json(manifest_path, "shard analysis manifest")
+        payload = dict(manifest)
+        manifest_hash = payload.pop("manifest_sha256", None)
+        if (
+            manifest.get("contract") != ANALYSIS_RUN_CONTRACT
+            or manifest_hash != canonical_sha256(payload)
+            or manifest.get("output_path") != str(shard_output.resolve())
+            or manifest.get("output_sha256") != file_sha256(shard_output)
+        ):
+            raise ValueError("shard analysis provenance is invalid")
+        coordinates = (
+            manifest.get("katago_sha256"),
+            manifest.get("config_sha256"),
+            manifest.get("model_sha256"),
+        )
+        if identity is None:
+            identity = coordinates
+        elif coordinates != identity:
+            raise ValueError("analysis shards disagree on binary/config/model")
+        rows = _load_jsonl(shard_output, "shard analysis output")
+        if len(rows) != manifest.get("row_count"):
+            raise ValueError("analysis shard row count changed")
+        for row in rows:
+            record_id = row.get("id")
+            if not isinstance(record_id, str) or record_id in merged:
+                raise ValueError("analysis shards contain duplicate/invalid IDs")
+            merged[record_id] = row
+        execution_manifests.append(
+            {
+                "path": str(manifest_path.resolve()),
+                "sha256": file_sha256(manifest_path),
+                "query_sha256": manifest.get("query_sha256"),
+                "output_sha256": manifest.get("output_sha256"),
+                "cuda_visible_devices": manifest.get("cuda_visible_devices"),
+            }
+        )
+    if set(merged) != expected_ids:
+        raise ValueError("analysis shard IDs do not cover the full query file")
+    data = _canonical_jsonl(merged[record_id] for record_id in sorted(merged))
+    _publish_file(output, data)
+    assert identity is not None
+    manifest = {
+        "schema_version": 1,
+        "contract": ANALYSIS_RUN_CONTRACT,
+        "argv": ["merge-analysis"],
+        "katago_sha256": identity[0],
+        "config_sha256": identity[1],
+        "model_sha256": identity[2],
+        "cuda_visible_devices": sorted(
+            {
+                str(item["cuda_visible_devices"])
+                for item in execution_manifests
+            }
+        ),
+        "query_path": str(Path(query_path).resolve()),
+        "query_sha256": file_sha256(query_path),
+        "output_path": str(Path(output).resolve()),
+        "output_sha256": file_sha256(output),
+        "row_count": len(merged),
+        "shards": execution_manifests,
+    }
+    manifest["manifest_sha256"] = canonical_sha256(manifest)
+    manifest_path = Path(str(output) + ".manifest.json")
+    _publish_file(
+        manifest_path, (canonical_json(manifest) + "\n").encode("utf-8")
+    )
+    return {**manifest, "manifest_path": str(manifest_path.resolve())}
+
+
 def _finite(value: Any, role: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{role} must be numeric")
@@ -1318,6 +1454,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     analyze.add_argument("-o", "--output", required=True, type=Path)
     analyze.add_argument("--gpu-index", type=int, default=0)
 
+    split = subparsers.add_parser("split-queries")
+    split.add_argument("queries", type=Path)
+    split.add_argument("--output-dir", required=True, type=Path)
+    split.add_argument("--shards", required=True, type=int)
+
+    merge = subparsers.add_parser("merge-analysis")
+    merge.add_argument("--queries", required=True, type=Path)
+    merge.add_argument("--shard-output", action="append", required=True, type=Path)
+    merge.add_argument("-o", "--output", required=True, type=Path)
+
     label = subparsers.add_parser("label")
     label.add_argument("normalized", type=Path)
     label.add_argument("--query-manifest", required=True, type=Path)
@@ -1375,6 +1521,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     **os.environ,
                     "CUDA_VISIBLE_DEVICES": str(args.gpu_index),
                 },
+            )
+        elif args.command == "split-queries":
+            result = split_queries(
+                args.queries, args.output_dir, shard_count=args.shards
+            )
+        elif args.command == "merge-analysis":
+            result = merge_analysis(
+                query_path=args.queries,
+                shard_outputs=args.shard_output,
+                output=args.output,
             )
         elif args.command == "label":
             result = label_positions(

@@ -15,10 +15,12 @@ from risk_score.curate_position_bank import (
     finalize_reviewed_bank,
     generate_query_bundle,
     label_positions,
+    merge_analysis,
     policy_pool_minima,
     publish_harvest_plan,
     publish_normalized,
     run_analysis,
+    split_queries,
 )
 from risk_score.position_samples import (
     build_analysis_query,
@@ -474,6 +476,61 @@ def test_analysis_runner_uses_argv_and_rejects_incomplete_ids(tmp_path):
             output=tmp_path / "incomplete.jsonl",
             subprocess_runner=incomplete,
         )
+
+
+def test_query_shards_merge_to_one_provenance_bound_result(tmp_path):
+    queries = tmp_path / "queries.jsonl"
+    query_rows = [
+        build_analysis_query(
+            position(index),
+            query_id=f"id-{index}",
+            max_visits=200,
+            powered=False,
+        )
+        for index in range(8)
+    ]
+    write_jsonl(queries, query_rows)
+    bundle = tmp_path / "shards"
+    manifest = split_queries(queries, bundle, shard_count=2)
+    katago = tmp_path / "katago"
+    config = tmp_path / "analysis.cfg"
+    model = tmp_path / "model.bin.gz"
+    katago.write_bytes(b"katago")
+    config.write_text(DETERMINISTIC_ANALYSIS_CONFIG, encoding="utf-8")
+    model.write_bytes(b"model")
+    shard_outputs = []
+    for shard in manifest["shards"]:
+        shard_query = bundle / shard["path"]
+        rows = [
+            analysis_record(row["id"], 0.0, visits=200)
+            for row in (
+                json.loads(line)
+                for line in shard_query.read_text(encoding="utf-8").splitlines()
+            )
+        ]
+        output = tmp_path / f"result-{shard['index']}.jsonl"
+        write_jsonl(output, rows)
+        write_analysis_manifest(
+            output,
+            query=shard_query,
+            katago=katago,
+            config=config,
+            model=model,
+            row_count=len(rows),
+        )
+        shard_outputs.append(output)
+    merged = tmp_path / "merged.jsonl"
+    receipt = merge_analysis(
+        query_path=queries,
+        shard_outputs=shard_outputs,
+        output=merged,
+    )
+    assert receipt["row_count"] == len(query_rows)
+    assert receipt["query_sha256"] == file_sha256(queries)
+    assert {
+        json.loads(line)["id"]
+        for line in merged.read_text(encoding="utf-8").splitlines()
+    } == {row["id"] for row in query_rows}
 
 
 def test_finalize_requires_review_and_policy_minima_then_feeds_suite_builder(tmp_path):
