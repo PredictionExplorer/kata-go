@@ -96,6 +96,8 @@ def test_shuffle_gate_detects_changed_summary_dependency(tmp_path):
     command = append_command(marker) + ["-summary-file", str(summary)]
     assert run_gate(tmp_path, command)["status"] == "SHUFFLED"
     assert run_gate(tmp_path, command)["status"] == "SKIPPED_UNCHANGED"
+    summary.write_text('{"first":1}\n', encoding="utf-8")
+    assert run_gate(tmp_path, command)["status"] == "SKIPPED_UNCHANGED"
 
     summary.write_text('{"second":2}\n', encoding="utf-8")
     assert run_gate(tmp_path, command)["status"] == "SHUFFLED"

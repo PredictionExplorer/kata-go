@@ -178,7 +178,6 @@ def _command_dependency_inventory(
                 "flag": part,
                 "path": str(path.resolve()),
                 "size": after.st_size,
-                "mtime_ns": after.st_mtime_ns,
                 "sha256": hashlib.sha256(data).hexdigest(),
             }
         )
