@@ -3,6 +3,7 @@ import subprocess
 from pathlib import Path
 
 from risk_score.promotion_preflight import (
+    bootstrap_backpressure,
     candidate_inventory,
     deployment_snapshot,
     filesystem_test,
@@ -70,3 +71,45 @@ def test_candidate_inventory_hashes_model_checkpoint_and_tree(tmp_path):
     assert result["candidate_count"] == 1
     assert result["candidates"][0]["sample_count"] == 500000
     assert len(result["candidates"][0]["directory_manifest_sha256"]) == 64
+
+
+def test_bootstrap_backpressure_is_canonical_fail_closed_and_idempotent(tmp_path):
+    output = (tmp_path / "promotion" / "operations" / "backpressure.json").resolve()
+    policy_hash = "a" * 64
+    first = bootstrap_backpressure(output, policy_hash)
+    second = bootstrap_backpressure(output, policy_hash)
+
+    assert first == second
+    assert first["allowExport"] is False
+    assert first["allowEvaluation"] is False
+    assert first["exportPaused"] is True
+    assert first["policy_hash"] == policy_hash
+    assert output.read_bytes() == (
+        json.dumps(
+            first,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode()
+
+    allowing = {
+        **first,
+        "allowExport": True,
+        "exportPaused": False,
+        "reasons": [],
+    }
+    output.write_text(
+        json.dumps(
+            allowing,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    reset = bootstrap_backpressure(output, policy_hash)
+    assert reset["allowExport"] is False
+    assert reset["exportPaused"] is True

@@ -4,6 +4,8 @@ set -o pipefail
 #Shuffles and copies selfplay training from selfplay/ to shuffleddata/current/
 #Should be run periodically.
 
+ORIGINAL_ARGS=("$@")
+
 if [[ $# -lt 3 ]]
 then
     echo "Usage: $0 BASEDIR TMPDIR NTHREADS"
@@ -26,6 +28,18 @@ if command -v python3 >/dev/null 2>&1; then
   PYTHON=python3
 else
   PYTHON=python
+fi
+
+BASEDIR="$(realpath "$BASEDIR")"
+if [[ "${KATAGO_SHUFFLE_GATE_BYPASS:-}" != "1" ]]
+then
+    exec "$PYTHON" -m katago.utils.shuffle_input_gate \
+         --input-root "$BASEDIR/selfplay" \
+         --state-file "$BASEDIR/shuffle-input-state.json" \
+         --lock-file "$BASEDIR/shuffle-input.lock" \
+         --output-root "$BASEDIR/shuffleddata" \
+         --force-after-seconds "${KATAGO_SHUFFLE_FORCE_AFTER_SECONDS:-0}" \
+         -- "$0" "${ORIGINAL_ARGS[@]}"
 fi
 
 OUTDIR=$(date "+%Y%m%d-%H%M%S")

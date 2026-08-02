@@ -46,6 +46,13 @@ from katago.train import load_model
 from katago.train import data_processing_pytorch
 from katago.train import trainloop_helpers
 from katago.train.metrics_logging import accumulate_metrics, log_metrics, clear_metric_nonfinite
+from katago.train.training_controls import (
+    add_validation_telemetry,
+    export_interval_ready,
+    validate_validation_manifest,
+    validation_data_dir,
+)
+
 
 # HANDLE COMMAND AND ARGS -------------------------------------------------------------------
 
@@ -69,6 +76,8 @@ if __name__ == "__main__":
     required_args.add_argument('-traindir', help='Dir to write to for recording training results', required=True)
     required_args.add_argument('-datadir', help='Directory with a train and val subdir of npz data, output by shuffle.py', required=False)
     required_args.add_argument('-latestdatadir', help='Use the latest subdirectory within this dir as the datadir, periodically checking for most recent', required=False)
+    optional_args.add_argument('-fixed-val-datadir', help='Use this immutable validation NPZ directory instead of each shuffle directory val subdir', required=False)
+    optional_args.add_argument('-fixed-val-manifest', help='Canonical hash manifest that must match -fixed-val-datadir on every validation epoch', required=False)
     optional_args.add_argument('-exportdir', help='Directory to export models periodically', required=False)
     optional_args.add_argument('-exportprefix', help='Prefix to append to names of models', required=False)
     optional_args.add_argument('-initial-checkpoint', help='If no training checkpoint exists, initialize from this checkpoint', required=False)
@@ -114,6 +123,7 @@ if __name__ == "__main__":
     optional_args.add_argument('-use-tf32-matmul', help='Reduce float32 precision for speed on some gpus', required=False, action='store_true')
 
     optional_args.add_argument('-epochs-per-export', help='Export model once every this many epochs', type=int, required=False)
+    optional_args.add_argument('-export-min-sample-interval', help='Require at least this many additional global training samples between exports', type=int, required=False)
     optional_args.add_argument('-export-prob', help='Export model with this probablity', type=float, required=False)
     optional_args.add_argument('-max-epochs-this-instance', help='Terminate training after this many more epochs', type=int, required=False)
     optional_args.add_argument('-max-training-samples', help='Terminate training after about this many training steps in samples', type=int, required=False)
@@ -331,6 +341,8 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
     traindir = args["traindir"]
     datadir = args["datadir"]
     latestdatadir = args["latestdatadir"]
+    fixed_val_datadir = args["fixed_val_datadir"]
+    fixed_val_manifest = args["fixed_val_manifest"]
     exportdir = args["exportdir"]
     exportprefix = args["exportprefix"]
     initial_checkpoint = args["initial_checkpoint"]
@@ -382,6 +394,7 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
     use_tf32_matmul = args["use_tf32_matmul"]
 
     epochs_per_export = args["epochs_per_export"]
+    export_min_sample_interval = args["export_min_sample_interval"]
     export_prob = args["export_prob"]
     max_epochs_this_instance = args["max_epochs_this_instance"]
     max_training_samples = args["max_training_samples"]
@@ -430,6 +443,26 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
 
     assert not (not datadir and not latestdatadir), "Must specify one of -datadir and -latestdatadir"
     assert not (datadir and latestdatadir), "Must specify only one of -datadir and -latestdatadir"
+    if (fixed_val_datadir is None) != (fixed_val_manifest is None):
+        raise ValueError(
+            "-fixed-val-datadir and -fixed-val-manifest must be specified together"
+        )
+    if fixed_val_datadir is not None:
+        if (
+            not os.path.isabs(fixed_val_datadir)
+            or os.path.islink(fixed_val_datadir)
+            or not os.path.isdir(fixed_val_datadir)
+        ):
+            raise ValueError("-fixed-val-datadir must be an absolute non-symlink directory")
+        fixed_val_datadir = os.path.realpath(fixed_val_datadir)
+        if (
+            not os.path.isabs(fixed_val_manifest)
+            or os.path.islink(fixed_val_manifest)
+            or not os.path.isfile(fixed_val_manifest)
+        ):
+            raise ValueError("-fixed-val-manifest must be an absolute regular file")
+        fixed_val_manifest = os.path.realpath(fixed_val_manifest)
+        validate_validation_manifest(fixed_val_datadir, fixed_val_manifest)
 
     if samples_per_epoch is None:
         samples_per_epoch = 1000000
@@ -437,6 +470,10 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
         max_train_bucket_size = 1.0e30
     if epochs_per_export is None:
         epochs_per_export = 1
+    if epochs_per_export <= 0:
+        raise ValueError("-epochs-per-export must be positive")
+    if export_min_sample_interval is not None and export_min_sample_interval <= 0:
+        raise ValueError("-export-min-sample-interval must be positive")
     if swa_period_samples is None:
         swa_period_samples = max(1, samples_per_epoch // 2)
     if swa_scale is None:
@@ -473,6 +510,9 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
             ],
         )
     np.set_printoptions(linewidth=150)
+    if fixed_val_datadir is not None:
+        logging.info(f"Using fixed validation data directory: {fixed_val_datadir}")
+        logging.info(f"Using fixed validation manifest: {fixed_val_manifest}")
 
     logging.info(str(sys.argv))
 
@@ -974,6 +1014,8 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
         train_state["train_steps_since_last_reload"] = 0
     if "export_cycle_counter" not in train_state:
         train_state["export_cycle_counter"] = 0
+    if "last_exported_step_samples" not in train_state:
+        train_state["last_exported_step_samples"] = train_state["global_step_samples"]
     if "window_start_data_row_idx" not in train_state:
         train_state["window_start_data_row_idx"] = 0
     if "total_num_data_rows" not in train_state:
@@ -1280,7 +1322,7 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
                     time.sleep(30)
                     continue
 
-                vdatadir = os.path.join(curdatadir,"val")
+                vdatadir = validation_data_dir(curdatadir, fixed_val_datadir)
 
             # Same directory as before, no new shuffle
             else:
@@ -1748,6 +1790,10 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
         if rank == 0:
             logging.info("Beginning validation after epoch!")
             val_files = []
+            if fixed_val_datadir is not None:
+                validate_validation_manifest(
+                    fixed_val_datadir, fixed_val_manifest
+                )
             if os.path.exists(vdatadir):
                 val_files = [os.path.join(vdatadir,fname) for fname in os.listdir(vdatadir) if fname.endswith(".npz")]
             if randomize_val:
@@ -1764,6 +1810,8 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
                     val_metric_sums = defaultdict(float)
                     val_metric_weights = defaultdict(float)
                     val_samples = 0
+                    val_batches = 0
+                    last_val_batch_metrics = {}
                     t0 = time.perf_counter()
                     for batch in data_processing_pytorch.read_npz_training_data(
                         val_files,
@@ -1809,19 +1857,41 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
                             intermediate_loss_scale=intermediate_loss_scale,
                         )
                         metrics = trainloop_helpers.detensorify_metrics(metrics)
+                        last_val_batch_metrics = metrics
                         accumulate_metrics(val_metric_sums, val_metric_weights, metrics, batch_size, decay=1.0, new_weight=1.0)
                         val_samples += batch_size
-                        if max_val_samples is not None and val_samples > max_val_samples:
+                        val_batches += 1
+                        if max_val_samples is not None and val_samples >= max_val_samples:
                             break
-                        val_metric_sums["nsamp_train"] = running_metrics["sums"]["nsamp"]
-                        val_metric_weights["nsamp_train"] = running_metrics["weights"]["nsamp"]
-                        val_metric_sums["wsum_train"] = running_metrics["sums"]["wsum"]
-                        val_metric_weights["wsum_train"] = running_metrics["weights"]["wsum"]
-                    last_val_metrics["sums"] = dict(val_metric_sums)
-                    last_val_metrics["weights"] = dict(val_metric_weights)
-                    log_metrics(val_metric_sums, val_metric_weights, metrics, val_metrics_out)
                     t1 = time.perf_counter()
-                    logging.info(f"Validation took {t1-t0} seconds")
+                    if val_batches <= 0:
+                        if fixed_val_datadir is not None:
+                            raise RuntimeError(
+                                "Fixed validation data produced no complete usable batches"
+                            )
+                        logging.warning("Validation files had no complete usable batches")
+                    else:
+                        add_validation_telemetry(
+                            val_metric_sums,
+                            val_metric_weights,
+                            global_step_samples=train_state["global_step_samples"],
+                            validation_samples=val_samples,
+                            validation_batches=val_batches,
+                            validation_wall_seconds=t1-t0,
+                            running_metrics=running_metrics,
+                        )
+                        last_val_metrics["sums"] = dict(val_metric_sums)
+                        last_val_metrics["weights"] = dict(val_metric_weights)
+                        log_metrics(
+                            val_metric_sums,
+                            val_metric_weights,
+                            last_val_batch_metrics,
+                            val_metrics_out,
+                        )
+                    logging.info(
+                        f"Validation took {t1-t0} seconds over "
+                        f"{val_samples} samples in {val_batches} batches"
+                    )
                     validation_model.train()
 
         if rank == 0:
@@ -1834,6 +1904,19 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
                 else:
                     train_state["export_cycle_counter"] = 0
                     is_time_to_export = True
+            if is_time_to_export and not export_interval_ready(
+                train_state["global_step_samples"],
+                train_state["last_exported_step_samples"],
+                export_min_sample_interval,
+            ):
+                logging.info(
+                    "Deferring export until minimum sample interval is reached: "
+                    f"current={train_state['global_step_samples']} "
+                    f"last={train_state['last_exported_step_samples']} "
+                    f"minimum={export_min_sample_interval}"
+                )
+                train_state["export_cycle_counter"] = epochs_per_export
+                is_time_to_export = False
 
             skip_export_this_time = False
             if export_prob is not None:
@@ -1850,6 +1933,10 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
                 )
                 savepath = os.path.join(exportdir,modelname)
                 savepathtmp = os.path.join(exportdir,modelname+".tmp")
+                # Store the new high-water mark in the exported checkpoint
+                # itself. If saving or publication fails, this process exits
+                # before the persistent checkpoint can advance.
+                train_state["last_exported_step_samples"] = train_state["global_step_samples"]
                 if os.path.exists(savepath):
                     logging.info("NOT saving model, already exists at: " + savepath)
                 else:

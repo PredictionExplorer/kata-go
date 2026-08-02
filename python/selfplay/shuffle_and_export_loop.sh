@@ -25,6 +25,12 @@ shift
 USEGATING="$1"
 shift
 
+if command -v python3 >/dev/null 2>&1; then
+  PYTHON=python3
+else
+  PYTHON=python
+fi
+
 GITROOTDIR="$(git rev-parse --show-toplevel)"
 
 basedir="$(realpath "$BASEDIRRAW")"
@@ -48,7 +54,13 @@ cp -r "$GITROOTDIR"/python/muon "$DATED_ARCHIVE"
     cd "$basedir"/scripts
     while true
     do
-        ./shuffle.sh "$basedir" "$tmpdir" "$NTHREADS" "$@"
+        rm -f "$basedir"/selfplay.summary.json.tmp
+        time $PYTHON ./summarize_old_selfplay_files.py "$basedir"/selfplay/ \
+             -old-summary-file-to-assume-correct "$basedir"/selfplay.summary.json \
+             -new-summary-file "$basedir"/selfplay.summary.json.tmp
+        mv "$basedir"/selfplay.summary.json.tmp "$basedir"/selfplay.summary.json
+        ./shuffle.sh "$basedir" "$tmpdir" "$NTHREADS" \
+             -summary-file "$basedir"/selfplay.summary.json "$@"
         sleep 20
     done
 ) >> "$basedir"/logs/outshuffle.txt 2>&1 & disown

@@ -173,7 +173,12 @@ except ValueError as exc:
 now = datetime.datetime.now(datetime.timezone.utc)
 age = (now - updated).total_seconds()
 if age < -5 or age > maximum_age:
-    raise SystemExit(f"backpressure status is stale or future-dated: age={age:.3f}s")
+    if value["allowExport"]:
+        raise SystemExit(f"export-allowing backpressure status is stale or future-dated: age={age:.3f}s")
+    # A stale denial cannot authorize publication and is therefore safe to
+    # honor indefinitely during bootstrap or a controller outage.
+    print("PAUSE")
+    raise SystemExit(0)
 print("ALLOW" if value["allowExport"] else "PAUSE")
 PY
         )"

@@ -981,17 +981,17 @@ if __name__ == '__main__':
                         filename_mtime_num_rowss = summary_data["filename_mtime_num_rowss"]
                         del dirnames[i]
                         i -= 1
-                        for (filename,mtime,num_rows) in filename_mtime_num_rowss:
-                            if is_temp_npz_like(filename):
-                                # print("WARNING: file looks like a temp file, treating as exclude: ", os.path.join(path,dirname,filename))
+                        for (summary_filename,mtime,num_rows) in filename_mtime_num_rowss:
+                            filename = os.path.join(path,dirname,summary_filename)
+                            if is_temp_npz_like(summary_filename):
+                                # print("WARNING: file looks like a temp file, treating as exclude: ", filename)
                                 excluded_count += 1
                                 tempfilelike_count += 1
                                 continue
-                            if exclude_basename and os.path.basename(filename) in exclude_set:
+                            if exclude_basename and summary_filename in exclude_set:
                                 excluded_count += 1
                                 excluded_due_to_excludes_count += 1
                                 continue
-                            filename = os.path.join(path,dirname,filename)
                             if not exclude_basename and filename in exclude_set:
                                 excluded_count += 1
                                 excluded_due_to_excludes_count += 1

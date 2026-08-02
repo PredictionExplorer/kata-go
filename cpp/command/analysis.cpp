@@ -433,10 +433,7 @@ int MainCmds::analysis(const vector<string>& args) {
   std::thread write_thread = std::thread(writeLoop);
   vector<AsyncBot*> bots;
   for(int threadIdx = 0; threadIdx<numAnalysisThreads; threadIdx++) {
-    string searchRandSeed =
-      forDeterministicTesting
-      ? "forDeterministicTestingAnalysisThread"
-      : Global::uint64ToHexString(seedRand.nextUInt64()) + Global::uint64ToHexString(seedRand.nextUInt64());
+    string searchRandSeed = Global::uint64ToHexString(seedRand.nextUInt64()) + Global::uint64ToHexString(seedRand.nextUInt64());
     AsyncBot* bot = new AsyncBot(defaultParams, nnEval, humanEval, &logger, searchRandSeed);
     bot->setCopyOfExternalPatternBonusTable(patternBonusTable);
     bot->setExternalEvalCache(evalCache);

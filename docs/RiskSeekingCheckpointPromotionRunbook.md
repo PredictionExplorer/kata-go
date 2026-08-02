@@ -222,22 +222,33 @@ python3 -m risk_score.curate_position_bank queries \
   --policy "$REPO/python/risk_score/promotion_policy_v2.json"
 ```
 
-Run each query role with the reviewed analysis config by using the
-`run-analysis` subcommand. The query bundle currently contains standard
-200/800/2,000-visit and powered 800/2,000-visit files. Pass every resulting
-`ROLE=PATH` file to `label`; missing, duplicate, or misbound IDs fail.
-Each run also publishes `<result>.manifest.json`, binding the query, model,
-binary, config, and result hashes, and `label` requires that sidecar:
+Keep `numAnalysisThreads=1`; scale throughput with independently manifested
+process shards. The query bundle currently contains standard 200/800/2,000
+visit and powered 800/2,000 visit files. Split each role before launching:
 
 ```bash
+python3 -m risk_score.curate_position_bank split-queries \
+  "$RUN_DIR/evaluation/curation/query-bundle/queries/standard-800.jsonl" \
+  --output-dir "$RUN_DIR/evaluation/curation/query-shards/standard-800" \
+  --shards 8
+
+# Run once for every shard, assigning reviewed GPU indices.
 python3 -m risk_score.curate_position_bank run-analysis \
   --katago "$REPO/cpp/build-cuda/katago" \
   --config "$REPO/cpp/configs/risk_score/promotion_curation_analysis.cfg" \
   --model "$ORIGINAL_MODEL" \
+  --queries "$RUN_DIR/evaluation/curation/query-shards/standard-800/shard-000.jsonl" \
+  --output "$RUN_DIR/evaluation/curation/result-shards/standard-800/shard-000.jsonl"
+
+# Merge only through the exact split manifest. Repeat --shard-output for all
+# eight outputs; cross-role, missing, duplicate, or misbound shards fail closed.
+python3 -m risk_score.curate_position_bank merge-analysis \
   --queries "$RUN_DIR/evaluation/curation/query-bundle/queries/standard-800.jsonl" \
+  --split-manifest "$RUN_DIR/evaluation/curation/query-shards/standard-800/manifest.json" \
+  --shard-output "$RUN_DIR/evaluation/curation/result-shards/standard-800/shard-000.jsonl" \
   --output "$RUN_DIR/evaluation/curation/results/standard-800.jsonl"
 
-# Repeat run-analysis for every role, then bind all five results:
+# Repeat split, run, and merge for every role, then bind all five results:
 python3 -m risk_score.curate_position_bank label \
   "$RUN_DIR/evaluation/curation/normalized.jsonl" \
   --query-manifest "$RUN_DIR/evaluation/curation/query-bundle/manifest.json" \
@@ -248,6 +259,11 @@ python3 -m risk_score.curate_position_bank label \
   --analysis powered-2000="$RUN_DIR/evaluation/curation/results/powered-2000.jsonl" \
   --output-dir "$RUN_DIR/evaluation/curation/labeling"
 ```
+
+Every shard publishes `<result>.manifest.json`, binding its exact query shard,
+model, binary, config, and result hashes. The merged receipt additionally binds
+the split manifest. Never rebuild a binary path while its shards are running;
+resume a failed shard only with the same recorded binary/config/model hashes.
 
 Only stable ordinary/Lead-40/Lead-80 cases are auto-labeled. Every tactical,
 exploitability, bait, tail, sacrifice, small-gain/large-lead, adversarial, or
@@ -330,12 +346,19 @@ When the promotion controller owns the run, also set:
 export KATAGO_PROMOTION_BACKPRESSURE_FILE="$TRAIN_BASE/promotion/operations/backpressure.json"
 export KATAGO_PROMOTION_POLICY_HASH="8562bcd7b835ae0cfcfe517a290748258da229b3fcf588dc99b3703c2b8f6023"
 export KATAGO_PROMOTION_BACKPRESSURE_MAX_AGE_SECONDS=120
+python3 -m risk_score.promotion_preflight bootstrap-backpressure \
+  --output "$KATAGO_PROMOTION_BACKPRESSURE_FILE" \
+  --policy-hash "$KATAGO_PROMOTION_POLICY_HASH"
 ```
 
 The gated exporter validates canonical JSON, policy identity, and freshness,
-pauses cleanly when `allowExport=false`, and fails closed on stale or malformed
-status. Leave these variables unset only when the controller is deliberately
-not supervising export cadence.
+pauses cleanly when `allowExport=false`, honors a stale denial, and fails
+closed on a stale allowance or malformed status. Re-running the bootstrap
+command safely replaces a controller allowance with a denial during an
+intentional maintenance restart. Shadow mode remains paused; the first
+mutation-enabled controller reconciliation replaces the bootstrap record.
+Leave these variables unset only when the controller is deliberately not
+supervising export cadence.
 
 The first inventory should identify the original, earliest, newest,
 approximately 500k-sample anchors, and checkpoints adjacent to known training

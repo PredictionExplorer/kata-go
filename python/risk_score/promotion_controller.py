@@ -50,6 +50,7 @@ from risk_score.promotion_state import (
     sha256_file,
     utc_timestamp,
 )
+from risk_score.hardened_exporter import EXPORT_CONTRACT
 
 
 _SHA_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -62,7 +63,12 @@ _OPTIONAL_CANDIDATE_FILES = {
     "metadata.json",
     "log.txt",
 }
-_HARDENED_EXPORT_CONTRACT = "katago-hardened-candidate-publication-v1"
+_HARDENED_EXPORT_CONTRACTS = frozenset(
+    {
+        "katago-hardened-candidate-publication-v1",
+        EXPORT_CONTRACT,
+    }
+)
 EVALUATION_PLAN_CONTRACT = "risk-score-evaluation-plan-v2"
 
 PROMOTION_FAILURE_STEPS = (
@@ -593,6 +599,35 @@ def _policy_get(
     return current
 
 
+def _validate_queue_contract(
+    controller: ControllerConfig, policy: Mapping[str, Any]
+) -> None:
+    if policy.get("schema_version") != 2:
+        return
+    queue_policy = policy.get("queue")
+    if not isinstance(queue_policy, Mapping):
+        raise SafetyHalt("frozen policy has no queue contract")
+    screen_interval = queue_policy.get("screen_interval_new_training_samples")
+    confirmation_interval = queue_policy.get(
+        "confirmation_interval_new_training_samples"
+    )
+    policy_queue_limit = queue_policy.get("maximum_active_evaluator_entries")
+    if (
+        type(screen_interval) is not int
+        or screen_interval <= 0
+        or type(confirmation_interval) is not int
+        or confirmation_interval < screen_interval
+        or confirmation_interval % screen_interval != 0
+        or type(policy_queue_limit) is not int
+        or policy_queue_limit <= 0
+        or controller.anchor_interval_samples != screen_interval
+        or controller.max_active_queue != policy_queue_limit
+        or queue_policy.get("coalesce_newer_before_screening") is not True
+        or queue_policy.get("never_replace_started_candidate") is not True
+    ):
+        raise SafetyHalt("runtime and frozen policy queue contracts disagree")
+
+
 def _parse_utc_timestamp(value: str) -> datetime:
     if not isinstance(value, str) or not value.endswith("Z"):
         raise ValueError("timestamp must be UTC and end in Z")
@@ -735,7 +770,7 @@ def _inspect_hardened_candidate(path: Path) -> CandidateArtifact:
     if (
         manifest["schemaVersion"] != 1
         or type(manifest["schemaVersion"]) is not int
-        or manifest["exportContract"] != _HARDENED_EXPORT_CONTRACT
+        or manifest["exportContract"] not in _HARDENED_EXPORT_CONTRACTS
         or manifest["modelProbePassed"] is not True
         or manifest["candidateName"] != path.name
         or not isinstance(manifest["modelName"], str)
@@ -970,11 +1005,11 @@ def select_backlog(
         existing = bins.get(bucket)
         if existing is None or (
             abs(item.sample_count - target),
-            item.sample_count,
+            -item.sample_count,
             item.name,
         ) < (
             abs(existing.sample_count - target),
-            existing.sample_count,
+            -existing.sample_count,
             existing.name,
         ):
             bins[bucket] = item
@@ -1473,6 +1508,9 @@ class PromotionController:
     def validate_static_inputs(self) -> None:
         """Verify every configured immutable policy/model/config/schedule hash."""
 
+        _validate_queue_contract(
+            self.runtime.controller, self.runtime.frozen_policy
+        )
         manifest, _ = self._load_suite_manifest()
         authoritative_cells = self._manifest_cells(manifest)
         byte_checks: List[Tuple[Path, str, str]] = [

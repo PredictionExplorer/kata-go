@@ -279,7 +279,7 @@
     "intervalSeconds": 30.0
   },
   "limits": {
-    "maxActiveQueue": 4,
+    "maxActiveQueue": 3,
     "minFreeBytes": 536870912000
   },
   "backlog": {

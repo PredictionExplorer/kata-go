@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -15,7 +17,11 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence
 
 from risk_score.position_samples import canonical_json, canonical_sha256, file_sha256
-from risk_score.promotion_host import HostCommandError, atomic_write_json
+from risk_score.promotion_host import (
+    HostCommandError,
+    atomic_replace_json,
+    atomic_write_json,
+)
 
 
 def filesystem_test(root: Path) -> Mapping[str, Any]:
@@ -182,6 +188,61 @@ def candidate_inventory(inbox: Path, output: Path) -> Mapping[str, Any]:
     return value
 
 
+def bootstrap_backpressure(output: Path, policy_hash: str) -> Mapping[str, Any]:
+    target = Path(output)
+    if (
+        not target.is_absolute()
+        or target.is_symlink()
+        or not re.fullmatch(r"[0-9a-f]{64}", policy_hash)
+    ):
+        raise HostCommandError(
+            "backpressure output must be absolute and policy hash must be lowercase SHA-256"
+        )
+    if target.exists():
+        if not target.is_file():
+            raise HostCommandError("existing backpressure output is not a regular file")
+        data = target.read_bytes()
+        try:
+            existing = json.loads(data)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise HostCommandError(f"existing backpressure output is invalid: {exc}") from exc
+        if (
+            not isinstance(existing, dict)
+            or data != (canonical_json(existing) + "\n").encode("utf-8")
+            or existing.get("schema_version") != 1
+            or existing.get("policy_hash") != policy_hash
+            or type(existing.get("allowExport")) is not bool
+        ):
+            raise HostCommandError("existing backpressure output conflicts with bootstrap")
+        if (
+            existing.get("allowExport") is False
+            and existing.get("exportPaused") is True
+        ):
+            return existing
+    value = {
+        "schema_version": 1,
+        "policy_hash": policy_hash,
+        "controller_hash": "0" * 64,
+        "updated_at_utc": datetime.datetime.now(
+            datetime.timezone.utc
+        ).isoformat().replace("+00:00", "Z"),
+        "allowExport": False,
+        "allowEvaluation": False,
+        "exportPaused": True,
+        "evaluationPaused": True,
+        "exportBacklogDepth": 0,
+        "evaluationBacklogDepth": 0,
+        "maximumActiveEvaluatorEntries": 3,
+        "importantQueueWarningDepth": 4,
+        "reasons": ["bootstrap-pre-controller"],
+    }
+    if target.exists():
+        atomic_replace_json(target, value)
+    else:
+        atomic_write_json(target, value)
+    return value
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -195,6 +256,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     inventory = subparsers.add_parser("candidate-inventory")
     inventory.add_argument("--inbox", required=True, type=Path)
     inventory.add_argument("--output", required=True, type=Path)
+    backpressure = subparsers.add_parser("bootstrap-backpressure")
+    backpressure.add_argument("--output", required=True, type=Path)
+    backpressure.add_argument("--policy-hash", required=True)
     return parser.parse_args(argv)
 
 
@@ -212,8 +276,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 output=args.output,
                 require_procfs=True,
             )
-        else:
+        elif args.command == "candidate-inventory":
             result = candidate_inventory(args.inbox, args.output)
+        else:
+            result = bootstrap_backpressure(args.output, args.policy_hash)
     except (HostCommandError, OSError, TypeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

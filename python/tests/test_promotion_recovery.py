@@ -16,6 +16,7 @@ from risk_score.promotion_controller import (
     PromotionController,
     RuntimeConfig,
     SafetyHalt,
+    _validate_queue_contract,
     configured_gate_evaluator,
     inspect_candidate,
     inventory_candidates,
@@ -876,6 +877,42 @@ def test_policy_hash_is_canonical_object_hash(tmp_path):
         controller.validate_static_inputs()
 
 
+def test_static_validation_rejects_runtime_queue_policy_drift(tmp_path):
+    runtime = prepare_runtime(tmp_path)
+    policy = {
+        "schema_version": 2,
+        "queue": {
+            "screen_interval_new_training_samples":
+                runtime.controller.anchor_interval_samples,
+            "confirmation_interval_new_training_samples":
+                runtime.controller.anchor_interval_samples * 2,
+            "maximum_active_evaluator_entries":
+                runtime.controller.max_active_queue,
+            "coalesce_newer_before_screening": True,
+            "never_replace_started_candidate": True,
+        },
+    }
+    _validate_queue_contract(runtime.controller, policy)
+    with pytest.raises(SafetyHalt, match="queue contracts disagree"):
+        _validate_queue_contract(
+            replace(
+                runtime.controller,
+                max_active_queue=runtime.controller.max_active_queue + 1,
+            ),
+            policy,
+        )
+
+    with pytest.raises(SafetyHalt, match="queue contracts disagree"):
+        _validate_queue_contract(
+            replace(
+                runtime.controller,
+                anchor_interval_samples=
+                    runtime.controller.anchor_interval_samples + 1,
+            ),
+            policy,
+        )
+
+
 def test_backlog_selection_preserves_edges_anchors_anomalies_and_started(tmp_path):
     inbox = tmp_path / "inbox"
     inbox.mkdir()
@@ -899,6 +936,28 @@ def test_backlog_selection_preserves_edges_anchors_anomalies_and_started(tmp_pat
     assert artifacts[-1].model_hash in selected_hashes
     assert artifacts[2].model_hash in selected_hashes
     assert artifacts[1].model_hash in selected_hashes
+
+
+def test_backlog_coalescing_prefers_newer_equal_distance_anchor(tmp_path):
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    artifacts = [
+        create_candidate(
+            inbox,
+            f"net-{index}-s{samples}-d{samples * 2}",
+            model=f"model-{index}".encode(),
+        )
+        for index, samples in enumerate((0, 400000, 600000, 1500000))
+    ]
+    selection = select_backlog(
+        artifacts,
+        original_hash=digest("original"),
+        anchor_interval_samples=500000,
+        max_active_queue=3,
+    )
+    selected_hashes = {item.model_hash for item in selection.selected}
+    assert artifacts[2].model_hash in selected_hashes
+    assert artifacts[1].model_hash not in selected_hashes
 
 
 def test_duplicate_hash_is_idempotent_and_duplicate_name_conflict_halts(tmp_path):

@@ -16,6 +16,7 @@ from risk_score.hardened_exporter import (
     HardenedExporter,
     main,
 )
+from risk_score.promotion_controller import inspect_candidate
 
 
 class FakeExportRunner:
@@ -148,6 +149,24 @@ def test_manifest_hashes_every_artifact_and_is_canonical(tmp_path):
         artifact = result.final_dir / entry["path"]
         assert entry["size"] == artifact.stat().st_size
         assert entry["sha256"] == hashlib.sha256(artifact.read_bytes()).hexdigest()
+
+
+def test_published_v2_candidate_is_accepted_by_promotion_controller(tmp_path):
+    source_dir, _ = source_candidate(tmp_path)
+    destination_root = tmp_path / "modelstobetested"
+    request = request_for(
+        source_dir,
+        destination_root,
+        name="candidate-s500000-d1000000",
+    )
+    published = HardenedExporter(command_runner=FakeExportRunner()).publish(request)
+
+    candidate = inspect_candidate(published.final_dir)
+
+    assert candidate.name == request.candidate_name
+    assert candidate.sample_count == 500000
+    assert candidate.data_count == 1000000
+    assert candidate.directory_manifest_hash == published.manifest_sha256
 
 
 def test_duplicate_name_with_same_manifest_is_idempotent(tmp_path):
@@ -348,6 +367,41 @@ def test_gated_shell_rejects_stale_allow_export_status(tmp_path):
 
     assert result.returncode != 0
     assert "failing closed" in result.stderr
+    assert list((tmp_path / "modelstobetested").iterdir()) == []
+
+
+def test_gated_shell_honors_stale_deny_status_fail_closed(tmp_path):
+    python_root = Path(__file__).resolve().parents[1]
+    script = python_root / "selfplay" / "export_model_for_selfplay.sh"
+    policy_hash = "a" * 64
+    status_path = tmp_path / "stale-deny-backpressure.json"
+    status = {
+        "schema_version": 1,
+        "updated_at_utc": "2020-01-01T00:00:00.000000Z",
+        "policy_hash": policy_hash,
+        "allowExport": False,
+    }
+    status_path.write_text(
+        json.dumps(status, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["KATAGO_PROMOTION_BACKPRESSURE_FILE"] = str(status_path)
+    env["KATAGO_PROMOTION_POLICY_HASH"] = policy_hash
+    env.pop("KATAGO_MODEL_PROBE_COMMAND_JSON", None)
+
+    result = subprocess.run(
+        ["bash", str(script), "test-run", str(tmp_path), "1"],
+        cwd=python_root,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "export paused by controller backpressure" in result.stdout
     assert list((tmp_path / "modelstobetested").iterdir()) == []
 
 

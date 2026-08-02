@@ -853,6 +853,7 @@ stopped reliably.
 ```bash
 export SHUFFLE_THREADS='SET_ME'
 export BATCH_SIZE='SET_ME'
+export KATAGO_SHUFFLE_FORCE_AFTER_SECONDS=3600
 case "$SHUFFLE_THREADS" in
   ''|*[!0-9]*) echo "Set integer SHUFFLE_THREADS" >&2; exit 1 ;;
 esac
@@ -878,7 +879,11 @@ echo "$shuffle_pid" > "$RUN_DIR/pids/shuffle.pgid"
 Fill the placeholders with integers before execution. Choose window and
 retention parameters only after reading `python/shuffle.py -help`; retain a
 validation split for checkpoint evaluation unless an approved experiment says
-otherwise.
+otherwise. `shuffle.sh` fingerprints complete self-play inputs and skips an
+unchanged shuffle. The force interval is a safety valve that provides a fresh
+random sample when a trainer still has bucket credit but no new self-play file
+has completed; tune it from measured trainer consumption time rather than
+returning to an unconditional tight loop.
 
 ### 3. Trainer on GPU 7
 
@@ -893,25 +898,44 @@ export TRAINING_NAME=riskb40
 export MODEL_KIND=b40c768nbt
 export INITIAL_CHECKPOINT="$RUN_DIR/artifacts/checkpoints/kata1-zhizi-b40c768nbt-s11272M-d5935M.ckpt"
 export LR_SCALE='SET_ME'
+export FIXED_VAL_DIR='SET_ME'
+export FIXED_VAL_MANIFEST='SET_ME'
 export MAX_BUCKET_PER_DATA=4
 export MAX_BUCKET_SIZE=5000000
 test "$LR_SCALE" != SET_ME
+test "$FIXED_VAL_DIR" != SET_ME
+test "$FIXED_VAL_MANIFEST" != SET_ME
 case "$BATCH_SIZE" in *[!0-9]*|'') echo "Set BATCH_SIZE" >&2; exit 1 ;; esac
 
 set +m
 setsid bash -c '
   cd "$1/python"
   export CUDA_VISIBLE_DEVICES=7
-  exec ./selfplay/train.sh \
-    "$2" "$3" "$4" "$5" main \
-    -initial-checkpoint "$6" \
-    -lr-scale "$7" \
-    -max-train-bucket-per-new-data "$8" \
-    -max-train-bucket-size "$9" \
-    -no-repeat-files
+  while true; do
+    if ! ./selfplay/train.sh \
+      "$2" "$3" "$4" "$5" main \
+      -initial-checkpoint "$6" \
+      -lr-scale "$7" \
+      -fixed-val-datadir "$8" \
+      -fixed-val-manifest "$9" \
+      -max-train-bucket-per-new-data "${10}" \
+      -max-train-bucket-size "${11}" \
+      -samples-per-epoch 100000 \
+      -swa-period-samples 1000000 \
+      -use-muon -use-bf16 \
+      -epochs-per-export 5 \
+      -export-min-sample-interval 500000 \
+      -max-val-samples 12288 \
+      -no-repeat-files -stop-when-train-bucket-limited
+    then
+      exit 1
+    fi
+    sleep 30
+  done
 ' _ \
   "$REPO" "$TRAIN_BASE" "$TRAINING_NAME" "$MODEL_KIND" "$BATCH_SIZE" \
-  "$INITIAL_CHECKPOINT" "$LR_SCALE" "$MAX_BUCKET_PER_DATA" "$MAX_BUCKET_SIZE" \
+  "$INITIAL_CHECKPOINT" "$LR_SCALE" "$FIXED_VAL_DIR" "$FIXED_VAL_MANIFEST" \
+  "$MAX_BUCKET_PER_DATA" "$MAX_BUCKET_SIZE" \
   >> "$TRAIN_BASE/logs/train-launch.log" 2>&1 &
 train_pid="$!"
 sleep 1
@@ -919,10 +943,17 @@ test "$(ps -o pgid= -p "$train_pid" | tr -d ' ')" = "$train_pid"
 echo "$train_pid" > "$RUN_DIR/pids/train.pgid"
 ```
 
-Select and record `-use-bf16`, `-use-fp16`, or neither only after a measured
-numerical and throughput smoke. If the source checkpoint's optimizer is
-resumable, pass the matching optimizer flags. If it is not, start a fresh
-optimizer explicitly and document the conservative schedule.
+The flags above reflect the measured b40 Muon/BF16 production path; any batch
+size change still requires a bounded smoke from a protected checkpoint copy.
+Keep the fixed validation directory immutable and outside shuffler/trainer
+inputs. Create its immutable inventory with
+`python3 -m katago.train.training_controls freeze-validation --directory
+"$FIXED_VAL_DIR" --output "$FIXED_VAL_MANIFEST"`. The trainer revalidates it
+every epoch. The restart loop handles normal bucket-limited exits; once the
+promotion host supervisor is installed, use that single-owner supervisor
+instead of running both. If the source checkpoint's optimizer is not
+resumable, start a fresh optimizer explicitly and document the conservative
+schedule.
 
 ### 4. Exporter, staging only
 
@@ -938,6 +969,10 @@ test "$KATAGO_MODEL_PROBE_COMMAND_JSON" != SET_ME
 export KATAGO_PROMOTION_BACKPRESSURE_FILE="$TRAIN_BASE/promotion/operations/backpressure.json"
 export KATAGO_PROMOTION_POLICY_HASH="8562bcd7b835ae0cfcfe517a290748258da229b3fcf588dc99b3703c2b8f6023"
 export KATAGO_PROMOTION_BACKPRESSURE_MAX_AGE_SECONDS=120
+
+python3 -m risk_score.promotion_preflight bootstrap-backpressure \
+  --output "$KATAGO_PROMOTION_BACKPRESSURE_FILE" \
+  --policy-hash "$KATAGO_PROMOTION_POLICY_HASH"
 
 set +m
 setsid bash -c '
@@ -959,8 +994,11 @@ Set `KATAGO_MODEL_PROBE_COMMAND_JSON` to a reviewed JSON argv array that loads
 hardened gated exporter publishes through a unique `.partial` directory,
 places completed candidates in `modelstobetested`, and archives the intact
 source under `torchmodels_exported`. The controller backpressure file pauses
-new gated exports when the evaluation queue is full; stale or malformed status
-fails closed.
+new gated exports when the evaluation queue is full. A stale denial remains a
+safe pause; a stale allowance, missing file, malformed status, or policy
+mismatch fails closed. Recommendation-only shadow mode deliberately leaves the
+bootstrap denial in place; the first mutation-enabled reconciler tick replaces
+it with the controller-owned live status after all activation gates pass.
 
 ### 5. Evaluation and controller promotion
 
@@ -1044,8 +1082,10 @@ Track:
 - newest self-play, shuffle, checkpoint, and export timestamps;
 - train-bucket occupancy and trainer wait time;
 - training and validation losses by head;
+- fixed-validation sample/batch count, wall time, and global sample anchor;
 - gradient norm, non-finite values, and AMP scaler behavior;
 - checkpoint/export cadence;
+- shuffle gate `SHUFFLED` versus `SKIPPED_UNCHANGED` status;
 - queued and evaluated candidates; and
 - Phase 2 evaluation metrics over time.
 

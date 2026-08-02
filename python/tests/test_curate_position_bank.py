@@ -162,6 +162,62 @@ def write_analysis_manifest(path, *, query, katago, config, model, row_count):
     )
 
 
+def create_sharded_analysis_fixture(
+    root, *, powered=False, visits=200, shard_count=2
+):
+    root.mkdir()
+    queries = root / "queries.jsonl"
+    query_rows = [
+        build_analysis_query(
+            position(index),
+            query_id=f"id-{index}",
+            max_visits=visits,
+            powered=powered,
+        )
+        for index in range(8)
+    ]
+    write_jsonl(queries, query_rows)
+    bundle = root / "shards"
+    split_manifest = split_queries(queries, bundle, shard_count=shard_count)
+    katago = root / "katago"
+    config = root / "analysis.cfg"
+    model = root / "model.bin.gz"
+    katago.write_bytes(b"katago")
+    config.write_text(DETERMINISTIC_ANALYSIS_CONFIG, encoding="utf-8")
+    model.write_bytes(b"model")
+    outputs = []
+    for shard in split_manifest["shards"]:
+        shard_query = bundle / shard["path"]
+        rows = [
+            analysis_record(row["id"], 0.0, visits=visits)
+            for row in (
+                json.loads(line)
+                for line in shard_query.read_text(encoding="utf-8").splitlines()
+            )
+        ]
+        output = root / f"result-{shard['index']}.jsonl"
+        write_jsonl(output, rows)
+        write_analysis_manifest(
+            output,
+            query=shard_query,
+            katago=katago,
+            config=config,
+            model=model,
+            row_count=len(rows),
+        )
+        outputs.append(output)
+    return {
+        "queries": queries,
+        "bundle": bundle,
+        "split_manifest": split_manifest,
+        "katago": katago,
+        "config": config,
+        "model": model,
+        "outputs": outputs,
+        "query_rows": query_rows,
+    }
+
+
 def test_normalization_rejects_semantic_duplicates_and_builds_analysis_query(tmp_path):
     rows = ["X" + "." * 18] + ["." * 19] * 18
     source = tmp_path / "positions.jsonl"
@@ -416,8 +472,9 @@ def test_analysis_runner_uses_argv_and_rejects_incomplete_ids(tmp_path):
     katago = tmp_path / "katago"
     config = tmp_path / "analysis.cfg"
     model = tmp_path / "model.bin.gz"
-    for path in (katago, config, model):
-        path.write_bytes(path.name.encode())
+    katago.write_bytes(b"katago")
+    config.write_text(DETERMINISTIC_ANALYSIS_CONFIG, encoding="utf-8")
+    model.write_bytes(b"model")
     queries = tmp_path / "queries.jsonl"
     write_jsonl(
         queries,
@@ -479,58 +536,103 @@ def test_analysis_runner_uses_argv_and_rejects_incomplete_ids(tmp_path):
 
 
 def test_query_shards_merge_to_one_provenance_bound_result(tmp_path):
-    queries = tmp_path / "queries.jsonl"
-    query_rows = [
-        build_analysis_query(
-            position(index),
-            query_id=f"id-{index}",
-            max_visits=200,
-            powered=False,
-        )
-        for index in range(8)
-    ]
-    write_jsonl(queries, query_rows)
-    bundle = tmp_path / "shards"
-    manifest = split_queries(queries, bundle, shard_count=2)
-    katago = tmp_path / "katago"
-    config = tmp_path / "analysis.cfg"
-    model = tmp_path / "model.bin.gz"
-    katago.write_bytes(b"katago")
-    config.write_text(DETERMINISTIC_ANALYSIS_CONFIG, encoding="utf-8")
-    model.write_bytes(b"model")
-    shard_outputs = []
-    for shard in manifest["shards"]:
-        shard_query = bundle / shard["path"]
-        rows = [
-            analysis_record(row["id"], 0.0, visits=200)
-            for row in (
-                json.loads(line)
-                for line in shard_query.read_text(encoding="utf-8").splitlines()
-            )
-        ]
-        output = tmp_path / f"result-{shard['index']}.jsonl"
-        write_jsonl(output, rows)
-        write_analysis_manifest(
-            output,
-            query=shard_query,
-            katago=katago,
-            config=config,
-            model=model,
-            row_count=len(rows),
-        )
-        shard_outputs.append(output)
+    fixture = create_sharded_analysis_fixture(tmp_path / "standard")
     merged = tmp_path / "merged.jsonl"
     receipt = merge_analysis(
-        query_path=queries,
-        shard_outputs=shard_outputs,
+        query_path=fixture["queries"],
+        split_manifest_path=fixture["bundle"] / "manifest.json",
+        shard_outputs=fixture["outputs"],
         output=merged,
     )
-    assert receipt["row_count"] == len(query_rows)
-    assert receipt["query_sha256"] == file_sha256(queries)
+    assert receipt["row_count"] == len(fixture["query_rows"])
+    assert receipt["query_sha256"] == file_sha256(fixture["queries"])
+    assert receipt["split_manifest_sha256"] == file_sha256(
+        fixture["bundle"] / "manifest.json"
+    )
     assert {
         json.loads(line)["id"]
         for line in merged.read_text(encoding="utf-8").splitlines()
-    } == {row["id"] for row in query_rows}
+    } == {row["id"] for row in fixture["query_rows"]}
+
+
+def test_merge_analysis_rejects_cross_role_and_incomplete_shards(tmp_path):
+    standard = create_sharded_analysis_fixture(tmp_path / "standard")
+    powered = create_sharded_analysis_fixture(
+        tmp_path / "powered", powered=True
+    )
+    with pytest.raises(ValueError, match="not in split manifest"):
+        merge_analysis(
+            query_path=standard["queries"],
+            split_manifest_path=standard["bundle"] / "manifest.json",
+            shard_outputs=[standard["outputs"][0], powered["outputs"][1]],
+            output=tmp_path / "cross-role.jsonl",
+        )
+    with pytest.raises(ValueError, match="output count"):
+        merge_analysis(
+            query_path=standard["queries"],
+            split_manifest_path=standard["bundle"] / "manifest.json",
+            shard_outputs=standard["outputs"][:1],
+            output=tmp_path / "missing.jsonl",
+        )
+    with pytest.raises(ValueError, match="more than once"):
+        merge_analysis(
+            query_path=standard["queries"],
+            split_manifest_path=standard["bundle"] / "manifest.json",
+            shard_outputs=[standard["outputs"][0], standard["outputs"][0]],
+            output=tmp_path / "duplicate.jsonl",
+        )
+
+
+def test_merge_analysis_rejects_misbound_shard_ids_and_source(tmp_path):
+    fixture = create_sharded_analysis_fixture(tmp_path / "standard")
+    first = fixture["outputs"][0]
+    first_manifest_path = Path(str(first) + ".manifest.json")
+    first_manifest = json.loads(first_manifest_path.read_text(encoding="utf-8"))
+    second_query = fixture["bundle"] / fixture["split_manifest"]["shards"][1]["path"]
+    first_manifest["query_path"] = str(second_query.resolve())
+    first_manifest["query_sha256"] = file_sha256(second_query)
+    first_manifest.pop("manifest_sha256")
+    first_manifest["manifest_sha256"] = canonical_sha256(first_manifest)
+    first_manifest_path.write_text(
+        canonical_json(first_manifest) + "\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="output IDs are misbound"):
+        merge_analysis(
+            query_path=fixture["queries"],
+            split_manifest_path=fixture["bundle"] / "manifest.json",
+            shard_outputs=fixture["outputs"],
+            output=tmp_path / "misbound.jsonl",
+        )
+
+    other = create_sharded_analysis_fixture(
+        tmp_path / "other", visits=800
+    )
+    with pytest.raises(ValueError, match="another source query file"):
+        merge_analysis(
+            query_path=fixture["queries"],
+            split_manifest_path=other["bundle"] / "manifest.json",
+            shard_outputs=fixture["outputs"],
+            output=tmp_path / "wrong-source.jsonl",
+        )
+
+
+def test_analysis_runner_rejects_multi_thread_deterministic_config(tmp_path):
+    fixture = create_sharded_analysis_fixture(tmp_path / "fixture")
+    config = tmp_path / "multi-thread.cfg"
+    config.write_text(
+        DETERMINISTIC_ANALYSIS_CONFIG.replace(
+            "numAnalysisThreads = 1", "numAnalysisThreads = 8"
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="numAnalysisThreads"):
+        run_analysis(
+            katago=fixture["katago"],
+            config=config,
+            model=fixture["model"],
+            queries=fixture["queries"],
+            output=tmp_path / "not-run.jsonl",
+        )
 
 
 def test_finalize_requires_review_and_policy_minima_then_feeds_suite_builder(tmp_path):

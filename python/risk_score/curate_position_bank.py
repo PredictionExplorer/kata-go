@@ -33,6 +33,7 @@ HARVEST_PLAN_CONTRACT = "risk-score-position-harvest-plan-v1"
 HARVEST_RECEIPT_CONTRACT = "risk-score-position-harvest-receipt-v1"
 QUERY_BUNDLE_CONTRACT = "risk-score-position-analysis-query-bundle-v1"
 ANALYSIS_RUN_CONTRACT = "risk-score-position-analysis-run-v1"
+QUERY_SHARDS_CONTRACT = "risk-score-analysis-query-shards-v1"
 LABELING_CONTRACT = "risk-score-position-bank-labeling-v1"
 FINAL_MANIFEST_CONTRACT = "risk-score-reviewed-position-bank-v1"
 REVIEW_ONLY_LABELS = frozenset(
@@ -259,6 +260,7 @@ def validate_deterministic_analysis_config(path: Path) -> None:
         values[key] = value.lower()
     required = {
         "forDeterministicTesting": "true",
+        "numAnalysisThreads": "1",
         "nnRandomize": "false",
         "rootNoiseEnabled": "false",
         "rootNumSymmetriesToSample": "1",
@@ -275,12 +277,6 @@ def validate_deterministic_analysis_config(path: Path) -> None:
         raise ValueError(
             f"analysis config is not deterministic and perspective-fixed: {conflicts}"
         )
-    try:
-        analysis_threads = int(values.get("numAnalysisThreads", ""))
-    except ValueError as exc:
-        raise ValueError("analysis config numAnalysisThreads is invalid") from exc
-    if not 1 <= analysis_threads <= 64:
-        raise ValueError("analysis config numAnalysisThreads must be 1..64")
 
 
 def normalize_sources(
@@ -711,6 +707,7 @@ def run_analysis(
         source = Path(path)
         if source.is_symlink() or not source.is_file():
             raise ValueError(f"{role} must be a regular non-symlink file")
+    validate_deterministic_analysis_config(Path(config))
     query_rows = _load_jsonl(Path(queries), "analysis queries")
     expected_ids = [row.get("id") for row in query_rows]
     if (
@@ -824,7 +821,7 @@ def split_queries(
         )
     manifest = {
         "schema_version": 1,
-        "contract": "risk-score-analysis-query-shards-v1",
+        "contract": QUERY_SHARDS_CONTRACT,
         "source_path": str(Path(query_path).resolve()),
         "source_sha256": file_sha256(query_path),
         "source_row_count": len(rows),
@@ -837,9 +834,105 @@ def split_queries(
     return manifest
 
 
+def _load_query_shard_manifest(
+    manifest_path: Path, query_path: Path
+) -> Tuple[Mapping[str, Any], Mapping[int, Mapping[str, Any]]]:
+    manifest_path = Path(manifest_path)
+    manifest = _load_json(manifest_path, "query shard manifest")
+    payload = dict(manifest)
+    manifest_hash = payload.pop("manifest_sha256", None)
+    if (
+        manifest.get("schema_version") != 1
+        or manifest.get("contract") != QUERY_SHARDS_CONTRACT
+        or manifest_hash != canonical_sha256(payload)
+    ):
+        raise ValueError("query shard manifest provenance is invalid")
+    query_path = Path(query_path)
+    if (
+        manifest.get("source_path") != str(query_path.resolve())
+        or manifest.get("source_sha256") != file_sha256(query_path)
+    ):
+        raise ValueError("query shard manifest names another source query file")
+    query_rows = _load_jsonl(query_path, "full analysis query file")
+    if manifest.get("source_row_count") != len(query_rows):
+        raise ValueError("query shard manifest source row count changed")
+    shard_count = manifest.get("shard_count")
+    shards = manifest.get("shards")
+    if (
+        type(shard_count) is not int
+        or shard_count < 1
+        or not isinstance(shards, list)
+        or len(shards) != shard_count
+    ):
+        raise ValueError("query shard manifest shard count is invalid")
+
+    by_index: Dict[int, Mapping[str, Any]] = {}
+    seen_hashes = set()
+    bundle_root = manifest_path.parent.resolve()
+    for raw_spec in shards:
+        if not isinstance(raw_spec, dict) or set(raw_spec) != {
+            "index",
+            "path",
+            "sha256",
+            "row_count",
+            "ids_sha256",
+        }:
+            raise ValueError("query shard manifest contains an invalid shard entry")
+        index = raw_spec.get("index")
+        relative = raw_spec.get("path")
+        query_hash = raw_spec.get("sha256")
+        if (
+            type(index) is not int
+            or index < 0
+            or index >= shard_count
+            or index in by_index
+            or not isinstance(relative, str)
+            or not relative
+            or Path(relative).is_absolute()
+            or ".." in Path(relative).parts
+            or not isinstance(query_hash, str)
+            or query_hash in seen_hashes
+        ):
+            raise ValueError("query shard manifest contains an unsafe shard identity")
+        shard_path = manifest_path.parent / relative
+        if (
+            shard_path.is_symlink()
+            or not shard_path.is_file()
+            or shard_path.resolve().parent != bundle_root
+            or file_sha256(shard_path) != query_hash
+        ):
+            raise ValueError(f"query shard {index} artifact changed")
+        rows = _load_jsonl(shard_path, f"analysis query shard {index}")
+        ids = [row.get("id") for row in rows]
+        if (
+            any(not isinstance(record_id, str) or not record_id for record_id in ids)
+            or len(ids) != len(set(ids))
+            or raw_spec.get("row_count") != len(rows)
+            or raw_spec.get("ids_sha256") != canonical_sha256(ids)
+        ):
+            raise ValueError(f"query shard {index} IDs or row count changed")
+        by_index[index] = {
+            **raw_spec,
+            "resolved_path": str(shard_path.resolve()),
+            "ids": frozenset(ids),
+        }
+        seen_hashes.add(query_hash)
+    if set(by_index) != set(range(shard_count)):
+        raise ValueError("query shard manifest indices are incomplete")
+    shard_ids = [spec["ids"] for spec in by_index.values()]
+    combined_ids = set().union(*shard_ids)
+    if (
+        sum(len(ids) for ids in shard_ids) != len(combined_ids)
+        or combined_ids != {row.get("id") for row in query_rows}
+    ):
+        raise ValueError("query shards do not cover the source query IDs")
+    return manifest, by_index
+
+
 def merge_analysis(
     *,
     query_path: Path,
+    split_manifest_path: Path,
     shard_outputs: Sequence[Path],
     output: Path,
 ) -> Mapping[str, Any]:
@@ -851,9 +944,18 @@ def merge_analysis(
         or not all(isinstance(value, str) and value for value in expected_ids)
     ):
         raise ValueError("full query file IDs are invalid")
+    split_manifest, shard_specs = _load_query_shard_manifest(
+        split_manifest_path, query_path
+    )
+    if len(shard_outputs) != len(shard_specs):
+        raise ValueError("analysis shard output count does not match split manifest")
+    specs_by_hash = {
+        spec["sha256"]: spec for spec in shard_specs.values()
+    }
     merged = {}
     execution_manifests = []
     identity = None
+    seen_indices = set()
     for shard_output in map(Path, shard_outputs):
         manifest_path = Path(str(shard_output) + ".manifest.json")
         manifest = _load_json(manifest_path, "shard analysis manifest")
@@ -875,9 +977,25 @@ def merge_analysis(
             identity = coordinates
         elif coordinates != identity:
             raise ValueError("analysis shards disagree on binary/config/model")
+        query_hash = manifest.get("query_sha256")
+        spec = specs_by_hash.get(query_hash)
+        if spec is None:
+            raise ValueError("analysis shard query hash is not in split manifest")
+        index = spec["index"]
+        if index in seen_indices:
+            raise ValueError(f"analysis shard index {index} was supplied more than once")
+        if manifest.get("query_path") != spec["resolved_path"]:
+            raise ValueError(f"analysis shard {index} query path is misbound")
         rows = _load_jsonl(shard_output, "shard analysis output")
         if len(rows) != manifest.get("row_count"):
             raise ValueError("analysis shard row count changed")
+        output_ids = {row.get("id") for row in rows}
+        if (
+            None in output_ids
+            or len(output_ids) != len(rows)
+            or output_ids != spec["ids"]
+        ):
+            raise ValueError(f"analysis shard {index} output IDs are misbound")
         for row in rows:
             record_id = row.get("id")
             if not isinstance(record_id, str) or record_id in merged:
@@ -885,15 +1003,21 @@ def merge_analysis(
             merged[record_id] = row
         execution_manifests.append(
             {
+                "index": index,
                 "path": str(manifest_path.resolve()),
                 "sha256": file_sha256(manifest_path),
-                "query_sha256": manifest.get("query_sha256"),
+                "query_path": spec["resolved_path"],
+                "query_sha256": query_hash,
                 "output_sha256": manifest.get("output_sha256"),
                 "cuda_visible_devices": manifest.get("cuda_visible_devices"),
             }
         )
+        seen_indices.add(index)
+    if seen_indices != set(shard_specs):
+        raise ValueError("analysis shard outputs do not cover the split manifest")
     if set(merged) != expected_ids:
         raise ValueError("analysis shard IDs do not cover the full query file")
+    execution_manifests.sort(key=lambda item: item["index"])
     data = _canonical_jsonl(merged[record_id] for record_id in sorted(merged))
     _publish_file(output, data)
     assert identity is not None
@@ -912,6 +1036,9 @@ def merge_analysis(
         ),
         "query_path": str(Path(query_path).resolve()),
         "query_sha256": file_sha256(query_path),
+        "split_manifest_path": str(Path(split_manifest_path).resolve()),
+        "split_manifest_sha256": file_sha256(Path(split_manifest_path)),
+        "split_manifest_identity": split_manifest["manifest_sha256"],
         "output_path": str(Path(output).resolve()),
         "output_sha256": file_sha256(output),
         "row_count": len(merged),
@@ -1466,6 +1593,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
     merge = subparsers.add_parser("merge-analysis")
     merge.add_argument("--queries", required=True, type=Path)
+    merge.add_argument("--split-manifest", required=True, type=Path)
     merge.add_argument("--shard-output", action="append", required=True, type=Path)
     merge.add_argument("-o", "--output", required=True, type=Path)
 
@@ -1534,6 +1662,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         elif args.command == "merge-analysis":
             result = merge_analysis(
                 query_path=args.queries,
+                split_manifest_path=args.split_manifest,
                 shard_outputs=args.shard_output,
                 output=args.output,
             )
