@@ -259,7 +259,6 @@ def validate_deterministic_analysis_config(path: Path) -> None:
         values[key] = value.lower()
     required = {
         "forDeterministicTesting": "true",
-        "numAnalysisThreads": "1",
         "nnRandomize": "false",
         "rootNoiseEnabled": "false",
         "rootNumSymmetriesToSample": "1",
@@ -276,6 +275,12 @@ def validate_deterministic_analysis_config(path: Path) -> None:
         raise ValueError(
             f"analysis config is not deterministic and perspective-fixed: {conflicts}"
         )
+    try:
+        analysis_threads = int(values.get("numAnalysisThreads", ""))
+    except ValueError as exc:
+        raise ValueError("analysis config numAnalysisThreads is invalid") from exc
+    if not 1 <= analysis_threads <= 64:
+        raise ValueError("analysis config numAnalysisThreads must be 1..64")
 
 
 def normalize_sources(
