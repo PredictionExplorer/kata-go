@@ -384,7 +384,7 @@ def build_harvest_argv(
             raise ValueError(
                 f"SGFS source is inside a training/shuffler input root: {directory}"
             )
-        argv.extend(["--sgfsdir", str(directory.resolve())])
+        argv.extend(["-sgfsdir", str(directory.resolve())])
     for directory in map(Path, sgf_dirs):
         if directory.is_symlink() or not directory.is_dir():
             raise ValueError(f"SGF source is not a regular directory: {directory}")
@@ -392,26 +392,26 @@ def build_harvest_argv(
             raise ValueError(
                 f"SGF source is inside a training/shuffler input root: {directory}"
             )
-        argv.extend(["--sgfdir", str(directory.resolve())])
+        argv.extend(["-sgfdir", str(directory.resolve())])
     argv.extend(
         [
-            "--outdir",
+            "-outdir",
             str(Path(output_dir).resolve()),
-            "--sample-prob",
+            "-sample-prob",
             "1",
-            "--turn-weight-lambda",
+            "-turn-weight-lambda",
             "0",
-            "--min-turn-number-board-area-prop",
+            "-min-turn-number-board-area-prop",
             "0.05",
-            "--max-turn-number-board-area-prop",
+            "-max-turn-number-board-area-prop",
             "0.95",
-            "--max-handicap",
+            "-max-handicap",
             "0",
-            "--max-komi",
+            "-max-komi",
             "7.5",
-            "--num-threads",
+            "-num-threads",
             str(threads),
-            "--for-testing",
+            "-for-testing",
         ]
     )
     return tuple(argv)
@@ -544,7 +544,7 @@ def execute_harvest_plan(
     )
     try:
         argv = list(plan["argv"])
-        out_index = argv.index("--outdir") + 1
+        out_index = argv.index("-outdir") + 1
         argv[out_index] = str(temporary)
         result = subprocess_runner(tuple(argv), shell=False, check=False)
         if result.returncode != 0:

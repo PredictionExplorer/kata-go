@@ -221,8 +221,8 @@ def test_harvest_plan_is_shell_free_and_content_bound(tmp_path):
         threads=1,
     )
     assert argv[:2] == (str(katago.resolve()), "samplesgfs")
-    assert argv[argv.index("--sample-prob") + 1] == "1"
-    assert "--for-testing" in argv
+    assert argv[argv.index("-sample-prob") + 1] == "1"
+    assert "-for-testing" in argv
 
     manifest_path = tmp_path / "harvest.json"
     manifest = publish_harvest_plan(
@@ -243,7 +243,7 @@ def test_harvest_plan_is_shell_free_and_content_bound(tmp_path):
 
     def fake(argv, **kwargs):
         calls.append((argv, kwargs))
-        target = Path(argv[argv.index("--outdir") + 1])
+        target = Path(argv[argv.index("-outdir") + 1])
         target.mkdir(exist_ok=True)
         (target / "0.startposes.txt").write_text(
             canonical_json(position(0)) + "\n", encoding="utf-8"
