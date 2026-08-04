@@ -27,7 +27,6 @@ from risk_score.position_samples import (
     semantic_position_sha256,
 )
 
-
 CURATION_CONTRACT = "risk-score-position-bank-curation-v1"
 HARVEST_PLAN_CONTRACT = "risk-score-position-harvest-plan-v1"
 HARVEST_RECEIPT_CONTRACT = "risk-score-position-harvest-receipt-v1"
@@ -35,6 +34,8 @@ QUERY_BUNDLE_CONTRACT = "risk-score-position-analysis-query-bundle-v1"
 ANALYSIS_RUN_CONTRACT = "risk-score-position-analysis-run-v1"
 QUERY_SHARDS_CONTRACT = "risk-score-analysis-query-shards-v1"
 LABELING_CONTRACT = "risk-score-position-bank-labeling-v1"
+SCORE_PREFILTER_CONTRACT = "risk-score-position-score-prefilter-v1"
+COMBINED_LABELING_CONTRACT = "risk-score-position-bank-combined-labeling-v1"
 FINAL_MANIFEST_CONTRACT = "risk-score-reviewed-position-bank-v1"
 REVIEW_ONLY_LABELS = frozenset(
     {
@@ -178,7 +179,9 @@ def _publish_bundle(output_dir: Path, files: Mapping[str, bytes]) -> Path:
                 if path.is_file()
             }
             if existing_files != set(files):
-                raise ValueError(f"existing immutable bundle has unexpected files: {output}")
+                raise ValueError(
+                    f"existing immutable bundle has unexpected files: {output}"
+                )
             for relative, data in files.items():
                 existing = output / relative
                 if (
@@ -232,7 +235,9 @@ def _source_inventory(
                 and path.suffix.lower() in suffixes
             )
             if not files:
-                raise ValueError(f"{kind.upper()} source has no input files: {directory}")
+                raise ValueError(
+                    f"{kind.upper()} source has no input files: {directory}"
+                )
             inventory.append(
                 {
                     "kind": kind,
@@ -710,10 +715,9 @@ def run_analysis(
     validate_deterministic_analysis_config(Path(config))
     query_rows = _load_jsonl(Path(queries), "analysis queries")
     expected_ids = [row.get("id") for row in query_rows]
-    if (
-        any(not isinstance(value, str) or not value for value in expected_ids)
-        or len(expected_ids) != len(set(expected_ids))
-    ):
+    if any(not isinstance(value, str) or not value for value in expected_ids) or len(
+        expected_ids
+    ) != len(set(expected_ids)):
         raise ValueError("analysis query IDs must be unique nonempty strings")
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -780,9 +784,7 @@ def run_analysis(
     }
     manifest["manifest_sha256"] = canonical_sha256(manifest)
     manifest_path = Path(str(output) + ".manifest.json")
-    _publish_file(
-        manifest_path, (canonical_json(manifest) + "\n").encode("utf-8")
-    )
+    _publish_file(manifest_path, (canonical_json(manifest) + "\n").encode("utf-8"))
     return {**manifest, "manifest_path": str(manifest_path.resolve())}
 
 
@@ -799,7 +801,9 @@ def split_queries(
         if not isinstance(query_id, str) or not query_id or query_id in seen:
             raise ValueError("analysis query IDs must be unique nonempty strings")
         seen.add(query_id)
-        index = int(hashlib.sha256(query_id.encode("utf-8")).hexdigest(), 16) % shard_count
+        index = (
+            int(hashlib.sha256(query_id.encode("utf-8")).hexdigest(), 16) % shard_count
+        )
         shards[index].append(row)
     files: Dict[str, bytes] = {}
     manifest_shards = []
@@ -848,10 +852,9 @@ def _load_query_shard_manifest(
     ):
         raise ValueError("query shard manifest provenance is invalid")
     query_path = Path(query_path)
-    if (
-        manifest.get("source_path") != str(query_path.resolve())
-        or manifest.get("source_sha256") != file_sha256(query_path)
-    ):
+    if manifest.get("source_path") != str(query_path.resolve()) or manifest.get(
+        "source_sha256"
+    ) != file_sha256(query_path):
         raise ValueError("query shard manifest names another source query file")
     query_rows = _load_jsonl(query_path, "full analysis query file")
     if manifest.get("source_row_count") != len(query_rows):
@@ -921,10 +924,9 @@ def _load_query_shard_manifest(
         raise ValueError("query shard manifest indices are incomplete")
     shard_ids = [spec["ids"] for spec in by_index.values()]
     combined_ids = set().union(*shard_ids)
-    if (
-        sum(len(ids) for ids in shard_ids) != len(combined_ids)
-        or combined_ids != {row.get("id") for row in query_rows}
-    ):
+    if sum(len(ids) for ids in shard_ids) != len(combined_ids) or combined_ids != {
+        row.get("id") for row in query_rows
+    }:
         raise ValueError("query shards do not cover the source query IDs")
     return manifest, by_index
 
@@ -949,9 +951,7 @@ def merge_analysis(
     )
     if len(shard_outputs) != len(shard_specs):
         raise ValueError("analysis shard output count does not match split manifest")
-    specs_by_hash = {
-        spec["sha256"]: spec for spec in shard_specs.values()
-    }
+    specs_by_hash = {spec["sha256"]: spec for spec in shard_specs.values()}
     merged = {}
     execution_manifests = []
     identity = None
@@ -983,7 +983,9 @@ def merge_analysis(
             raise ValueError("analysis shard query hash is not in split manifest")
         index = spec["index"]
         if index in seen_indices:
-            raise ValueError(f"analysis shard index {index} was supplied more than once")
+            raise ValueError(
+                f"analysis shard index {index} was supplied more than once"
+            )
         if manifest.get("query_path") != spec["resolved_path"]:
             raise ValueError(f"analysis shard {index} query path is misbound")
         rows = _load_jsonl(shard_output, "shard analysis output")
@@ -1029,10 +1031,7 @@ def merge_analysis(
         "config_sha256": identity[1],
         "model_sha256": identity[2],
         "cuda_visible_devices": sorted(
-            {
-                str(item["cuda_visible_devices"])
-                for item in execution_manifests
-            }
+            {str(item["cuda_visible_devices"]) for item in execution_manifests}
         ),
         "query_path": str(Path(query_path).resolve()),
         "query_sha256": file_sha256(query_path),
@@ -1046,9 +1045,7 @@ def merge_analysis(
     }
     manifest["manifest_sha256"] = canonical_sha256(manifest)
     manifest_path = Path(str(output) + ".manifest.json")
-    _publish_file(
-        manifest_path, (canonical_json(manifest) + "\n").encode("utf-8")
-    )
+    _publish_file(manifest_path, (canonical_json(manifest) + "\n").encode("utf-8"))
     return {**manifest, "manifest_path": str(manifest_path.resolve())}
 
 
@@ -1113,6 +1110,297 @@ def _analysis_map(path: Path, expected_ids: Iterable[str], role: str) -> Dict[st
     if set(values) != set(expected_ids):
         raise ValueError(f"{role} analysis IDs do not match normalized positions")
     return values
+
+
+def _validate_manifest(
+    path: Path, role: str, *, contract: str
+) -> Tuple[Dict[str, Any], str]:
+    manifest = _load_json(Path(path), role)
+    payload = dict(manifest)
+    identity = payload.pop("manifest_sha256", None)
+    if (
+        type(manifest.get("schema_version")) is not int
+        or manifest.get("schema_version") != 1
+        or manifest.get("contract") != contract
+        or identity != canonical_sha256(payload)
+    ):
+        raise ValueError(f"{role} provenance or self-hash is invalid")
+    return manifest, identity
+
+
+def _require_sha256(value: Any, role: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{role} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _manifest_bound_file(
+    manifest: Mapping[str, Any],
+    *,
+    path_key: str,
+    hash_key: str,
+    role: str,
+) -> Path:
+    raw_path = manifest.get(path_key)
+    expected_hash = _require_sha256(manifest.get(hash_key), f"{role} hash")
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ValueError(f"{role} path binding is missing")
+    source = Path(raw_path)
+    if not source.is_absolute() or str(source.resolve()) != raw_path:
+        raise ValueError(f"{role} path binding is unsafe")
+    if (
+        source.is_symlink()
+        or not source.is_file()
+        or file_sha256(source) != expected_hash
+    ):
+        raise ValueError(f"{role} changed after query generation")
+    return source
+
+
+def score_prefilter_positions(
+    *,
+    normalized_path: Path,
+    query_manifest_path: Path,
+    analysis_path: Path,
+    output_path: Path,
+    manifest_path: Path,
+    minimum_score: float = 30.0,
+    maximum_score: Optional[float] = None,
+) -> Mapping[str, Any]:
+    """Select score-lead candidates from a frozen standard-200 analysis."""
+
+    minimum = _finite(minimum_score, "minimum score")
+    maximum = None if maximum_score is None else _finite(maximum_score, "maximum score")
+    if minimum <= 0.0:
+        raise ValueError("minimum score must be positive")
+    if maximum is not None and maximum < minimum:
+        raise ValueError("maximum score must be at least the minimum score")
+
+    normalized_path = Path(normalized_path)
+    query_manifest_path = Path(query_manifest_path)
+    analysis_path = Path(analysis_path)
+    output_path = Path(output_path)
+    manifest_path = Path(manifest_path)
+    if output_path.resolve() == manifest_path.resolve():
+        raise ValueError("prefilter output and manifest paths must be distinct")
+
+    positions = _normalized_positions(normalized_path)
+    position_ids = [position["semanticSha256"] for position in positions]
+    normalized_hash = file_sha256(normalized_path)
+    query_manifest, query_manifest_identity = _validate_manifest(
+        query_manifest_path,
+        "query manifest",
+        contract=QUERY_BUNDLE_CONTRACT,
+    )
+    query_manifest_file_hash = file_sha256(query_manifest_path)
+    if (
+        query_manifest.get("normalized_path") != str(normalized_path.resolve())
+        or query_manifest.get("normalized_sha256") != normalized_hash
+        or type(query_manifest.get("position_count")) is not int
+        or query_manifest.get("position_count") != len(positions)
+        or query_manifest.get("semantic_hashes_sha256")
+        != canonical_sha256(position_ids)
+    ):
+        raise ValueError("query manifest is bound to another normalized position file")
+
+    katago_path = _manifest_bound_file(
+        query_manifest,
+        path_key="katago_path",
+        hash_key="katago_sha256",
+        role="KataGo binary",
+    )
+    config_path = _manifest_bound_file(
+        query_manifest,
+        path_key="analysis_config_path",
+        hash_key="analysis_config_sha256",
+        role="analysis config",
+    )
+    model_path = _manifest_bound_file(
+        query_manifest,
+        path_key="reference_model_path",
+        hash_key="reference_model_sha256",
+        role="reference model",
+    )
+    validate_deterministic_analysis_config(config_path)
+
+    policy_path_value = query_manifest.get("policy_path")
+    if not isinstance(policy_path_value, str) or not policy_path_value:
+        raise ValueError("query manifest policy path binding is missing")
+    policy_path = Path(policy_path_value)
+    if (
+        not policy_path.is_absolute()
+        or str(policy_path.resolve()) != policy_path_value
+        or policy_path.is_symlink()
+        or not policy_path.is_file()
+        or canonical_sha256(load_policy(policy_path))
+        != query_manifest.get("policy_hash")
+    ):
+        raise ValueError("promotion policy changed after query generation")
+    policy_file_hash = file_sha256(policy_path)
+
+    queries = query_manifest.get("queries")
+    if not isinstance(queries, Mapping):
+        raise ValueError("query manifest query inventory is malformed")
+    artifact = queries.get("standard-200")
+    if (
+        not isinstance(artifact, Mapping)
+        or artifact.get("powered") is not False
+        or type(artifact.get("visits")) is not int
+        or artifact.get("visits") != 200
+        or type(artifact.get("row_count")) is not int
+        or artifact.get("row_count") != len(positions)
+    ):
+        raise ValueError("query manifest lacks an exact standard-200 query artifact")
+    relative = artifact.get("path")
+    query_hash = _require_sha256(artifact.get("sha256"), "standard-200 query hash")
+    if (
+        not isinstance(relative, str)
+        or not relative
+        or Path(relative).is_absolute()
+        or ".." in Path(relative).parts
+    ):
+        raise ValueError("standard-200 query path is unsafe")
+    query_path = query_manifest_path.parent / relative
+    if (
+        query_path.is_symlink()
+        or not query_path.is_file()
+        or not _is_within(query_path, query_manifest_path.parent)
+        or file_sha256(query_path) != query_hash
+    ):
+        raise ValueError("standard-200 query artifact changed")
+    query_rows = _load_jsonl(query_path, "standard-200 queries")
+    expected_query_rows = [
+        build_analysis_query(
+            position,
+            query_id=position["semanticSha256"],
+            max_visits=200,
+            powered=False,
+        )
+        for position in positions
+    ]
+    if query_rows != expected_query_rows:
+        raise ValueError("standard-200 query IDs, visits, or positions changed")
+
+    analyses = _analysis_map(
+        analysis_path, position_ids, "standard-200 score prefilter"
+    )
+    analysis_hash = file_sha256(analysis_path)
+    execution_path = Path(str(analysis_path) + ".manifest.json")
+    execution, execution_identity = _validate_manifest(
+        execution_path,
+        "standard-200 analysis run manifest",
+        contract=ANALYSIS_RUN_CONTRACT,
+    )
+    execution_file_hash = file_sha256(execution_path)
+    if (
+        execution.get("katago_sha256") != query_manifest.get("katago_sha256")
+        or execution.get("config_sha256")
+        != query_manifest.get("analysis_config_sha256")
+        or execution.get("model_sha256") != query_manifest.get("reference_model_sha256")
+        or execution.get("query_path") != str(query_path.resolve())
+        or execution.get("query_sha256") != query_hash
+        or execution.get("output_path") != str(analysis_path.resolve())
+        or execution.get("output_sha256") != analysis_hash
+        or type(execution.get("row_count")) is not int
+        or execution.get("row_count") != len(analyses)
+    ):
+        raise ValueError("standard-200 analysis run provenance changed")
+
+    selected = []
+    for position in positions:
+        semantic_hash = position["semanticSha256"]
+        features = analysis_features(
+            analyses[semantic_hash],
+            "standard-200 score prefilter",
+            expected_visits=200,
+        )
+        score = features["score_lead"]
+        if score >= minimum and (maximum is None or score <= maximum):
+            selected.append(position)
+    if not selected:
+        raise ValueError("score prefilter selected no positions")
+    selected.sort(key=lambda row: row["semanticSha256"])
+    selected_ids = [row["semanticSha256"] for row in selected]
+    data = _canonical_jsonl(selected)
+
+    frozen_files = (
+        (normalized_path, normalized_hash, "normalized positions"),
+        (query_manifest_path, query_manifest_file_hash, "query manifest"),
+        (query_path, query_hash, "standard-200 queries"),
+        (analysis_path, analysis_hash, "standard-200 analysis"),
+        (execution_path, execution_file_hash, "analysis run manifest"),
+        (katago_path, query_manifest["katago_sha256"], "KataGo binary"),
+        (
+            config_path,
+            query_manifest["analysis_config_sha256"],
+            "analysis config",
+        ),
+        (
+            model_path,
+            query_manifest["reference_model_sha256"],
+            "reference model",
+        ),
+        (policy_path, policy_file_hash, "promotion policy"),
+    )
+    for source, expected_hash, role in frozen_files:
+        if (
+            source.is_symlink()
+            or not source.is_file()
+            or file_sha256(source) != expected_hash
+        ):
+            raise ValueError(f"{role} changed while score prefiltering")
+
+    protected_paths = {source.resolve() for source, _, _ in frozen_files}
+    if (
+        output_path.resolve() in protected_paths
+        or manifest_path.resolve() in protected_paths
+    ):
+        raise ValueError("prefilter outputs may not replace provenance inputs")
+    immutable_query_root = query_manifest_path.parent.resolve()
+    if _is_within(output_path, immutable_query_root) or _is_within(
+        manifest_path, immutable_query_root
+    ):
+        raise ValueError("prefilter outputs may not modify the immutable query bundle")
+
+    manifest = {
+        "schema_version": 1,
+        "contract": SCORE_PREFILTER_CONTRACT,
+        "normalized_path": str(normalized_path.resolve()),
+        "normalized_sha256": normalized_hash,
+        "query_manifest_path": str(query_manifest_path.resolve()),
+        "query_manifest_sha256": query_manifest_file_hash,
+        "query_manifest_identity": query_manifest_identity,
+        "query_path": str(query_path.resolve()),
+        "query_sha256": query_hash,
+        "analysis_path": str(analysis_path.resolve()),
+        "analysis_sha256": analysis_hash,
+        "analysis_manifest_path": str(execution_path.resolve()),
+        "analysis_manifest_sha256": execution_file_hash,
+        "analysis_manifest_identity": execution_identity,
+        "katago_sha256": query_manifest["katago_sha256"],
+        "analysis_config_sha256": query_manifest["analysis_config_sha256"],
+        "reference_model_sha256": query_manifest["reference_model_sha256"],
+        "policy_hash": query_manifest["policy_hash"],
+        "source_count": len(positions),
+        "selected_count": len(selected),
+        "selected_ids_sha256": canonical_sha256(selected_ids),
+        "minimum_score": minimum,
+        "maximum_score": maximum,
+        "output_path": str(output_path.resolve()),
+        "output_sha256": hashlib.sha256(data).hexdigest(),
+    }
+    manifest["manifest_sha256"] = canonical_sha256(manifest)
+    _publish_file(output_path, data)
+    _publish_file(manifest_path, (canonical_json(manifest) + "\n").encode("utf-8"))
+    return manifest
+
+
+# Keep a concise API spelling alongside the CLI-oriented name.
+prefilter_positions = score_prefilter_positions
 
 
 def _suggest_specialized(
@@ -1192,8 +1480,7 @@ def label_positions(
         if (
             execution.get("model_sha256")
             != query_manifest.get("reference_model_sha256")
-            or execution.get("katago_sha256")
-            != query_manifest.get("katago_sha256")
+            or execution.get("katago_sha256") != query_manifest.get("katago_sha256")
             or execution.get("config_sha256")
             != query_manifest.get("analysis_config_sha256")
             or execution.get("query_sha256") != queries[role].get("sha256")
@@ -1216,7 +1503,9 @@ def label_positions(
         "powered-2000",
     }
     if not required.issubset(analyses):
-        raise ValueError(f"analysis bundle is missing roles: {sorted(required-analyses.keys())}")
+        raise ValueError(
+            f"analysis bundle is missing roles: {sorted(required-analyses.keys())}"
+        )
 
     auto_rows = []
     review_rows = []
@@ -1237,8 +1526,7 @@ def label_positions(
             for role in ("standard-200", "standard-800", "standard-2000")
         ]
         powered_scores = [
-            features[role]["score_lead"]
-            for role in ("powered-800", "powered-2000")
+            features[role]["score_lead"] for role in ("powered-800", "powered-2000")
         ]
         stable = (
             max(standard_scores) - min(standard_scores) <= stability_margin
@@ -1254,9 +1542,7 @@ def label_positions(
             auto_label = "ordinary"
         suggestions = sorted(
             set(
-                _suggest_specialized(
-                    features["standard-800"], features["powered-800"]
-                )
+                _suggest_specialized(features["standard-800"], features["powered-800"])
             ).union(
                 _suggest_specialized(
                     features["standard-2000"], features["powered-2000"]
@@ -1328,6 +1614,206 @@ def label_positions(
     return manifest
 
 
+def _automatic_row_identity(row: Mapping[str, Any], role: str) -> str:
+    position = normalize_position_sample(row, role)
+    semantic_hash = semantic_position_sha256(position)
+    curation = row.get("curation")
+    if isinstance(curation, Mapping) and curation.get("semanticSha256") not in {
+        None,
+        semantic_hash,
+    }:
+        raise ValueError(f"{role} declares another semantic identity")
+    return semantic_hash
+
+
+def _review_row_identity(row: Mapping[str, Any], role: str) -> str:
+    semantic_hash = row.get("semantic_sha256")
+    if not isinstance(semantic_hash, str) or not semantic_hash:
+        raise ValueError(f"{role} has no semantic identity")
+    position = normalize_position_sample(row, role)
+    if semantic_position_sha256(position) != semantic_hash:
+        raise ValueError(f"{role} semantic identity does not match its position")
+    return semantic_hash
+
+
+def merge_labeling_bundles(
+    bundle_dirs: Sequence[Path], output_dir: Path
+) -> Mapping[str, Any]:
+    """Combine independently labeled bundles without weakening provenance."""
+
+    if len(bundle_dirs) < 2:
+        raise ValueError("at least two labeling bundle directories are required")
+    output_dir = Path(output_dir)
+    roots = []
+    seen_roots = set()
+    for raw_root in map(Path, bundle_dirs):
+        if raw_root.is_symlink() or not raw_root.is_dir():
+            raise ValueError(f"labeling bundle is not a regular directory: {raw_root}")
+        root = raw_root.resolve()
+        if root in seen_roots:
+            raise ValueError("a labeling bundle directory was supplied more than once")
+        if _paths_overlap(output_dir, root):
+            raise ValueError("combined output may not overlap a source labeling bundle")
+        seen_roots.add(root)
+        roots.append(root)
+    roots.sort(key=str)
+
+    automatic_rows: List[Tuple[str, Dict[str, Any]]] = []
+    review_rows: List[Tuple[str, Dict[str, Any]]] = []
+    source_bundles = []
+    seen_semantic: Dict[str, str] = {}
+    frozen_files: List[Tuple[Path, str, str]] = []
+    common_policy_hash = None
+    common_reference_hash = None
+    common_stability_margin = None
+
+    for root in roots:
+        auto_path = root / "auto-labeled.jsonl"
+        review_path = root / "review-queue.jsonl"
+        manifest_path = root / "manifest.json"
+        for source, role in (
+            (auto_path, "automatic labels"),
+            (review_path, "review queue"),
+            (manifest_path, "labeling manifest"),
+        ):
+            if source.is_symlink() or not source.is_file():
+                raise ValueError(f"{role} is missing from labeling bundle {root}")
+        manifest, manifest_identity = _validate_manifest(
+            manifest_path,
+            f"labeling manifest {root}",
+            contract=LABELING_CONTRACT,
+        )
+        auto = _load_jsonl(auto_path, "automatic labels", allow_empty=True)
+        review = _load_jsonl(review_path, "review queue", allow_empty=True)
+        auto_hash = file_sha256(auto_path)
+        review_hash = file_sha256(review_path)
+        manifest_file_hash = file_sha256(manifest_path)
+        if (
+            type(manifest.get("automatic_count")) is not int
+            or manifest.get("automatic_count") != len(auto)
+            or type(manifest.get("review_count")) is not int
+            or manifest.get("review_count") != len(review)
+            or manifest.get("automatic_sha256") != auto_hash
+            or manifest.get("review_queue_sha256") != review_hash
+        ):
+            raise ValueError(f"labeling bundle file counts or hashes changed: {root}")
+
+        policy_hash = _require_sha256(
+            manifest.get("policy_hash"), "labeling policy hash"
+        )
+        reference_hash = _require_sha256(
+            manifest.get("reference_model_sha256"),
+            "labeling reference model hash",
+        )
+        stability_margin = _finite(
+            manifest.get("stability_margin"), "labeling stability margin"
+        )
+        if stability_margin < 0:
+            raise ValueError("labeling stability margin must be nonnegative")
+        if common_policy_hash is None:
+            common_policy_hash = policy_hash
+            common_reference_hash = reference_hash
+            common_stability_margin = stability_margin
+        else:
+            if policy_hash != common_policy_hash:
+                raise ValueError("labeling bundles disagree on policy hash")
+            if reference_hash != common_reference_hash:
+                raise ValueError("labeling bundles disagree on reference model hash")
+            if stability_margin != common_stability_margin:
+                raise ValueError("labeling bundles disagree on stability margin")
+
+        for index, row in enumerate(auto, start=1):
+            role = f"{root}/auto-labeled.jsonl:{index}"
+            semantic_hash = _automatic_row_identity(row, role)
+            previous = seen_semantic.get(semantic_hash)
+            if previous is not None:
+                raise ValueError(
+                    f"{role}: semantic duplicate; first seen at {previous}"
+                )
+            seen_semantic[semantic_hash] = role
+            automatic_rows.append((semantic_hash, row))
+        for index, row in enumerate(review, start=1):
+            role = f"{root}/review-queue.jsonl:{index}"
+            semantic_hash = _review_row_identity(row, role)
+            previous = seen_semantic.get(semantic_hash)
+            if previous is not None:
+                raise ValueError(
+                    f"{role}: semantic duplicate; first seen at {previous}"
+                )
+            seen_semantic[semantic_hash] = role
+            review_rows.append((semantic_hash, row))
+
+        source_bundles.append(
+            {
+                "path": str(root),
+                "manifest_path": str(manifest_path),
+                "manifest_sha256": manifest_file_hash,
+                "manifest_identity": manifest_identity,
+                "automatic_sha256": auto_hash,
+                "automatic_count": len(auto),
+                "review_queue_sha256": review_hash,
+                "review_count": len(review),
+            }
+        )
+        frozen_files.extend(
+            (
+                (auto_path, auto_hash, f"{root} automatic labels"),
+                (review_path, review_hash, f"{root} review queue"),
+                (manifest_path, manifest_file_hash, f"{root} labeling manifest"),
+            )
+        )
+
+    automatic_rows.sort(key=lambda item: item[0])
+    review_rows.sort(key=lambda item: item[0])
+    automatic_ids = [semantic_hash for semantic_hash, _ in automatic_rows]
+    review_ids = [semantic_hash for semantic_hash, _ in review_rows]
+    auto_data = _canonical_jsonl(row for _, row in automatic_rows)
+    review_data = _canonical_jsonl(row for _, row in review_rows)
+
+    for source, expected_hash, role in frozen_files:
+        if (
+            source.is_symlink()
+            or not source.is_file()
+            or file_sha256(source) != expected_hash
+        ):
+            raise ValueError(f"{role} changed while merging labeling bundles")
+
+    assert common_policy_hash is not None
+    assert common_reference_hash is not None
+    assert common_stability_margin is not None
+    manifest = {
+        "schema_version": 1,
+        "contract": COMBINED_LABELING_CONTRACT,
+        "source_bundle_count": len(source_bundles),
+        "source_bundles": source_bundles,
+        "source_bundles_sha256": canonical_sha256(source_bundles),
+        "reference_model_sha256": common_reference_hash,
+        "policy_hash": common_policy_hash,
+        "stability_margin": common_stability_margin,
+        "automatic_count": len(automatic_rows),
+        "review_count": len(review_rows),
+        "automatic_sha256": hashlib.sha256(auto_data).hexdigest(),
+        "review_queue_sha256": hashlib.sha256(review_data).hexdigest(),
+        "automatic_ids_sha256": canonical_sha256(automatic_ids),
+        "review_ids_sha256": canonical_sha256(review_ids),
+        "semantic_hashes_sha256": canonical_sha256(
+            sorted((*automatic_ids, *review_ids))
+        ),
+    }
+    manifest["manifest_sha256"] = canonical_sha256(manifest)
+    files = {
+        "auto-labeled.jsonl": auto_data,
+        "review-queue.jsonl": review_data,
+        "manifest.json": (canonical_json(manifest) + "\n").encode("utf-8"),
+    }
+    _publish_bundle(output_dir, files)
+    return manifest
+
+
+# "Combine" is a useful API synonym; the command remains "merge-labeling".
+combine_labeling_bundles = merge_labeling_bundles
+
+
 def policy_pool_minima(policy: Mapping[str, Any]) -> Dict[str, int]:
     stages = policy["evaluation_stages"]
     stage_1 = stages["stage_1_cheap_paired_screen"]
@@ -1389,7 +1875,10 @@ def finalize_reviewed_bank(
     labeling_manifest = _load_json(labeling_manifest_path, "labeling manifest")
     policy = load_policy(Path(policy_path))
     active_policy_hash = canonical_sha256(policy)
-    if labeling_manifest.get("contract") != LABELING_CONTRACT:
+    if labeling_manifest.get("contract") not in {
+        LABELING_CONTRACT,
+        COMBINED_LABELING_CONTRACT,
+    }:
         raise ValueError("labeling manifest contract is unsupported")
     labeling_payload = dict(labeling_manifest)
     labeling_manifest_hash = labeling_payload.pop("manifest_sha256", None)
@@ -1493,9 +1982,7 @@ def finalize_reviewed_bank(
             }
         )
     final_rows.sort(key=lambda row: row["curation"]["semanticSha256"])
-    counts = Counter(
-        label for row in final_rows for label in row.get("labels", [])
-    )
+    counts = Counter(label for row in final_rows for label in row.get("labels", []))
     minima = policy_pool_minima(policy)
     deficits = {
         label: minimum - counts.get(label, 0)
@@ -1597,12 +2084,27 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     merge.add_argument("--shard-output", action="append", required=True, type=Path)
     merge.add_argument("-o", "--output", required=True, type=Path)
 
+    prefilter = subparsers.add_parser("score-prefilter", aliases=["prefilter"])
+    prefilter.add_argument("normalized", type=Path)
+    prefilter.add_argument("--query-manifest", required=True, type=Path)
+    prefilter.add_argument("--analysis", required=True, type=Path)
+    prefilter.add_argument("-o", "--output", required=True, type=Path)
+    prefilter.add_argument("--manifest", required=True, type=Path)
+    prefilter.add_argument("--minimum-score", "--min-score", type=float, default=30.0)
+    prefilter.add_argument("--maximum-score", "--max-score", type=float)
+
     label = subparsers.add_parser("label")
     label.add_argument("normalized", type=Path)
     label.add_argument("--query-manifest", required=True, type=Path)
     label.add_argument("--analysis", action="append", default=[], required=True)
     label.add_argument("--output-dir", required=True, type=Path)
     label.add_argument("--stability-margin", type=float, default=5.0)
+
+    merge_labels = subparsers.add_parser(
+        "merge-labeling", aliases=["merge-labeling-bundles"]
+    )
+    merge_labels.add_argument("bundles", nargs="+", type=Path)
+    merge_labels.add_argument("--output-dir", required=True, type=Path)
 
     finalize = subparsers.add_parser("finalize")
     finalize.add_argument("--auto", required=True, type=Path)
@@ -1666,6 +2168,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 shard_outputs=args.shard_output,
                 output=args.output,
             )
+        elif args.command in {"score-prefilter", "prefilter"}:
+            result = score_prefilter_positions(
+                normalized_path=args.normalized,
+                query_manifest_path=args.query_manifest,
+                analysis_path=args.analysis,
+                output_path=args.output,
+                manifest_path=args.manifest,
+                minimum_score=args.minimum_score,
+                maximum_score=args.maximum_score,
+            )
         elif args.command == "label":
             result = label_positions(
                 normalized_path=args.normalized,
@@ -1674,7 +2186,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 output_dir=args.output_dir,
                 stability_margin=args.stability_margin,
             )
-        else:
+        elif args.command in {"merge-labeling", "merge-labeling-bundles"}:
+            result = merge_labeling_bundles(args.bundles, args.output_dir)
+        elif args.command == "finalize":
             result = finalize_reviewed_bank(
                 auto_path=args.auto,
                 review_queue_path=args.review_queue,
@@ -1684,6 +2198,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 output_path=args.output,
                 manifest_path=args.manifest,
             )
+        else:
+            raise ValueError(f"unsupported command {args.command!r}")
     except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

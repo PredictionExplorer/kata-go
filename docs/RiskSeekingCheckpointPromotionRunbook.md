@@ -26,6 +26,7 @@ Freeze and hash these together:
 - `cpp/configs/risk_score/promotion_powered_match.cfg`;
 - `cpp/configs/risk_score/promotion_standard_match.cfg`;
 - `cpp/configs/risk_score/promotion_curation_analysis.cfg`;
+- `cpp/configs/risk_score/promotion_curation_lead_selfplay_19x19.cfg`;
 - `cpp/configs/risk_score/promotion_selfplay_worker_19x19.cfg`;
 - discovery, confirmation, and audit suite manifests and schedules;
 - the immutable original model;
@@ -265,6 +266,54 @@ model, binary, config, and result hashes. The merged receipt additionally binds
 the split manifest. Never rebuild a binary path while its shards are running;
 resume a failed shard only with the same recorded binary/config/model hashes.
 
+### Supplement missing Lead pools
+
+Inspect the labeling manifest and automatic-label counts before review. A
+balanced original-versus-original corpus can satisfy the ordinary quota while
+producing too few stable Lead-40 or Lead-80 positions. Do not assign Lead
+labels to ordinary positions merely to satisfy policy minima.
+
+When either Lead pool is deficient, generate a separate corpus with
+`promotion_curation_lead_selfplay_19x19.cfg`. Use the immutable original model
+in a one-model directory and a new output root under
+`evaluation/curation`; verify that this root is outside every shuffler and
+trainer input. The command writes both SGFs and toxic-to-training `tdata`, so
+the entire output remains quarantined. Record the binary, config, model, launch
+argv, and resulting SGF hashes before harvesting.
+
+Harvest and normalize this corpus into a new bundle, generate queries, and run
+only `standard-200` first. Use its fully provenance-bound result to discard
+positions that are not plausible positive leads:
+
+```bash
+python3 -m risk_score.curate_position_bank score-prefilter \
+  "$RUN_DIR/evaluation/curation/lead-v1/normalized.jsonl" \
+  --query-manifest "$RUN_DIR/evaluation/curation/lead-v1/query-bundle/manifest.json" \
+  --analysis "$RUN_DIR/evaluation/curation/lead-v1/results/standard-200.jsonl" \
+  --minimum-score 30 \
+  --output "$RUN_DIR/evaluation/curation/lead-v1/selected.jsonl" \
+  --manifest "$RUN_DIR/evaluation/curation/lead-v1/selected.manifest.json"
+```
+
+Generate a fresh query bundle from `selected.jsonl`, then run and merge all
+five roles. The cheap prefilter is discovery-only: final Lead labels still
+require the normal standard/powered 200/800/2,000 visit-stability checks.
+
+After labeling the supplemental bundle, combine it with the original bundle.
+The merge rejects changed inputs, policy/model/stability mismatches, and
+semantic duplicates:
+
+```bash
+python3 -m risk_score.curate_position_bank merge-labeling \
+  "$RUN_DIR/evaluation/curation/labeling" \
+  "$RUN_DIR/evaluation/curation/lead-v1/labeling" \
+  --output-dir "$RUN_DIR/evaluation/curation/labeling-combined-v1"
+```
+
+Use the combined bundle's `auto-labeled.jsonl`, `review-queue.jsonl`, and
+`manifest.json` for review and finalization. Preserve every source bundle and
+prefilter manifest as frozen provenance.
+
 Only stable ordinary/Lead-40/Lead-80 cases are auto-labeled. Every tactical,
 exploitability, bait, tail, sacrifice, small-gain/large-lead, adversarial, or
 unstable case remains in `review-queue.jsonl`. A reviewer must provide exactly
@@ -279,10 +328,10 @@ unreviewed rows, changed inputs, and pools below policy-v2 minima:
 
 ```bash
 python3 -m risk_score.curate_position_bank finalize \
-  --auto "$RUN_DIR/evaluation/curation/labeling/auto-labeled.jsonl" \
-  --review-queue "$RUN_DIR/evaluation/curation/labeling/review-queue.jsonl" \
-  --decisions "$RUN_DIR/evaluation/curation/review-decisions.jsonl" \
-  --labeling-manifest "$RUN_DIR/evaluation/curation/labeling/manifest.json" \
+  --auto "$RUN_DIR/evaluation/curation/labeling-combined-v1/auto-labeled.jsonl" \
+  --review-queue "$RUN_DIR/evaluation/curation/labeling-combined-v1/review-queue.jsonl" \
+  --decisions "$RUN_DIR/evaluation/curation/review-decisions-combined-v1.jsonl" \
+  --labeling-manifest "$RUN_DIR/evaluation/curation/labeling-combined-v1/manifest.json" \
   --policy "$REPO/python/risk_score/promotion_policy_v2.json" \
   --output "$RUN_DIR/evaluation/source-positions.jsonl" \
   --manifest "$RUN_DIR/evaluation/source-positions.manifest.json"

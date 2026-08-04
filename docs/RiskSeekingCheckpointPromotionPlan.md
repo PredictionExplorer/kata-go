@@ -142,6 +142,8 @@ source bank currently exists in the repository or live run.
   against an immutable reference model.
 - [x] Implement conservative ordinary, Lead-40, and Lead-80 auto-labeling with
   visit-stability checks.
+- [x] Implement provenance-bound score prefiltering and immutable labeling
+  bundle merging for targeted supplemental Lead corpora.
 - [x] Implement explicit human-review queues for tactical, exploitability,
   bait, score-tail, sacrifice, small-gain/large-lead, and adversarial cases.
 - [x] Publish a canonical curation manifest and fail closed when policy-v2 pool
@@ -436,6 +438,11 @@ loading, and training-data generation remain the execution engines.
 - `cpp/configs/risk_score/promotion_curation_analysis.cfg`
   - deterministic standard/powered query baseline for position curation;
   - one leased GPU with binary, config, model, query, and result hash binding.
+- `cpp/configs/risk_score/promotion_curation_lead_selfplay_19x19.cfg`
+  - quarantined original-model corpus generation for supplemental Lead-40 and
+    Lead-80 discovery;
+  - fixed rules with uncompensated asymmetric playout strength, while
+    manifest-bound analysis remains authoritative for labels.
 - `python/risk_score/promotion_policy_v1.json`
   - immutable historical policy and evidence identity.
 - `python/risk_score/promotion_policy_v2.json`

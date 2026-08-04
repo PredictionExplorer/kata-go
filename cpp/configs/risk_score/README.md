@@ -173,6 +173,14 @@ config, the KataGo binary, and the immutable original-model hash. It enables
 KataGo's deterministic test seed and one analysis worker. Run it only under
 the same exclusive GPU lease used for other promotion analysis.
 
+`promotion_curation_lead_selfplay_19x19.cfg` generates a quarantined
+supplemental corpus for Lead-40/Lead-80 discovery. It keeps the fixed 19x19
+rules and immutable original model, but deliberately gives one color an
+uncompensated random playout advantage. This makes large-lead positions common
+without asserting any labels: the manifest-bound five-tier analysis remains
+the only source of automatic Lead labels. Its output must never enter a
+shuffler or trainer input root.
+
 `promotion_selfplay_worker_19x19.cfg` is the generation-pinned one-GPU
 self-play template. Launch seven separate workers through the promotion
 controller/supervisor, each with an immutable one-model directory, distinct
