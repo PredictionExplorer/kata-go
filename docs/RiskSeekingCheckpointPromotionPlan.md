@@ -142,8 +142,8 @@ source bank currently exists in the repository or live run.
   against an immutable reference model.
 - [x] Implement conservative ordinary, Lead-40, and Lead-80 auto-labeling with
   visit-stability checks.
-- [x] Implement provenance-bound score prefiltering and immutable labeling
-  bundle merging for targeted supplemental Lead corpora.
+- [x] Implement provenance-bound SGFS-margin and score prefiltering plus
+  immutable labeling bundle merging for targeted supplemental Lead corpora.
 - [x] Implement explicit human-review queues for tactical, exploitability,
   bait, score-tail, sacrifice, small-gain/large-lead, and adversarial cases.
 - [x] Publish a canonical curation manifest and fail closed when policy-v2 pool

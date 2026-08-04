@@ -281,9 +281,21 @@ trainer input. The command writes both SGFs and toxic-to-training `tdata`, so
 the entire output remains quarantined. Record the binary, config, model, launch
 argv, and resulting SGF hashes before harvesting.
 
-Harvest and normalize this corpus into a new bundle, generate queries, and run
-only `standard-200` first. Use its fully provenance-bound result to discard
-positions that are not plausible positive leads:
+Large terminal margins are a cheap game-level filter, not a Lead label. Before
+harvesting a large corpus, publish a content-bound SGFS subset with a loose
+margin threshold:
+
+```bash
+python3 -m risk_score.curate_position_bank filter-sgfs \
+  "$RUN_DIR/evaluation/curation/lead-v1/quarantined-selfplay/original/sgfs/"*.sgfs \
+  --minimum-margin 35 \
+  --output "$RUN_DIR/evaluation/curation/lead-v1/filtered/games.sgfs" \
+  --manifest "$RUN_DIR/evaluation/curation/lead-v1/filtered/manifest.json"
+```
+
+Harvest and normalize the filtered corpus into a new bundle, generate queries,
+and run only `standard-200` first. Use its fully provenance-bound result to
+discard positions that are not plausible positive leads:
 
 ```bash
 python3 -m risk_score.curate_position_bank score-prefilter \

@@ -11,9 +11,11 @@ from risk_score.build_evaluation_suites import (
 from risk_score.curate_position_bank import (
     COMBINED_LABELING_CONTRACT,
     SCORE_PREFILTER_CONTRACT,
+    SGFS_FILTER_CONTRACT,
     analysis_features,
     build_harvest_argv,
     execute_harvest_plan,
+    filter_sgfs_by_result_margin,
     finalize_reviewed_bank,
     generate_query_bundle,
     label_positions,
@@ -472,6 +474,84 @@ def test_harvest_plan_is_shell_free_and_content_bound(tmp_path):
             training_input_roots=[nested_training],
             output_dir=tmp_path / "mixed-output",
             threads=1,
+        )
+
+
+def test_sgfs_margin_filter_is_deterministic_and_content_bound(tmp_path):
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    first = first_dir / "games.sgfs"
+    second = second_dir / "games.sgfs"
+    first.write_text(
+        "(;GM[1]FF[4]RE[B+20.5])\n"
+        "(;GM[1]FF[4]RE[W+80.5])\n"
+        "(;GM[1]FF[4]RE[B+R])\n",
+        encoding="utf-8",
+    )
+    second.write_text("(;GM[1]FF[4]RE[B+50.5])\n", encoding="utf-8")
+    output = tmp_path / "filtered" / "games.sgfs"
+    manifest_path = tmp_path / "filtered" / "manifest.json"
+    initial = filter_sgfs_by_result_margin(
+        [second, first],
+        output_path=output,
+        manifest_path=manifest_path,
+        minimum_margin=40.0,
+    )
+    repeated = filter_sgfs_by_result_margin(
+        [first, second],
+        output_path=output,
+        manifest_path=manifest_path,
+        minimum_margin=40.0,
+    )
+    assert initial == repeated
+    assert initial["contract"] == SGFS_FILTER_CONTRACT
+    assert initial["source_count"] == 4
+    assert initial["numeric_result_count"] == 3
+    assert initial["non_numeric_result_count"] == 1
+    assert initial["selected_count"] == 2
+    assert initial["selected_margin_minimum"] == 50.5
+    assert initial["selected_margin_maximum"] == 80.5
+    assert set(output.read_text(encoding="utf-8").splitlines()) == {
+        "(;GM[1]FF[4]RE[W+80.5])",
+        "(;GM[1]FF[4]RE[B+50.5])",
+    }
+
+    second.write_text(
+        "(;GM[1]FF[4]RE[B+50.5])\n(;GM[1]FF[4]RE[W+60.5])\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="immutable output conflicts"):
+        filter_sgfs_by_result_margin(
+            [first, second],
+            output_path=output,
+            manifest_path=manifest_path,
+            minimum_margin=40.0,
+        )
+
+
+def test_sgfs_margin_filter_rejects_duplicates_and_source_mutation(tmp_path):
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    source = source_dir / "games.sgfs"
+    game = "(;GM[1]FF[4]RE[B+80.5])"
+    source.write_text(game + "\n" + game + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate SGF game"):
+        filter_sgfs_by_result_margin(
+            [source],
+            output_path=tmp_path / "output" / "games.sgfs",
+            manifest_path=tmp_path / "output" / "manifest.json",
+            minimum_margin=40.0,
+        )
+
+    source.write_text(game + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="may not modify a source directory"):
+        filter_sgfs_by_result_margin(
+            [source],
+            output_path=source_dir / "filtered.sgfs",
+            manifest_path=tmp_path / "manifest.json",
+            minimum_margin=40.0,
         )
 
 

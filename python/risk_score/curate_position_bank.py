@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -30,6 +31,7 @@ from risk_score.position_samples import (
 CURATION_CONTRACT = "risk-score-position-bank-curation-v1"
 HARVEST_PLAN_CONTRACT = "risk-score-position-harvest-plan-v1"
 HARVEST_RECEIPT_CONTRACT = "risk-score-position-harvest-receipt-v1"
+SGFS_FILTER_CONTRACT = "risk-score-sgfs-result-margin-filter-v1"
 QUERY_BUNDLE_CONTRACT = "risk-score-position-analysis-query-bundle-v1"
 ANALYSIS_RUN_CONTRACT = "risk-score-position-analysis-run-v1"
 QUERY_SHARDS_CONTRACT = "risk-score-analysis-query-shards-v1"
@@ -253,6 +255,130 @@ def _source_inventory(
                 }
             )
     return inventory
+
+
+_NUMERIC_SGF_RESULT = re.compile(r"RE\[([BW])\+([0-9]+(?:\.[0-9]+)?)\]")
+
+
+def filter_sgfs_by_result_margin(
+    sources: Sequence[Path],
+    *,
+    output_path: Path,
+    manifest_path: Path,
+    minimum_margin: float,
+) -> Mapping[str, Any]:
+    """Publish games whose numeric terminal margin meets a frozen threshold."""
+
+    if not sources:
+        raise ValueError("at least one SGFS source is required")
+    margin_threshold = _finite(minimum_margin, "minimum result margin")
+    if margin_threshold < 0:
+        raise ValueError("minimum result margin must be nonnegative")
+    output_path = Path(output_path)
+    manifest_path = Path(manifest_path)
+    if output_path.resolve() == manifest_path.resolve():
+        raise ValueError("filtered SGFS output and manifest paths must be distinct")
+
+    source_paths = []
+    source_seen = set()
+    for raw_source in map(Path, sources):
+        if raw_source.is_symlink() or not raw_source.is_file():
+            raise ValueError(f"SGFS source must be a regular file: {raw_source}")
+        source = raw_source.resolve()
+        if source in source_seen:
+            raise ValueError("an SGFS source was supplied more than once")
+        if _is_within(output_path, source.parent) or _is_within(
+            manifest_path, source.parent
+        ):
+            raise ValueError("filtered SGFS artifacts may not modify a source directory")
+        source_seen.add(source)
+        source_paths.append(source)
+    source_paths.sort(key=str)
+
+    source_inventory = []
+    selected = []
+    seen_games = {}
+    numeric_count = 0
+    non_numeric_count = 0
+    source_count = 0
+    for source in source_paths:
+        source_hash = file_sha256(source)
+        source_rows = 0
+        with source.open("r", encoding="utf-8") as handle:
+            for line_number, raw in enumerate(handle, start=1):
+                game = raw.strip()
+                if not game:
+                    continue
+                source_rows += 1
+                source_count += 1
+                game_hash = hashlib.sha256(game.encode("utf-8")).hexdigest()
+                previous = seen_games.get(game_hash)
+                if previous is not None:
+                    raise ValueError(
+                        f"{source}:{line_number}: duplicate SGF game; "
+                        f"first seen at {previous}"
+                    )
+                seen_games[game_hash] = f"{source}:{line_number}"
+                matches = _NUMERIC_SGF_RESULT.findall(game)
+                if len(matches) > 1:
+                    raise ValueError(
+                        f"{source}:{line_number}: SGF has multiple numeric results"
+                    )
+                if not matches:
+                    non_numeric_count += 1
+                    continue
+                numeric_count += 1
+                result_margin = _finite(
+                    float(matches[0][1]), f"{source}:{line_number} result margin"
+                )
+                if result_margin >= margin_threshold:
+                    selected.append((game_hash, game, result_margin))
+        source_inventory.append(
+            {
+                "path": str(source),
+                "sha256": source_hash,
+                "size": source.stat().st_size,
+                "row_count": source_rows,
+            }
+        )
+    if not selected:
+        raise ValueError("SGFS result-margin filter selected no games")
+    selected.sort(key=lambda item: item[0])
+    selected_hashes = [item[0] for item in selected]
+    data = "".join(item[1] + "\n" for item in selected).encode("utf-8")
+
+    for item in source_inventory:
+        source = Path(item["path"])
+        if (
+            source.is_symlink()
+            or not source.is_file()
+            or source.stat().st_size != item["size"]
+            or file_sha256(source) != item["sha256"]
+        ):
+            raise ValueError("SGFS source changed while filtering")
+
+    manifest = {
+        "schema_version": 1,
+        "contract": SGFS_FILTER_CONTRACT,
+        "sources": source_inventory,
+        "sources_sha256": canonical_sha256(source_inventory),
+        "source_count": source_count,
+        "numeric_result_count": numeric_count,
+        "non_numeric_result_count": non_numeric_count,
+        "minimum_margin": margin_threshold,
+        "selected_count": len(selected),
+        "selected_game_hashes_sha256": canonical_sha256(selected_hashes),
+        "selected_margin_minimum": min(item[2] for item in selected),
+        "selected_margin_maximum": max(item[2] for item in selected),
+        "output_path": str(output_path.resolve()),
+        "output_sha256": hashlib.sha256(data).hexdigest(),
+    }
+    manifest["manifest_sha256"] = canonical_sha256(manifest)
+    _publish_file(output_path, data)
+    _publish_file(
+        manifest_path, (canonical_json(manifest) + "\n").encode("utf-8")
+    )
+    return manifest
 
 
 def validate_deterministic_analysis_config(path: Path) -> None:
@@ -2035,6 +2161,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    filter_sgfs = subparsers.add_parser(
+        "filter-sgfs", aliases=["filter-sgfs-by-margin"]
+    )
+    filter_sgfs.add_argument("sources", nargs="+", type=Path)
+    filter_sgfs.add_argument("-o", "--output", required=True, type=Path)
+    filter_sgfs.add_argument("--manifest", required=True, type=Path)
+    filter_sgfs.add_argument("--minimum-margin", required=True, type=float)
+
     normalize = subparsers.add_parser("normalize")
     normalize.add_argument("sources", nargs="+", type=Path)
     normalize.add_argument("-o", "--output", required=True, type=Path)
@@ -2120,7 +2254,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     try:
-        if args.command == "normalize":
+        if args.command in {"filter-sgfs", "filter-sgfs-by-margin"}:
+            result = filter_sgfs_by_result_margin(
+                args.sources,
+                output_path=args.output,
+                manifest_path=args.manifest,
+                minimum_margin=args.minimum_margin,
+            )
+        elif args.command == "normalize":
             result = publish_normalized(args.sources, args.output, args.manifest)
         elif args.command == "harvest-plan":
             result = publish_harvest_plan(
