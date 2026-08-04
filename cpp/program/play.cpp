@@ -615,9 +615,12 @@ void GameInitializer::createGameSharedUnsynchronized(
 
   double asymmetricProb = (extraBlackAndKomi.extraBlack > 0) ? playSettings.handicapAsymmetricPlayoutProb : playSettings.normalAsymmetricPlayoutProb;
   if(asymmetricProb > 0 && rand.nextBool(asymmetricProb)) {
+    testAssert(playSettings.minAsymmetricRatio >= 1.0);
     testAssert(playSettings.maxAsymmetricRatio >= 1.0);
+    testAssert(playSettings.minAsymmetricRatio <= playSettings.maxAsymmetricRatio);
+    double minNumDoublings = log(playSettings.minAsymmetricRatio) / log(2.0);
     double maxNumDoublings = log(playSettings.maxAsymmetricRatio) / log(2.0);
-    double numDoublings = rand.nextDouble(maxNumDoublings);
+    double numDoublings = minNumDoublings + rand.nextDouble(maxNumDoublings - minNumDoublings);
     if(extraBlackAndKomi.extraBlack > 0 || rand.nextBool(0.5)) {
       otherGameProps.playoutDoublingAdvantagePla = C_WHITE;
       otherGameProps.playoutDoublingAdvantage = numDoublings;

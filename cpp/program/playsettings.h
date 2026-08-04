@@ -107,6 +107,7 @@ struct PlaySettings {
   //Asymmetric playouts training
   double handicapAsymmetricPlayoutProb; //Probability of asymmetric playouts on handicap games
   double normalAsymmetricPlayoutProb; //Probability of asymmetric playouts on normal games
+  double minAsymmetricRatio;
   double maxAsymmetricRatio;
   double minAsymmetricCompensateKomiProb; //Minimum probability to make game fair if asymmetric (other probs will also override)
 

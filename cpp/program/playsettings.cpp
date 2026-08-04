@@ -18,7 +18,7 @@ PlaySettings::PlaySettings()
    noResolveTargetWeights(false),
    allowResignation(false),resignThreshold(0.0),resignConsecTurns(1),
    forSelfPlay(false),
-   handicapAsymmetricPlayoutProb(0.0),normalAsymmetricPlayoutProb(0.0),maxAsymmetricRatio(2.0),
+   handicapAsymmetricPlayoutProb(0.0),normalAsymmetricPlayoutProb(0.0),minAsymmetricRatio(1.0),maxAsymmetricRatio(2.0),
    dynamicSelfKomiBonusMin(0.0),
    dynamicSelfKomiBonusMax(0.0),
    dynamicSelfKomiWinLossMin(-1.0),
@@ -117,7 +117,10 @@ PlaySettings PlaySettings::loadForSelfplay(ConfigParser& cfg, bool isDistributed
   }
   playSettings.handicapAsymmetricPlayoutProb = cfg.getDouble("handicapAsymmetricPlayoutProb",0.0,1.0);
   playSettings.normalAsymmetricPlayoutProb = cfg.getDouble("normalAsymmetricPlayoutProb",0.0,1.0);
+  playSettings.minAsymmetricRatio = cfg.contains("minAsymmetricRatio") ? cfg.getDouble("minAsymmetricRatio",1.0,100.0) : 1.0;
   playSettings.maxAsymmetricRatio = cfg.getDouble("maxAsymmetricRatio",1.0,100.0);
+  if(playSettings.minAsymmetricRatio > playSettings.maxAsymmetricRatio)
+    throw StringError("minAsymmetricRatio > maxAsymmetricRatio");
   playSettings.minAsymmetricCompensateKomiProb = cfg.getDouble("minAsymmetricCompensateKomiProb",0.0,1.0);
   playSettings.sekiForkHackProb = cfg.contains("sekiForkHackProb") ? cfg.getDouble("sekiForkHackProb",0.0,1.0) : 0.0;
   playSettings.forSelfPlay = true;
