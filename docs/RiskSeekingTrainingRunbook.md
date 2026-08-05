@@ -218,7 +218,7 @@ RUN_DIR/
   phase2/
     shuffle-scratch/
     training/                KataGo's asynchronous BASEDIR
-      models/                manually accepted models only
+      models/                controller-accepted models only
       modelstobetested/      staged, unevaluated exports
       rejectedmodels/
       selfplay/
@@ -745,6 +745,8 @@ All items must be true:
 - official b40 and b28 inference models load;
 - both raw checkpoints were inspected and round-trip exported;
 - model, checkpoint, config, and schedule hashes are in the manifest;
+- the policy-v3 suite transitively binds a machine-consensus
+  `risk-score-reviewed-position-bank-v2` curation manifest;
 - frozen self-play config is exactly 19x19 Tromp-Taylor 7.5;
 - `reduceVisits=false`, no resignation, no handicap, no rectangles, and no
   exotic initialization are confirmed from parsed config output;
@@ -967,7 +969,7 @@ export NAME_PREFIX="$RUN_ID"
 export KATAGO_MODEL_PROBE_COMMAND_JSON='SET_ME'
 test "$KATAGO_MODEL_PROBE_COMMAND_JSON" != SET_ME
 export KATAGO_PROMOTION_BACKPRESSURE_FILE="$TRAIN_BASE/promotion/operations/backpressure.json"
-export KATAGO_PROMOTION_POLICY_HASH="8562bcd7b835ae0cfcfe517a290748258da229b3fcf588dc99b3703c2b8f6023"
+export KATAGO_PROMOTION_POLICY_HASH="0151ddcdee764b1e599eb5313f9dfae944e671ff8098dd471425f8d646ba3318"
 export KATAGO_PROMOTION_BACKPRESSURE_MAX_AGE_SECONDS=120
 
 python3 -m risk_score.promotion_preflight bootstrap-backpressure \
@@ -1002,12 +1004,26 @@ it with the controller-owned live status after all activation gates pass.
 
 ### 5. Evaluation and controller promotion
 
+Build the source bank through the active `queries-consensus`,
+`label-consensus`, optional `merge-labeling-consensus`, and
+`finalize-consensus` flow in `RiskSeekingCheckpointPromotionRunbook.md`.
+It freezes distinct original/champion hashes and standard/powered 2,000/8,000
+visit results over all distinct shape-preserving symmetries. Ambiguous rows
+remain permanently in `rejected.jsonl`; there is no decisions file. The legacy
+human-review curation-v1 path is historical and cannot satisfy policy v3.
+
+The final source must contain at least 3,200 ordinary, 2,080 Lead-40, and 4,128
+Lead-80 positions. `build_evaluation_suites` requires `--curation-manifest` for
+each source and emits the v3 suite manifest. Curation can require up to 64
+analyses per non-symmetric square position, so execute the eight roles in
+manifested shards.
+
 For every important candidate:
 
 1. yield GPU 7 through the exclusive trainer/evaluator lease;
 2. hash the candidate directory;
-3. run the frozen v2 look-specific ordinary, Lead, tactical, and
-   exploitability suites;
+3. run the frozen v3 look-specific ordinary and Lead suites plus fixed
+   integrity probes;
 4. compare against the original b40 and the current accepted champion;
 5. execute the manifest-bound matrix with `risk_score.promotion_evaluator`,
    which finalizes paired statistics through `risk_score.promotion_evidence`;
@@ -1031,6 +1047,11 @@ python3 -m risk_score.promotion_controller \
   --recommend-only
 ```
 
+Stage 0–2 screening is allowed before machine-review readiness. Direct and
+automatic promotion are not: the controller must first validate transitive v3
+provenance from the suite manifest to every machine-reviewed source, including
+policy, source, rejected-artifact, original-model, and champion-model hashes.
+
 Do not promote into the monolithic mtime-selected self-play process. Before
 enabling mutation, migrate to seven generation-pinned workers, complete the
 canary and rollback drills, and satisfy every repository-closure and live
@@ -1038,8 +1059,9 @@ validation item in `RiskSeekingCheckpointPromotionPlan.md`.
 
 The controller performs the accepted-model move, canary quarantine, worker
 acknowledgements, champion compare-and-swap, admission, and rollback
-transactions. Never manually copy a model into the live model directory or
-touch an old file to influence mtime.
+transactions. Policy v3 requires a 4,000-game canary plus 2,048 fresh audit
+pairs before admission. Never manually copy a model into the live model
+directory or touch an old file to influence mtime.
 
 ## Monitoring
 

@@ -9,7 +9,7 @@ training, shuffle, or host-provisioning procedures there.
 The controller starts in recommendation-only mode. Enabling filesystem or
 process mutation requires both:
 
-1. `"mutationEnabled": true` in a reviewed runtime configuration; and
+1. `"mutationEnabled": true` in a frozen runtime configuration; and
 2. an explicit automatic/mutation CLI flag.
 
 Never enable mutation until the shadow gate, filesystem tests, GPU handoff,
@@ -21,21 +21,21 @@ volume.
 Freeze and hash these together:
 
 - the source revision and local diff;
-- `python/risk_score/promotion_policy_v2.json`;
-- the unchanged v1 policy and its hash when retaining historical v1 evidence;
+- `python/risk_score/promotion_policy_v3.json`;
+- the unchanged v1 and v2 policies when retaining historical evidence;
 - `cpp/configs/risk_score/promotion_powered_match.cfg`;
 - `cpp/configs/risk_score/promotion_standard_match.cfg`;
 - `cpp/configs/risk_score/promotion_curation_analysis.cfg`;
 - `cpp/configs/risk_score/promotion_curation_lead_selfplay_19x19.cfg`;
 - `cpp/configs/risk_score/promotion_selfplay_worker_19x19.cfg`;
 - discovery, confirmation, and audit suite manifests and schedules;
-- the immutable original model;
-- the current champion model;
-- the current trainer checkpoint; and
-- the reviewed runtime configuration.
+- the immutable original model and its byte SHA-256;
+- the frozen champion model used for curation and its byte SHA-256;
+- the current trainer checkpoint;
+- the frozen runtime configuration;
 - `promotion/supervisor/trainer.json`, the dynamic consumer identity snapshot,
   and the live supervisor heartbeat;
-- `configs/deployment-manifest.json`, `trainer-launch.json`,
+- and `configs/deployment-manifest.json`, `trainer-launch.json`,
   `consumer-stop.json`, and `promotion-services.json`.
 
 Keep the live runtime configuration outside Git. Start from
@@ -52,14 +52,11 @@ cd "$REPO/python"
 python3 -c 'from risk_score.paired_stats import load_policy, canonical_sha256; print(canonical_sha256(load_policy()))'
 ```
 
-The checked-in v2 policy prints
-`8562bcd7b835ae0cfcfe517a290748258da229b3fcf588dc99b3703c2b8f6023`.
-Any other value is a different policy and requires a new review and suite
-freeze.
-
-Policy v1 is replay-only historical evidence. Its runner-v2 bundles remain
-readable without a synthetic visit field, but no new evaluation may be
-launched under v1; every new promotion plan uses policy v2 and runner v3.
+The checked-in v3 policy prints
+`0151ddcdee764b1e599eb5313f9dfae944e671ff8098dd471425f8d646ba3318`.
+Any other value is a different policy and requires a new suite freeze. Policies
+v1 and v2 are replay-only historical evidence; all new suite builds and
+promotion plans use policy v3.
 
 ## Installation and preflight
 
@@ -68,6 +65,7 @@ From the repository root:
 ```bash
 python3 -m json.tool python/risk_score/promotion_policy_v1.json >/dev/null
 python3 -m json.tool python/risk_score/promotion_policy_v2.json >/dev/null
+python3 -m json.tool python/risk_score/promotion_policy_v3.json >/dev/null
 python3 -m json.tool python/risk_score/promotion_runtime.example.json >/dev/null
 python3 -m json.tool python/risk_score/gpu_lease_runtime.example.json >/dev/null
 cd python
@@ -118,7 +116,7 @@ automatic mode rechecks on every poll:
 ```bash
 python3 -m risk_score.build_live_runtime \
   --repo "$DEPLOY_REPO" --run-root "$TRAIN_BASE" \
-  --suite-dir "$RUN_DIR/evaluation/promotion-suites-v2" \
+  --suite-dir "$RUN_DIR/evaluation/promotion-suites-v3" \
   --katago-binary "$DEPLOY_REPO/cpp/build-cuda/katago" \
   --python-executable "$DEPLOY_REPO/python/.venv/bin/python" \
   --trainer-spec "$RUN_DIR/configs/trainer-launch.json" \
@@ -131,7 +129,7 @@ python3 -m risk_score.build_live_runtime \
 ```
 
 The host supervisor is safe to start with mutation disabled: it publishes
-identity snapshots and a heartbeat but launches no process. After reviewed
+identity snapshots and a heartbeat but launches no process. After validated
 runtime regeneration with mutation enabled, it adopts or starts exactly one
 trainer, respects every GPU-lease phase, supervises rollout acknowledgements,
 and keeps seven continuous workers synchronized to `champion.json`.
@@ -170,18 +168,13 @@ an atomic rename.
 
 ## Curate the source position bank
 
-`risk_score.curate_position_bank` creates the reviewed input consumed by the
-suite builder. It is staged and fail-closed: discovery/confirmation/audit
-assignment does not happen during curation.
+The active curation contract is machine-consensus v2. It emits only
+machine-reviewed `ordinary`, `lead-40`, and `lead-80` positions for policy v3;
+discovery/confirmation/audit assignment happens later in the suite builder.
 
-Do not harvest the live training self-play corpus: those positions have already
-trained the candidates and would contaminate confirmation holdouts. Generate a
-separate original-model SGF corpus under
-`$RUN_DIR/evaluation/curation/quarantined-sgfs`, keep it outside every
-shuffler/trainer input root, and never admit those games to training.
-
-First publish an immutable harvest plan with the complete source inventory and
-training-root exclusions:
+Do not harvest live training self-play. Generate quarantined source SGFs outside
+every shuffler/trainer input root, then publish and validate the immutable
+harvest plan:
 
 ```bash
 cd "$REPO/python"
@@ -192,21 +185,13 @@ python3 -m risk_score.curate_position_bank harvest-plan \
   --output-dir "$RUN_DIR/evaluation/curation/harvested" \
   --manifest "$RUN_DIR/evaluation/curation/harvest.json" \
   --threads 1
-
-# After independent review of harvest.json:
 python3 -m risk_score.curate_position_bank harvest-execute \
   "$RUN_DIR/evaluation/curation/harvest.json"
 ```
 
-The curation harvester deliberately requires one parser thread so that SGF
-output order and source provenance are reproducible. Execution revalidates the
-complete source inventory before and after `samplesgfs`, writes into a
-temporary directory, and atomically publishes the output with a receipt.
-Query analysis is the GPU-bound stage and may be batched separately.
-
-Normalize and semantically deduplicate the harvested `*.startposes.txt`
-outputs, then create analysis queries bound to the immutable original model
-and frozen policy:
+The one parser thread makes harvest order reproducible. Normalize and
+semantically deduplicate the harvested positions, then freeze distinct original
+and champion model files and hashes in the consensus query manifest:
 
 ```bash
 python3 -m risk_score.curate_position_bank normalize \
@@ -214,167 +199,150 @@ python3 -m risk_score.curate_position_bank normalize \
   --output "$RUN_DIR/evaluation/curation/normalized.jsonl" \
   --manifest "$RUN_DIR/evaluation/curation/normalized-manifest.json"
 
-python3 -m risk_score.curate_position_bank queries \
+python3 -m risk_score.curate_position_bank queries-consensus \
   "$RUN_DIR/evaluation/curation/normalized.jsonl" \
-  --output-dir "$RUN_DIR/evaluation/curation/query-bundle" \
+  --output-dir "$RUN_DIR/evaluation/curation/query-bundle-v2" \
   --katago "$REPO/cpp/build-cuda/katago" \
   --analysis-config "$REPO/cpp/configs/risk_score/promotion_curation_analysis.cfg" \
-  --reference-model "$ORIGINAL_MODEL" \
-  --policy "$REPO/python/risk_score/promotion_policy_v2.json"
+  --original-model "$ORIGINAL_MODEL" \
+  --champion-model "$CHAMPION_MODEL" \
+  --policy "$REPO/python/risk_score/promotion_policy_v3.json"
 ```
 
-Keep `numAnalysisThreads=1`; scale throughput with independently manifested
-process shards. The query bundle currently contains standard 200/800/2,000
-visit and powered 800/2,000 visit files. Split each role before launching:
+`queries-consensus` creates exactly eight roles: original/champion ×
+standard/powered × 2,000/8,000 visits. Every role covers every distinct
+shape-preserving symmetry in each position's orbit. Square boards have at most
+eight distinct members and rectangles at most four.
+
+Resource warning: one non-symmetric square position requires up to 64 analyses
+(2 models × 2 modes × 2 visit counts × 8 symmetries). Keep
+`numAnalysisThreads=1` and shard each role; do not launch one monolithic query
+file.
 
 ```bash
+ROLE=original/standard-2000
 python3 -m risk_score.curate_position_bank split-queries \
-  "$RUN_DIR/evaluation/curation/query-bundle/queries/standard-800.jsonl" \
-  --output-dir "$RUN_DIR/evaluation/curation/query-shards/standard-800" \
+  "$RUN_DIR/evaluation/curation/query-bundle-v2/queries/$ROLE.jsonl" \
+  --output-dir "$RUN_DIR/evaluation/curation/query-shards/$ROLE" \
   --shards 8
 
-# Run once for every shard, assigning reviewed GPU indices.
+# Run once per shard, using ORIGINAL_MODEL for original/* and CHAMPION_MODEL
+# for champion/*.
 python3 -m risk_score.curate_position_bank run-analysis \
   --katago "$REPO/cpp/build-cuda/katago" \
   --config "$REPO/cpp/configs/risk_score/promotion_curation_analysis.cfg" \
   --model "$ORIGINAL_MODEL" \
-  --queries "$RUN_DIR/evaluation/curation/query-shards/standard-800/shard-000.jsonl" \
-  --output "$RUN_DIR/evaluation/curation/result-shards/standard-800/shard-000.jsonl"
+  --queries "$RUN_DIR/evaluation/curation/query-shards/$ROLE/shard-000.jsonl" \
+  --output "$RUN_DIR/evaluation/curation/result-shards/$ROLE/shard-000.jsonl"
 
-# Merge only through the exact split manifest. Repeat --shard-output for all
-# eight outputs; cross-role, missing, duplicate, or misbound shards fail closed.
+# Repeat --shard-output for every shard in the split manifest.
 python3 -m risk_score.curate_position_bank merge-analysis \
-  --queries "$RUN_DIR/evaluation/curation/query-bundle/queries/standard-800.jsonl" \
-  --split-manifest "$RUN_DIR/evaluation/curation/query-shards/standard-800/manifest.json" \
-  --shard-output "$RUN_DIR/evaluation/curation/result-shards/standard-800/shard-000.jsonl" \
-  --output "$RUN_DIR/evaluation/curation/results/standard-800.jsonl"
-
-# Repeat split, run, and merge for every role, then bind all five results:
-python3 -m risk_score.curate_position_bank label \
-  "$RUN_DIR/evaluation/curation/normalized.jsonl" \
-  --query-manifest "$RUN_DIR/evaluation/curation/query-bundle/manifest.json" \
-  --analysis standard-200="$RUN_DIR/evaluation/curation/results/standard-200.jsonl" \
-  --analysis standard-800="$RUN_DIR/evaluation/curation/results/standard-800.jsonl" \
-  --analysis standard-2000="$RUN_DIR/evaluation/curation/results/standard-2000.jsonl" \
-  --analysis powered-800="$RUN_DIR/evaluation/curation/results/powered-800.jsonl" \
-  --analysis powered-2000="$RUN_DIR/evaluation/curation/results/powered-2000.jsonl" \
-  --output-dir "$RUN_DIR/evaluation/curation/labeling"
+  --queries "$RUN_DIR/evaluation/curation/query-bundle-v2/queries/$ROLE.jsonl" \
+  --split-manifest "$RUN_DIR/evaluation/curation/query-shards/$ROLE/manifest.json" \
+  --shard-output "$RUN_DIR/evaluation/curation/result-shards/$ROLE/shard-000.jsonl" \
+  --output "$RUN_DIR/evaluation/curation/results/$ROLE.jsonl"
 ```
 
-Every shard publishes `<result>.manifest.json`, binding its exact query shard,
-model, binary, config, and result hashes. The merged receipt additionally binds
-the split manifest. Never rebuild a binary path while its shards are running;
-resume a failed shard only with the same recorded binary/config/model hashes.
+Every analysis output has a sibling `.manifest.json` binding the model, binary,
+config, query, and result hashes. After merging all eight roles:
+
+```bash
+python3 -m risk_score.curate_position_bank label-consensus \
+  "$RUN_DIR/evaluation/curation/normalized.jsonl" \
+  --query-manifest "$RUN_DIR/evaluation/curation/query-bundle-v2/manifest.json" \
+  --analysis original/standard-2000="$RUN_DIR/evaluation/curation/results/original/standard-2000.jsonl" \
+  --analysis original/standard-8000="$RUN_DIR/evaluation/curation/results/original/standard-8000.jsonl" \
+  --analysis original/powered-2000="$RUN_DIR/evaluation/curation/results/original/powered-2000.jsonl" \
+  --analysis original/powered-8000="$RUN_DIR/evaluation/curation/results/original/powered-8000.jsonl" \
+  --analysis champion/standard-2000="$RUN_DIR/evaluation/curation/results/champion/standard-2000.jsonl" \
+  --analysis champion/standard-8000="$RUN_DIR/evaluation/curation/results/champion/standard-8000.jsonl" \
+  --analysis champion/powered-2000="$RUN_DIR/evaluation/curation/results/champion/powered-2000.jsonl" \
+  --analysis champion/powered-8000="$RUN_DIR/evaluation/curation/results/champion/powered-8000.jsonl" \
+  --output-dir "$RUN_DIR/evaluation/curation/labeling-v2"
+```
+
+Acceptance is deliberately narrow. All standard scores must agree on one
+buffered band: `abs(score) < 25` for ordinary, `45 <= score < 75` for Lead-40,
+or `score >= 85` for Lead-80. Visit, model, symmetry, or canonical top-move
+disagreement; a threshold boundary; a specialized signal; or an unclassifiable
+label sends the position permanently to `rejected.jsonl`. Only rows in
+`machine-labeled.jsonl` have classification `machine-reviewed`. Policy v3
+freezes the global score-stability margin at 5.0; it is not an operator-tunable
+promotion parameter.
 
 ### Supplement missing Lead pools
 
-Inspect the labeling manifest and automatic-label counts before review. A
-balanced original-versus-original corpus can satisfy the ordinary quota while
-producing too few stable Lead-40 or Lead-80 positions. Do not assign Lead
-labels to ordinary positions merely to satisfy policy minima.
+Policy v3 requires at least 3,200 ordinary, 2,080 Lead-40, and 4,128 Lead-80
+source positions. If either Lead pool is short, generate a separate quarantined
+corpus with `promotion_curation_lead_selfplay_19x19.cfg`. A terminal-margin SGFS
+filter may reduce obvious misses, but it does not assign labels. Normalize the
+supplement and run the same complete `queries-consensus` and `label-consensus`
+workflow with the same frozen policy, original hash, champion hash, and
+stability margin.
 
-When either Lead pool is deficient, generate a separate corpus with
-`promotion_curation_lead_selfplay_19x19.cfg`. Use the immutable original model
-in a one-model directory and a new output root under
-`evaluation/curation`; verify that this root is outside every shuffler and
-trainer input. The command writes both SGFs and toxic-to-training `tdata`, so
-the entire output remains quarantined. Record the binary, config, model, launch
-argv, and resulting SGF hashes before harvesting.
-
-Large terminal margins are a cheap game-level filter, not a Lead label. Before
-harvesting a large corpus, publish a content-bound SGFS subset with a loose
-margin threshold:
+Merge disjoint consensus bundles without weakening their provenance:
 
 ```bash
-python3 -m risk_score.curate_position_bank filter-sgfs \
-  "$RUN_DIR/evaluation/curation/lead-v1/quarantined-selfplay/original/sgfs/"*.sgfs \
-  --minimum-margin 35 \
-  --output "$RUN_DIR/evaluation/curation/lead-v1/filtered/games.sgfs" \
-  --manifest "$RUN_DIR/evaluation/curation/lead-v1/filtered/manifest.json"
+python3 -m risk_score.curate_position_bank merge-labeling-consensus \
+  "$RUN_DIR/evaluation/curation/labeling-v2" \
+  "$RUN_DIR/evaluation/curation/lead-v2/labeling-v2" \
+  --output-dir "$RUN_DIR/evaluation/curation/labeling-combined-v2"
 ```
 
-Harvest and normalize the filtered corpus into a new bundle, generate queries,
-and run only `standard-200` first. Use its fully provenance-bound result to
-discard positions that are not plausible positive leads:
+The merge carries both accepted and rejected rows and rejects semantic
+duplicates or policy/model/stability mismatches. Finalization has no decisions
+file and cannot rescue a rejected row:
 
 ```bash
-python3 -m risk_score.curate_position_bank score-prefilter \
-  "$RUN_DIR/evaluation/curation/lead-v1/normalized.jsonl" \
-  --query-manifest "$RUN_DIR/evaluation/curation/lead-v1/query-bundle/manifest.json" \
-  --analysis "$RUN_DIR/evaluation/curation/lead-v1/results/standard-200.jsonl" \
-  --minimum-score 30 \
-  --output "$RUN_DIR/evaluation/curation/lead-v1/selected.jsonl" \
-  --manifest "$RUN_DIR/evaluation/curation/lead-v1/selected.manifest.json"
-```
-
-Generate a fresh query bundle from `selected.jsonl`, then run and merge all
-five roles. The cheap prefilter is discovery-only: final Lead labels still
-require the normal standard/powered 200/800/2,000 visit-stability checks.
-
-After labeling the supplemental bundle, combine it with the original bundle.
-The merge rejects changed inputs, policy/model/stability mismatches, and
-semantic duplicates:
-
-```bash
-python3 -m risk_score.curate_position_bank merge-labeling \
-  "$RUN_DIR/evaluation/curation/labeling" \
-  "$RUN_DIR/evaluation/curation/lead-v1/labeling" \
-  --output-dir "$RUN_DIR/evaluation/curation/labeling-combined-v1"
-```
-
-Use the combined bundle's `auto-labeled.jsonl`, `review-queue.jsonl`, and
-`manifest.json` for review and finalization. Preserve every source bundle and
-prefilter manifest as frozen provenance.
-
-Only stable ordinary/Lead-40/Lead-80 cases are auto-labeled. Every tactical,
-exploitability, bait, tail, sacrifice, small-gain/large-lead, adversarial, or
-unstable case remains in `review-queue.jsonl`. A reviewer must provide exactly
-one decision per queued semantic SHA:
-
-```json
-{"approved":true,"labels":["exploitability","baits"],"semantic_sha256":"..."}
-```
-
-Finalize only after review. The command rejects semantic duplicates,
-unreviewed rows, changed inputs, and pools below policy-v2 minima:
-
-```bash
-python3 -m risk_score.curate_position_bank finalize \
-  --auto "$RUN_DIR/evaluation/curation/labeling-combined-v1/auto-labeled.jsonl" \
-  --review-queue "$RUN_DIR/evaluation/curation/labeling-combined-v1/review-queue.jsonl" \
-  --decisions "$RUN_DIR/evaluation/curation/review-decisions-combined-v1.jsonl" \
-  --labeling-manifest "$RUN_DIR/evaluation/curation/labeling-combined-v1/manifest.json" \
-  --policy "$REPO/python/risk_score/promotion_policy_v2.json" \
+python3 -m risk_score.curate_position_bank finalize-consensus \
+  --machine-labeled "$RUN_DIR/evaluation/curation/labeling-combined-v2/machine-labeled.jsonl" \
+  --rejected "$RUN_DIR/evaluation/curation/labeling-combined-v2/rejected.jsonl" \
+  --labeling-manifest "$RUN_DIR/evaluation/curation/labeling-combined-v2/manifest.json" \
+  --policy "$REPO/python/risk_score/promotion_policy_v3.json" \
   --output "$RUN_DIR/evaluation/source-positions.jsonl" \
   --manifest "$RUN_DIR/evaluation/source-positions.manifest.json"
 ```
 
-Do not use promotion match output to curate the suite that evaluates those
-candidates. That would leak discovery or confirmation results into the frozen
-holdouts.
+Preserve `rejected.jsonl` permanently with the final bank. Do not use promotion
+match output to curate the suite that evaluates those candidates.
+
+### Historical curation v1
+
+The older `queries`, `label`, `merge-labeling`, and `finalize` commands produced
+an `auto-labeled.jsonl`/`review-queue.jsonl` bundle and required a human
+`--decisions` file. That path remains available only to replay historical
+evidence. It does not satisfy policy-v3 machine-review provenance and must not
+be used for a new promotion suite.
 
 ## Freeze evaluation suites
 
-The suite builder consumes reviewed, labeled `PositionSample` JSONL. It does
-not synthesize tactical or exploitability positions.
-
-Create a new, previously absent output directory:
+Suite build v3 requires exactly one `--curation-manifest` for each source JSONL
+and binds the `risk-score-reviewed-position-bank-v2` contract transitively:
 
 ```bash
 cd "$REPO/python"
 python3 -m risk_score.build_evaluation_suites \
   "$RUN_DIR/evaluation/source-positions.jsonl" \
-  --output-dir "$RUN_DIR/evaluation/promotion-suites-v2" \
-  --seed risk-score-promotion-v2 \
-  --policy "$REPO/python/risk_score/promotion_policy_v2.json"
+  --output-dir "$RUN_DIR/evaluation/promotion-suites-v3" \
+  --seed risk-score-promotion-v3 \
+  --policy "$REPO/python/risk_score/promotion_policy_v3.json" \
+  --curation-manifest "$RUN_DIR/evaluation/source-positions.manifest.json"
 ```
 
-Review row counts, exclusions, labels, source hashes, bank hashes, and schedule
-hashes in the emitted manifest. Confirm that every risk-bearing pair has a
-distinct independent position cluster, that look 1 is an exact complete-pair
-prefix of look 2, and that Lead discovery positions are disjoint from Lead
-confirmation positions. Confirmation data must not have been used to rank
-candidates. Publish a new version rather than overwriting a frozen suite.
+Validate the emitted `risk-score-authoritative-evaluation-manifest-v3`,
+including `machineReviewOnly=true`, curation sources, model hashes, source
+hashes, labels, quotas, and schedule hashes. The source minima are 3,200
+ordinary, 2,080 Lead-40, and 4,128 Lead-80 positions. Deep audit reserves 2,048
+ordinary, 1,024 Lead-40, and 2,048 Lead-80 pairs, each at both 2,000 and 8,000
+visits. Its v2 request/report matrix binds all 24 bank/visit/control cells to
+runner and statistics artifact hashes. Before scheduling, freeze the b28
+control at `$PROMOTION_ROOT/controls/b28/model.bin.gz`; its content hash is
+bound into the request with candidate, champion, and original hashes. Every
+runner manifest must bind existing result and move JSONL files, and each
+statistics artifact must bind those exact output hashes. Cell PASS/FAIL is
+recomputed from the validated games against the frozen win-rate threshold;
+report authors cannot declare it independently. Publish a new version rather
+than overwriting a frozen suite.
 
 ## Bootstrap and inventory
 
@@ -405,7 +373,7 @@ When the promotion controller owns the run, also set:
 
 ```bash
 export KATAGO_PROMOTION_BACKPRESSURE_FILE="$TRAIN_BASE/promotion/operations/backpressure.json"
-export KATAGO_PROMOTION_POLICY_HASH="8562bcd7b835ae0cfcfe517a290748258da229b3fcf588dc99b3703c2b8f6023"
+export KATAGO_PROMOTION_POLICY_HASH="0151ddcdee764b1e599eb5313f9dfae944e671ff8098dd471425f8d646ba3318"
 export KATAGO_PROMOTION_BACKPRESSURE_MAX_AGE_SECONDS=120
 python3 -m risk_score.promotion_preflight bootstrap-backpressure \
   --output "$KATAGO_PROMOTION_BACKPRESSURE_FILE" \
@@ -460,10 +428,16 @@ For every recommendation, independently verify:
 Run enough shadow cycles to demonstrate that restarts and repeated invocations
 produce the same events, evaluation keys, and reports.
 
+Stage 0–2 screening is allowed before machine-review readiness is complete.
+That permission does not extend to activation: both direct promotion and
+automatic advancement remain blocked unless the controller can trace the v3
+suite manifest through every `risk-score-reviewed-position-bank-v2` curation
+manifest, source hash, policy hash, and original/champion model binding.
+
 ### Configured evaluator adapter
 
 Automatic controller mode invokes the runtime `commands.evaluator` argv
-template. Use the reviewed in-repository `risk_score.promotion_evaluator`
+template. Use the in-repository `risk_score.promotion_evaluator`
 unless an equivalent replacement has been audited. It runs the exact
 manifest-bound match cells through `EvaluationRunner`, then uses
 `risk_score.promotion_evidence` to atomically publish canonical
@@ -519,7 +493,7 @@ python3 -m risk_score.gpu_lease \
   --config "$RUN_DIR/configs/gpu-lease-runtime.json" reconcile
 ```
 
-Only after reviewing the plan, apply it explicitly:
+Apply only after the dry plan is valid:
 
 ```bash
 python3 -m risk_score.gpu_lease \
@@ -554,9 +528,9 @@ Canary output must be outside the shuffler-visible self-play root.
 
 The rollout sequence is:
 
-1. one of seven workers for 2,000 games;
-2. fresh 1,024-pair audit against the previous champion;
-3. schema, purity, throughput, crash-rate, tactical, and catastrophe checks;
+1. one of seven workers for 4,000 games;
+2. fresh 2,048-pair audit against the previous champion;
+3. schema, purity, throughput, crash-rate, behavioral, and catastrophe checks;
 4. three of seven workers after canary PASS;
 5. all seven workers after model-SHA acknowledgement; and
 6. atomic admission of the generation data followed by champion commit.
@@ -575,7 +549,11 @@ thread count, verified process identity, and a stable closed-output manifest.
 Canary and intermediate auditors publish finalized reports to
 `rolloutReportInbox`. The owning controller ingests these IPC files while
 holding the process-lifetime writer lock; bare acknowledgement or PASS marker
-files are rejected.
+files are rejected. A v3 canary report must bind a canonical
+`risk-score-canary-fresh-audit-v1` manifest containing the
+candidate/reference, suite, policy, schedule, pair-identity, and
+statistics-artifact hashes. The 2,048 pair IDs must equal the complete
+two-member pair set in the frozen audit schedule.
 
 After commit, record the first game, tdata file, admitted directory, shuffle,
 and trainer consumption that reference the new generation.
@@ -584,7 +562,7 @@ and trainer consumption that reference the new generation.
 
 Automatic mode is allowed only after:
 
-- recommendation-only decisions match independent review;
+- recommendation-only decisions match the frozen gate and expected fixtures;
 - event replay and report finalization are idempotent;
 - GPU lease handoff and trainer restoration pass on GPU 7;
 - evaluator topology is frozen;
@@ -593,8 +571,8 @@ Automatic mode is allowed only after:
 - all rollback drills pass; and
 - monitoring exposes every invariant and latency target.
 
-Policy v1 remains immutable historical evidence and must not be used for new
-automatic promotion. Policy v2 uses cumulative confirmation looks:
+Policies v1 and v2 remain immutable historical evidence and must not be used
+for new automatic promotion. Policy v3 uses cumulative confirmation looks:
 
 - look 1: 512 powered ordinary pairs per matchup, 128 standard pairs, 512
   Lead-40 pairs, and 1,024 Lead-80 pairs;
@@ -608,9 +586,9 @@ zero-event margins remain inconclusive. A full final confirmation is 5,248
 color pairs, or 10,496 games, before canary audit work; benchmark this workload
 before accepting the four-hour target.
 
-Review and set `"mutationEnabled": true` in both controller and GPU-lease
-runtime configs, then use the controller's explicit automatic flag. Keep a
-human present for the first promotion.
+Set `"mutationEnabled": true` in both controller and GPU-lease runtime configs
+only after all activation checks pass, then use the controller's explicit
+automatic flag. A PASS report alone cannot bypass machine-review readiness.
 
 ## Rollback
 

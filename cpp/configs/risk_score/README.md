@@ -138,9 +138,10 @@ powered-utility and predicted-score differences between the selected moves.
 
 ## Checkpoint promotion
 
-New promotion evaluation uses the immutable v2 policy while v1 remains
-available only for replaying historical evidence. V2 publishes separate
-cumulative look-1/look-2 schedule artifacts and requires one independent
+New promotion evaluation uses `promotion_policy_v3.json`, canonical hash
+`0151ddcdee764b1e599eb5313f9dfae944e671ff8098dd471425f8d646ba3318`.
+Policies v1/v2 remain available only for replaying historical evidence. V3
+publishes cumulative look-1/look-2 schedules and requires one independent
 position cluster per risk-bearing pair.
 
 Promotion evaluation uses:
@@ -167,19 +168,59 @@ assembler then binds finalized runner output to paired statistics and the
 five-cell gate. An external PASS marker is not promotion evidence.
 
 `promotion_curation_analysis.cfg` is the deterministic one-GPU analysis
-template for `risk_score.curate_position_bank`. Query files override visits
-and powered/standard utility per position; the curation manifest binds this
-config, the KataGo binary, and the immutable original-model hash. It enables
-KataGo's deterministic test seed and one analysis worker. Run it only under
-the same exclusive GPU lease used for other promotion analysis.
+template for the active machine-consensus curation-v2 flow:
+
+```sh
+python3 -m risk_score.curate_position_bank queries-consensus ...
+python3 -m risk_score.curate_position_bank label-consensus ...
+python3 -m risk_score.curate_position_bank merge-labeling-consensus ...
+python3 -m risk_score.curate_position_bank finalize-consensus ...
+```
+
+`queries-consensus` freezes distinct original and champion model hashes. It
+generates standard and powered queries at 2,000 and 8,000 visits over every
+distinct shape-preserving symmetry. A non-symmetric square position can
+therefore require 64 analyses (2 models × 2 modes × 2 visits × 8 symmetries);
+split, execute, and merge every role in manifested shards.
+
+Only unanimous buffered ordinary (`abs(score) < 25`), Lead-40
+(`45 <= score < 75`), or Lead-80 (`score >= 85`) rows become
+`machine-reviewed`. Every visit/model/symmetry/top-move disagreement, threshold
+boundary, specialized signal, or unclassifiable row is permanently recorded in
+`rejected.jsonl`. Policy v3 freezes the global score-stability margin at 5.0;
+`finalize-consensus` has no decisions-file input.
+
+The legacy `queries`, `label`, `merge-labeling`, and `finalize` human-review
+path remains historical curation-v1 support only. It cannot authorize policy-v3
+promotion.
+
+Finalization requires at least 3,200 ordinary, 2,080 Lead-40, and 4,128 Lead-80
+positions. Suite build v3 requires one `--curation-manifest` per source and
+transitively binds `risk-score-reviewed-position-bank-v2`:
+
+```sh
+cd python
+python3 -m risk_score.build_evaluation_suites \
+  /path/to/source-positions.jsonl \
+  --output-dir /path/to/promotion-suites-v3 \
+  --seed risk-score-promotion-v3 \
+  --policy risk_score/promotion_policy_v3.json \
+  --curation-manifest /path/to/source-positions.manifest.json
+```
+
+The v3 deep audit uses 2,048 ordinary, 1,024 Lead-40, and 2,048 Lead-80 pairs
+at both 2,000 and 8,000 visits. Rollout requires a 4,000-game canary plus 2,048
+fresh audit pairs. Stage 0–2 screening may run before readiness, but direct and
+automatic promotion remain blocked unless the suite transitively passes the v3
+machine-review provenance checks.
 
 `promotion_curation_lead_selfplay_19x19.cfg` generates a quarantined
 supplemental corpus for Lead-40/Lead-80 discovery. It keeps the fixed 19x19
 rules and immutable original model, but deliberately gives one color an
 uncompensated fixed 100x playout advantage. This makes large-lead positions
-common without asserting any labels: the manifest-bound five-tier analysis
-remains the only source of automatic Lead labels. Its output must never enter
-a shuffler or trainer input root.
+common without asserting any labels: the complete two-model consensus analysis
+remains the only source of machine-reviewed Lead labels. Its output must never
+enter a shuffler or trainer input root.
 
 `promotion_selfplay_worker_19x19.cfg` is the generation-pinned one-GPU
 self-play template. Launch seven separate workers through the promotion

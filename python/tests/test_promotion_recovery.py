@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from risk_score.generate_schedule import build_schedule
 from risk_score.promotion_controller import (
     ConfigurationError,
     IncompleteCandidate,
@@ -39,6 +40,67 @@ from risk_score.promotion_state import (
 
 def digest(label):
     return sha256_bytes(label.encode("utf-8"))
+
+
+def deep_audit_result(row, *, candidate_wins=True):
+    candidate_black = row["blackBot"] == 0
+    winner = (
+        ("B" if candidate_black else "W")
+        if candidate_wins
+        else ("W" if candidate_black else "B")
+    )
+    score = -1.0 if winner == "B" else 1.0
+    return {
+        "schemaVersion": 1,
+        "scheduleId": row["scheduleId"],
+        "gameId": row["gameId"],
+        "pairId": row["pairId"],
+        "positionId": row["positionId"],
+        "seed": row["seed"],
+        "blackBot": "candidate" if candidate_black else "reference",
+        "whiteBot": "reference" if candidate_black else "candidate",
+        "blackBotIndex": row["blackBot"],
+        "whiteBotIndex": row["whiteBot"],
+        "board": {"xSize": 19, "ySize": 19},
+        "rules": {"ko": "POSITIONAL", "scoring": "AREA"},
+        "komi": 7.5,
+        "finalResult": f"{winner}+1",
+        "finalWhiteMinusBlackScore": score,
+        "winner": winner,
+        "moveCount": 2,
+        "blackMoveCount": 1,
+        "whiteMoveCount": 1,
+        "startTurnNumber": row["startPosition"]["initialTurnNumber"],
+        "hitTurnLimit": False,
+        "resignation": False,
+        "noResult": False,
+        "scored": True,
+        "gameHash": "hash-" + row["gameId"],
+    }
+
+
+def deep_audit_moves(row, result):
+    return [
+        {
+            "schemaVersion": 1,
+            "scheduleId": row["scheduleId"],
+            "gameId": row["gameId"],
+            "pairId": row["pairId"],
+            "positionId": row["positionId"],
+            "seed": row["seed"],
+            "turnNumber": result["startTurnNumber"] + offset,
+            "player": player,
+            "bot": (
+                result["blackBot"]
+                if player == "B"
+                else result["whiteBot"]
+            ),
+            "move": "D4" if offset == 0 else "Q16",
+            "scoreLead": 0.0,
+            "winProbability": 0.5,
+        }
+        for offset, player in enumerate(("B", "W"))
+    ]
 
 
 def gate_ranking_summary(
@@ -265,12 +327,31 @@ def prepare_runtime(tmp_path, *, mutation_enabled=True, min_free=0, max_queue=4)
         directory.mkdir(parents=True, exist_ok=True)
     (root / "train" / "model.ckpt").write_bytes(b"checkpoint-before-promotion")
     (root / "original.bin.gz").write_bytes(b"original")
+    b28 = root / "promotion" / "controls" / "b28" / "model.bin.gz"
+    b28.parent.mkdir(parents=True)
+    b28.write_bytes(b"immutable-b28-control")
     (root / "policy.json").write_text(
         json.dumps(
             {
-                "policy_version": "test-v1",
+                "schema_version": 1,
+                "policy_version": "risk-seeking-checkpoint-promotion-v3",
                 "threshold": 0.5,
                 "frozen_plan": {"source_revision": "a" * 40},
+                "machine_curation_contract": {
+                    "final_contract": "risk-score-reviewed-position-bank-v2",
+                    "review_mode": "machine-consensus",
+                    "consensus_rules_version": 1,
+                    "stability_margin": 5.0,
+                    "allowed_labels": ["ordinary", "lead-40", "lead-80"],
+                    "model_roles": [
+                        "immutable_original",
+                        "frozen_champion",
+                    ],
+                    "search_modes": ["standard", "powered"],
+                    "visits": [2000, 8000],
+                    "symmetry_semantics": "katago-shape-preserving-d4-v1",
+                    "automatic_promotion_requires_transitive_suite_provenance": True,
+                },
                 "evaluation_stages": {
                     "stage_0_integrity_and_fixed_probes": {
                         "fixed_analysis_positions": 8,
@@ -291,6 +372,16 @@ def prepare_runtime(tmp_path, *, mutation_enabled=True, min_free=0, max_queue=4)
                     "deep_audit": {
                         "promotion_interval": 5,
                         "near_boundary_fraction": 0.1,
+                        "ordinary_color_pairs": 1,
+                        "lead_40_color_pairs": 1,
+                        "lead_80_color_pairs": 1,
+                        "visits": [2000, 8000],
+                        "controls": [
+                            "candidate",
+                            "champion",
+                            "original",
+                            "b28",
+                        ],
                     },
                 },
                 "queue": {
@@ -304,8 +395,8 @@ def prepare_runtime(tmp_path, *, mutation_enabled=True, min_free=0, max_queue=4)
                     "intermediate_workers": 3,
                     "full_workers": 7,
                     "games_per_worker_initial_threads": 100,
-                    "canary_games": 2000,
-                    "canary_fresh_audit_color_pairs": 1024,
+                    "canary_games": 4,
+                    "canary_fresh_audit_color_pairs": 2,
                 },
             },
             indent=2,
@@ -324,6 +415,43 @@ def prepare_runtime(tmp_path, *, mutation_enabled=True, min_free=0, max_queue=4)
         "selfplay.cfg",
     ):
         (root / name).write_text(name, encoding="utf-8")
+    audit_positions = [
+        {
+            "xSize": 19,
+            "ySize": 19,
+            "board": "/".join(["." * 19] * 19),
+            "nextPla": "B",
+            "moveLocs": [],
+            "movePlas": [],
+            "initialTurnNumber": index,
+            "hintLoc": "null",
+        }
+        for index in range(2)
+    ]
+    audit_rows = build_schedule(
+        audit_positions,
+        bot_a_index=0,
+        bot_b_index=1,
+        pairs_per_position=1,
+        base_seed="promotion-recovery-audit",
+    )
+    (root / "audit.jsonl").write_bytes(
+        b"".join(canonical_json_bytes(row) + b"\n" for row in audit_rows)
+    )
+    for name, seed in (
+        ("lead40.jsonl", "promotion-recovery-lead40"),
+        ("lead80.jsonl", "promotion-recovery-lead80"),
+    ):
+        rows = build_schedule(
+            audit_positions,
+            bot_a_index=0,
+            bot_b_index=1,
+            pairs_per_position=1,
+            base_seed=seed,
+        )
+        (root / name).write_bytes(
+            b"".join(canonical_json_bytes(row) + b"\n" for row in rows)
+        )
     (root / "standard-confirmation.jsonl").write_bytes(
         (root / "confirmation.jsonl").read_bytes()
     )
@@ -341,16 +469,58 @@ def prepare_runtime(tmp_path, *, mutation_enabled=True, min_free=0, max_queue=4)
         "lead-40": root / "lead40.jsonl",
         "lead-80": root / "lead80.jsonl",
     }
+    suite_schedules = root / "suites" / "schedules"
+    suite_schedules.mkdir()
+    for name, source in bank_files.items():
+        (suite_schedules / f"{name}.jsonl").write_bytes(source.read_bytes())
+    source_hash = digest("machine-reviewed-source")
+    original_hash = sha256_file(root / "original.bin.gz")
     suite_payload = {
-        "schemaVersion": 1,
+        "schemaVersion": 3,
+        "manifestContract": "risk-score-authoritative-evaluation-manifest-v3",
         "policy_hash": canonical_sha256(policy),
         "source_revision": policy["frozen_plan"]["source_revision"],
+        "machineReviewOnly": True,
+        "acceptedLabels": ["lead-40", "lead-80", "ordinary"],
+        "sources": [
+            {
+                "name": "source-positions.jsonl",
+                "sha256": source_hash,
+                "rowCount": 3,
+                "blankLineCount": 0,
+            }
+        ],
+        "curationSources": [
+            {
+                "source_name": "source-positions.jsonl",
+                "contract": "risk-score-reviewed-position-bank-v2",
+                "review_mode": "machine-consensus",
+                "consensus_rules_version": 1,
+                "policy_hash": canonical_sha256(policy),
+                "allowed_labels": ["lead-40", "lead-80", "ordinary"],
+                "output_sha256": source_hash,
+                "manifest_sha256": digest("machine-review-manifest"),
+                "rejected_count": 1,
+                "rejected_sha256": digest("rejected-positions"),
+                "models": {
+                    "original": {
+                        "role": "immutable_original",
+                        "sha256": original_hash,
+                    },
+                    "champion": {
+                        "role": "frozen_champion",
+                        "sha256": digest("curation-champion"),
+                    },
+                },
+            }
+        ],
         "banks": [
             {
                 "name": name,
                 "positions": {"sha256": digest(f"{name}-positions")},
                 "schedule": {
-                    "sha256": sha256_file(path),
+                    "path": f"schedules/{name}.jsonl",
+                    "sha256": sha256_file(suite_schedules / f"{name}.jsonl"),
                     "scheduleId": f"{name}-schedule",
                     "rowCount": 2,
                     "pairCount": 1,
@@ -614,6 +784,78 @@ def promotion_controller_tree_manifest(path):
 
 def mark_health_pass(controller, runtime, artifact, generation_id, phase):
     worker_count = 1 if phase == "canary" else 3
+    rollout = runtime.frozen_policy["rollout"]
+    fresh_audit_pair_ids = (
+        sorted(
+            {
+                json.loads(line)["pairId"]
+                for line in runtime.audit_schedule_path.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+                if line
+            }
+        )
+        if phase == "canary"
+        else []
+    )
+    runtime.rollout_report_inbox.mkdir(parents=True, exist_ok=True)
+    audit_manifest_path = (
+        runtime.promotion_root
+        / "transactions"
+        / generation_id
+        / "fresh-audit.json"
+    )
+    if phase == "canary":
+        intent = load_json(
+            runtime.promotion_root
+            / "transactions"
+            / generation_id
+            / "intent.json"
+        )
+        statistics_path = (
+            runtime.promotion_root
+            / "transactions"
+            / generation_id
+            / "fresh-audit-statistics.json"
+        )
+        statistics = {
+            "schema_version": 1,
+            "contract": "risk-score-canary-fresh-audit-statistics-v1",
+            "finalized": True,
+            "decision": "PASS",
+            "candidate_hash": artifact.model_hash,
+            "reference_hash": intent["tested_champion_hash"],
+            "policy_hash": runtime.controller.policy_hash,
+            "suite_manifest_hash": runtime.controller.suite_manifest_hash,
+            "audit_schedule_hash": runtime.controller.audit_schedule_hash,
+            "color_pairs": rollout["canary_fresh_audit_color_pairs"],
+            "pair_ids": fresh_audit_pair_ids,
+            "pair_ids_sha256": canonical_sha256(fresh_audit_pair_ids),
+            "safety_failures": 0,
+        }
+        statistics["manifest_sha256"] = canonical_sha256(statistics)
+        atomic_write_json(statistics_path, statistics)
+        audit_manifest = {
+            "schema_version": 1,
+            "contract": "risk-score-canary-fresh-audit-v1",
+            "finalized": True,
+            "decision": "PASS",
+            "generation_id": generation_id,
+            "candidate_hash": artifact.model_hash,
+            "reference_hash": intent["tested_champion_hash"],
+            "policy_hash": runtime.controller.policy_hash,
+            "suite_manifest_hash": runtime.controller.suite_manifest_hash,
+            "audit_schedule_hash": runtime.controller.audit_schedule_hash,
+            "color_pairs": rollout["canary_fresh_audit_color_pairs"],
+            "pair_ids_sha256": canonical_sha256(fresh_audit_pair_ids),
+            "statistics_artifact_path": str(statistics_path.resolve()),
+            "statistics_artifact_sha256": sha256_file(statistics_path),
+            "safety_failures": 0,
+        }
+        audit_manifest["manifest_sha256"] = canonical_sha256(
+            audit_manifest
+        )
+        atomic_write_json(audit_manifest_path, audit_manifest)
     report = {
         "schema_version": 1,
         "finalized": True,
@@ -640,10 +882,23 @@ def mark_health_pass(controller, runtime, artifact, generation_id, phase):
         "tactical_pass": True,
         "exploitability_pass": True,
         "catastrophe_pass": True,
-        "game_count": 2000 if phase == "canary" else 6000,
-        "fresh_audit_pairs": 1024 if phase == "canary" else 0,
+        "game_count": rollout["canary_games"] if phase == "canary" else 6000,
+        "fresh_audit_pairs": (
+            rollout["canary_fresh_audit_color_pairs"] if phase == "canary" else 0
+        ),
+        "fresh_audit_pair_ids": fresh_audit_pair_ids,
+        "fresh_audit_pair_ids_sha256": canonical_sha256(fresh_audit_pair_ids),
+        "fresh_audit_manifest_path": (
+            str(audit_manifest_path.resolve())
+            if phase == "canary"
+            else None
+        ),
+        "fresh_audit_manifest_sha256": (
+            sha256_file(audit_manifest_path)
+            if phase == "canary"
+            else None
+        ),
     }
-    runtime.rollout_report_inbox.mkdir(parents=True, exist_ok=True)
     report_path = runtime.rollout_report_inbox / f"{generation_id}.{phase}.json"
     atomic_write_json(report_path, report)
     kwargs = {
@@ -768,15 +1023,13 @@ def test_runtime_example_is_safe_and_uses_repository_evidence_cli():
     assert "worker-start" in example["commands"]["selfplay"]
     assert "workers-drain" in example["commands"]["drain"]
     assert "consumers-stop" in example["commands"]["rollback"]
-    assert example["paths"]["policy"].endswith(
-        "risk_score/promotion_policy_v2.json"
-    )
-    assert example["paths"]["suites"].endswith("promotion-suites-v2")
+    assert example["paths"]["policy"].endswith("risk_score/promotion_policy_v3.json")
+    assert example["paths"]["suites"].endswith("promotion-suites-v3")
     assert example["paths"]["lead40Schedule"].endswith(
-        "promotion-suites-v2/schedules/lead-40-confirmation.jsonl"
+        "promotion-suites-v3/schedules/lead-40-confirmation.jsonl"
     )
     assert example["paths"]["lead80Schedule"].endswith(
-        "promotion-suites-v2/schedules/lead-80-confirmation.jsonl"
+        "promotion-suites-v3/schedules/lead-80-confirmation.jsonl"
     )
     assert example["paths"]["standardConfirmationSchedule"].endswith(
         "configs/standard-confirmation.jsonl"
@@ -785,6 +1038,8 @@ def test_runtime_example_is_safe_and_uses_repository_evidence_cli():
         example["hashes"]["standardConfirmationSchedule"]
         == example["hashes"]["confirmationOrdinarySchedule"]
     )
+    max_games_index = example["commands"]["selfplay"].index("--max-games") + 1
+    assert example["commands"]["selfplay"][max_games_index] == "4000"
 
 
 def test_cli_defaults_to_recommendation_and_requires_explicit_automatic():
@@ -2034,6 +2289,86 @@ def test_run_once_orchestrates_all_stages_one_poll_at_a_time(tmp_path):
     )
 
 
+def test_screening_survives_machine_review_promotion_block(tmp_path):
+    runtime, controller, artifact = bootstrap_and_claim(tmp_path)
+    _, report_path, report_hash = confirm_and_report(controller, artifact)
+    blocked_policy = {
+        **runtime.frozen_policy,
+        "policy_version": "risk-seeking-checkpoint-promotion-v2",
+    }
+    blocked = PromotionController(
+        replace(runtime, frozen_policy=blocked_policy),
+        automatic=True,
+        command_executor=successful_command,
+    )
+
+    status = blocked.run_once()
+
+    assert status["promotions"] == [
+        {
+            "status": "PROMOTION_BLOCKED",
+            "candidate_hash": artifact.model_hash,
+            "reason": "machine-review-readiness",
+            "readiness_errors": ["POLICY_NOT_MACHINE_REVIEW_V3"],
+        }
+    ]
+    assert (
+        blocked.registry.reconstruct().candidates[artifact.model_hash].state
+        == CandidateState.CONFIRMED
+    )
+    with pytest.raises(SafetyHalt, match="promotion readiness invariant"):
+        blocked.promote(
+            artifact.model_hash,
+            "generation-blocked",
+            **promotion_kwargs(runtime, report_path, report_hash),
+        )
+
+
+def test_promotion_readiness_rejects_mixed_curation_models(tmp_path):
+    runtime = prepare_runtime(tmp_path)
+    manifest_path = runtime.suites / "manifest.json"
+    manifest = load_json(manifest_path)
+    second_source_hash = digest("second-machine-source")
+    manifest["sources"].append(
+        {
+            "name": "second-source.jsonl",
+            "sha256": second_source_hash,
+            "rowCount": 3,
+            "blankLineCount": 0,
+        }
+    )
+    second_curation = {
+        **manifest["curationSources"][0],
+        "source_name": "second-source.jsonl",
+        "output_sha256": second_source_hash,
+        "manifest_sha256": digest("second-machine-manifest"),
+        "models": {
+            **manifest["curationSources"][0]["models"],
+            "champion": {
+                "role": "frozen_champion",
+                "sha256": digest("different-curation-champion"),
+            },
+        },
+    }
+    manifest["curationSources"].append(second_curation)
+    manifest.pop("manifestPayloadSha256")
+    manifest["manifestPayloadSha256"] = canonical_sha256(manifest)
+    atomic_write_json(manifest_path, manifest)
+    runtime = replace(
+        runtime,
+        controller=replace(
+            runtime.controller,
+            suite_manifest_hash=sha256_file(manifest_path),
+        ),
+    )
+
+    errors = PromotionController(
+        runtime, automatic=True
+    )._promotion_readiness_errors()
+
+    assert "SUITE_CURATION_MODELS_MISMATCH" in errors
+
+
 def test_only_one_confirmation_attempt_is_allocated_per_champion(tmp_path):
     runtime = prepare_runtime(tmp_path)
     holder = {}
@@ -2704,13 +3039,15 @@ def test_every_fifth_promotion_enqueues_one_deep_audit(tmp_path):
     )
     assert first == retry
     assert first["reasons"] == ["every-5-promotions"]
-    assert len(
-        list(
-            (
-                runtime.promotion_root / "audits" / "queue"
-            ).glob("*.json")
-        )
-    ) == 2
+    request = load_json(Path(first["request_path"]))
+    assert request["contract"] == "risk-score-deep-audit-request-v2"
+    assert request["visit_tiers"] == [2000, 8000]
+    assert [bank["label"] for bank in request["audit_banks"]] == [
+        "ordinary",
+        "lead-40",
+        "lead-80",
+    ]
+    assert len(list((runtime.promotion_root / "audits" / "queue").glob("*.json"))) == 2
 
 
 def test_trash_grace_reference_protection_and_backpressure_status(tmp_path):
@@ -2839,18 +3176,160 @@ def test_deep_audit_failure_triggers_replay_safe_rollback(tmp_path):
         reasons=["near-safety-boundary"],
     )
     external = tmp_path / "deep-audit-fail.json"
+    request = load_json(Path(scheduled["request_path"]))
+    control_hashes = {
+        **request["control_model_hashes"],
+        "b28": digest("immutable-b28-control"),
+    }
+    artifact_root = (
+        runtime.promotion_root
+        / "audits"
+        / "artifacts"
+        / "generation-audit-rollback"
+    )
+    artifact_root.mkdir(parents=True)
+    cells = []
+    for index, request_cell in enumerate(request["audit_cells"]):
+        expected_cell = {
+            **request_cell,
+            "control_model_hash": control_hashes[
+                request_cell["control"]
+            ],
+        }
+        decision = "FAIL" if index == 0 else "PASS"
+        bank = next(
+            bank
+            for bank in request["audit_banks"]
+            if bank["schedule_hash"] == request_cell["schedule_hash"]
+        )
+        schedule_rows = [
+            json.loads(line)
+            for line in Path(bank["schedule_path"]).read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if line
+        ][: 2 * request_cell["color_pairs"]]
+        result_rows = [
+            deep_audit_result(
+                row,
+                candidate_wins=(decision == "PASS"),
+            )
+            for row in schedule_rows
+        ]
+        move_rows = [
+            move
+            for row, result in zip(schedule_rows, result_rows)
+            for move in deep_audit_moves(row, result)
+        ]
+        runner_output_hashes = {}
+        runner_output_paths = {}
+        for output_name, output_rows in (
+            ("results", result_rows),
+            ("moves", move_rows),
+        ):
+            output_path = (
+                artifact_root
+                / f"{request_cell['cell_id']}.{output_name}.jsonl"
+            )
+            output_path.write_text(
+                "".join(
+                    json.dumps(
+                        row,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                    + "\n"
+                    for row in output_rows
+                ),
+                encoding="utf-8",
+            )
+            runner_output_paths[output_name] = str(
+                output_path.resolve()
+            )
+            runner_output_hashes[output_name] = sha256_file(
+                output_path
+            )
+        paths = {}
+        for artifact_name, contract in (
+            (
+                "runner_manifest",
+                "risk-score-deep-audit-runner-manifest-v1",
+            ),
+            (
+                "statistics_artifact",
+                "risk-score-deep-audit-statistics-v1",
+            ),
+        ):
+            artifact_path = (
+                artifact_root
+                / f"{request_cell['cell_id']}.{artifact_name}.json"
+            )
+            artifact_value = {
+                "schema_version": 1,
+                "contract": contract,
+                "finalized": True,
+                "cell": expected_cell,
+                "decision": decision,
+                "policy_hash": runtime.controller.policy_hash,
+                "audit_request_hash": scheduled["request_hash"],
+            }
+            if artifact_name == "runner_manifest":
+                artifact_value.update(
+                    {
+                        "results_path": runner_output_paths["results"],
+                        "results_sha256": runner_output_hashes["results"],
+                        "moves_path": runner_output_paths["moves"],
+                        "moves_sha256": runner_output_hashes["moves"],
+                    }
+                )
+            if artifact_name == "statistics_artifact":
+                artifact_value.update(
+                    {
+                        "results_sha256": runner_output_hashes["results"],
+                        "moves_sha256": runner_output_hashes["moves"],
+                        "safety_failures": (
+                            1 if decision == "FAIL" else 0
+                        ),
+                        "candidate_win_rate": (
+                            1.0 if decision == "PASS" else 0.0
+                        ),
+                        "minimum_candidate_win_rate": 0.47,
+                    }
+                )
+            artifact_value["manifest_sha256"] = canonical_sha256(
+                artifact_value
+            )
+            atomic_write_json(artifact_path, artifact_value)
+            paths[f"{artifact_name}_path"] = str(
+                artifact_path.resolve()
+            )
+            paths[f"{artifact_name}_sha256"] = sha256_file(
+                artifact_path
+            )
+        cells.append(
+            {
+                **expected_cell,
+                "decision": decision,
+                **paths,
+            }
+        )
+    report = {
+        "schema_version": 2,
+        "contract": "risk-score-deep-audit-report-v2",
+        "finalized": True,
+        "decision": "FAIL",
+        "rollback_required": True,
+        "generation_id": "generation-audit-rollback",
+        "candidate_hash": artifact.model_hash,
+        "policy_hash": runtime.controller.policy_hash,
+        "audit_request_hash": scheduled["request_hash"],
+        "control_model_hashes": control_hashes,
+        "cells": cells,
+    }
+    report["manifest_sha256"] = canonical_sha256(report)
     atomic_write_json(
         external,
-        {
-            "schema_version": 1,
-            "finalized": True,
-            "decision": "FAIL",
-            "rollback_required": True,
-            "generation_id": "generation-audit-rollback",
-            "candidate_hash": artifact.model_hash,
-            "policy_hash": runtime.controller.policy_hash,
-            "audit_request_hash": scheduled["request_hash"],
-        },
+        report,
     )
     controller.record_deep_audit_report(
         "generation-audit-rollback",

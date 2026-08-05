@@ -9,6 +9,7 @@ import os
 import shutil
 import sys
 import tempfile
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
@@ -16,6 +17,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, 
 from risk_score.generate_schedule import (
     GENERATOR_CONTRACT as SCHEDULE_GENERATOR_CONTRACT,
 )
+from risk_score.board_symmetry import symmetry_orbit_sha256
 from risk_score.generate_schedule import (
     build_schedule,
     validate_position,
@@ -29,9 +31,19 @@ SCHEMA_VERSION = 2
 GENERATOR_CONTRACT = "risk-score-content-addressed-evaluation-suites-v2"
 LEGACY_GENERATOR_CONTRACT = "risk-score-content-addressed-evaluation-suites-v1"
 MANIFEST_CONTRACT = "risk-score-authoritative-evaluation-manifest-v2"
+MACHINE_SCHEMA_VERSION = 3
+MACHINE_GENERATOR_CONTRACT = "risk-score-content-addressed-evaluation-suites-v3"
+MACHINE_MANIFEST_CONTRACT = "risk-score-authoritative-evaluation-manifest-v3"
+MACHINE_REVIEW_MANIFEST_CONTRACT = "risk-score-reviewed-position-bank-v2"
+MACHINE_REVIEW_MODE = "machine-consensus"
 _V1_POLICY_PATH = Path(__file__).with_name("promotion_policy_v1.json")
 _V2_POLICY_PATH = Path(__file__).with_name("promotion_policy_v2.json")
-DEFAULT_POLICY_PATH = _V2_POLICY_PATH if _V2_POLICY_PATH.exists() else _V1_POLICY_PATH
+_V3_POLICY_PATH = Path(__file__).with_name("promotion_policy_v3.json")
+DEFAULT_POLICY_PATH = (
+    _V3_POLICY_PATH
+    if _V3_POLICY_PATH.exists()
+    else (_V2_POLICY_PATH if _V2_POLICY_PATH.exists() else _V1_POLICY_PATH)
+)
 ORDINARY_LABEL = "ordinary"
 ORDINARY_BANKS = ("discovery", "confirmation", "audit")
 POLICY_HOLDOUTS = ORDINARY_BANKS
@@ -48,6 +60,7 @@ SPECIALIZED_LABELS = (
     "adversarial",
 )
 ALL_LABELS = frozenset((ORDINARY_LABEL,) + SPECIALIZED_LABELS)
+MACHINE_REVIEW_LABELS = frozenset((ORDINARY_LABEL,) + RISK_LABELS)
 STAGE_3_CELL_ORDER = (
     "powered_candidate_vs_champion",
     "powered_candidate_vs_original",
@@ -134,6 +147,7 @@ class _LabeledPosition:
     labels: Tuple[str, ...]
     content_sha256: str
     semantic_sha256: str
+    curation: Optional[Mapping[str, Any]]
     source_name: str
     source_line: int
 
@@ -145,6 +159,7 @@ class _PolicySuitePlan:
     policy_version: str
     source_revision: str
     exact_quota_contract: bool
+    machine_review_contract: bool
     holdout_quotas: Mapping[str, Mapping[str, int]]
     stage_3_looks: Tuple[Mapping[str, Any], ...]
 
@@ -354,11 +369,35 @@ def _load_policy_binding(path: Path) -> _PolicySuitePlan:
     ):
         raise ValueError("Stage-3 look numbers must be contiguous starting at one")
 
-    if "v2" in policy_version.lower() and not exact_quota_contract:
+    machine_review_contract = policy_version == "risk-seeking-checkpoint-promotion-v3"
+    if (
+        "v2" in policy_version.lower() or machine_review_contract
+    ) and not exact_quota_contract:
         raise ValueError(
-            "v2 promotion policy must declare "
+            "v2/v3 promotion policy must declare "
             "minimum_independent_position_clusters per Stage-3 cell"
         )
+    if machine_review_contract:
+        machine_curation = policy.get("machine_curation_contract")
+        if not isinstance(machine_curation, dict):
+            raise ValueError("v3 promotion policy has no machine_curation_contract")
+        expected_machine_curation = {
+            "final_contract": MACHINE_REVIEW_MANIFEST_CONTRACT,
+            "review_mode": MACHINE_REVIEW_MODE,
+            "consensus_rules_version": 1,
+            "stability_margin": 5.0,
+            "allowed_labels": sorted(MACHINE_REVIEW_LABELS),
+            "automatic_promotion_requires_transitive_suite_provenance": True,
+        }
+        for key, expected in expected_machine_curation.items():
+            actual = machine_curation.get(key)
+            if key == "allowed_labels" and isinstance(actual, list):
+                actual = sorted(actual)
+            if actual != expected:
+                raise ValueError(
+                    "v3 machine_curation_contract "
+                    f"{key} does not match the frozen contract"
+                )
 
     stage_1 = evaluation_stages.get("stage_1_cheap_paired_screen", {})
     stage_2 = evaluation_stages.get("stage_2_finalist_selection", {})
@@ -425,6 +464,7 @@ def _load_policy_binding(path: Path) -> _PolicySuitePlan:
         policy_version=policy_version,
         source_revision=source_revision,
         exact_quota_contract=exact_quota_contract,
+        machine_review_contract=machine_review_contract,
         holdout_quotas=holdout_quotas,
         stage_3_looks=tuple(parsed_looks),
     )
@@ -562,6 +602,11 @@ def _load_labeled_positions(
                         labels=labels,
                         content_sha256=content_hash,
                         semantic_sha256=semantic_hash,
+                        curation=(
+                            dict(row["curation"])
+                            if isinstance(row.get("curation"), Mapping)
+                            else None
+                        ),
                         source_name=source_name,
                         source_line=line_number,
                     )
@@ -589,6 +634,233 @@ def _validate_sha256(value: str, source: str) -> str:
     ):
         raise ValueError(f"{source} must be a 64-character SHA-256")
     return value.lower()
+
+
+def _load_machine_curation_sources(
+    source_paths: Sequence[Path],
+    source_inventory: Sequence[Mapping[str, Any]],
+    positions: Sequence[_LabeledPosition],
+    manifest_paths: Sequence[Path],
+    *,
+    policy_plan: _PolicySuitePlan,
+) -> List[Dict[str, Any]]:
+    if len(manifest_paths) != len(source_paths):
+        raise ValueError(
+            "v3 suite builds require exactly one curation manifest per source"
+        )
+    inventory_by_name = {source["name"]: source for source in source_inventory}
+    positions_by_source = {
+        name: [position for position in positions if position.source_name == name]
+        for name in inventory_by_name
+    }
+    expected_labels = sorted(MACHINE_REVIEW_LABELS)
+    summaries = []
+    seen_outputs = set()
+    common_models = None
+    for raw_path in manifest_paths:
+        path = Path(raw_path)
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"curation manifest is not a regular file: {path}")
+        try:
+            data = path.read_bytes()
+            manifest = json.loads(data.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"cannot load curation manifest {path}: {exc}") from exc
+        if not isinstance(manifest, dict):
+            raise ValueError(f"curation manifest root must be an object: {path}")
+        if data != (canonical_json(manifest) + "\n").encode("utf-8"):
+            raise ValueError(f"curation manifest is not canonical JSON: {path}")
+        payload = dict(manifest)
+        identity = payload.pop("manifest_sha256", None)
+        if identity != canonical_sha256(payload):
+            raise ValueError(f"curation manifest self-hash is invalid: {path}")
+        allowed_labels = manifest.get("allowed_labels")
+        if (
+            manifest.get("schema_version") != 2
+            or manifest.get("contract") != MACHINE_REVIEW_MANIFEST_CONTRACT
+            or manifest.get("review_mode") != MACHINE_REVIEW_MODE
+            or manifest.get("consensus_rules_version") != 1
+            or manifest.get("policy_hash") != policy_plan.policy_hash
+            or not isinstance(allowed_labels, list)
+            or sorted(allowed_labels) != expected_labels
+            or len(allowed_labels) != len(expected_labels)
+        ):
+            raise ValueError(
+                f"curation manifest does not satisfy the v3 machine contract: {path}"
+            )
+        raw_output = manifest.get("output_path")
+        if not isinstance(raw_output, str) or not raw_output:
+            raise ValueError(f"curation manifest has no output path: {path}")
+        output = Path(raw_output)
+        if (
+            not output.is_absolute()
+            or str(output.resolve()) != raw_output
+            or output.is_symlink()
+            or not output.is_file()
+        ):
+            raise ValueError(f"curation manifest output path is unsafe: {path}")
+        resolved_output = output.resolve()
+        if resolved_output in seen_outputs:
+            raise ValueError("a machine-reviewed source was bound more than once")
+        seen_outputs.add(resolved_output)
+        if resolved_output not in {Path(source).resolve() for source in source_paths}:
+            raise ValueError("curation manifest names an undeclared suite source")
+        output_hash = _validate_sha256(
+            manifest.get("output_sha256"), "curation output hash"
+        )
+        inventory = inventory_by_name.get(output.name)
+        if inventory is None or inventory.get("sha256") != output_hash:
+            raise ValueError("curation output hash is not bound to the suite source")
+        if manifest.get("row_count") != inventory.get("rowCount"):
+            raise ValueError("curation output row count changed")
+        source_positions = positions_by_source[output.name]
+        label_counts = Counter(
+            label for item in source_positions for label in item.labels
+        )
+        semantic_hashes = [item.semantic_sha256 for item in source_positions]
+        orbit_hashes = [
+            item.curation["symmetryOrbitSha256"] for item in source_positions
+        ]
+        if (
+            manifest.get("label_counts") != dict(sorted(label_counts.items()))
+            or manifest.get("semantic_hashes_sha256")
+            != canonical_sha256(semantic_hashes)
+            or manifest.get("symmetry_orbits_sha256")
+            != canonical_sha256(orbit_hashes)
+        ):
+            raise ValueError("curation manifest row inventory changed")
+        labeling_manifest_path = manifest.get("labeling_manifest_path")
+        labeling_manifest_hash = manifest.get("labeling_manifest_sha256")
+        labeling_manifest_identity = manifest.get("labeling_manifest_identity")
+        if not isinstance(labeling_manifest_path, str) or not labeling_manifest_path:
+            raise ValueError("curation labeling manifest path is missing")
+        labeling_path = Path(labeling_manifest_path)
+        if (
+            not labeling_path.is_absolute()
+            or str(labeling_path.resolve()) != labeling_manifest_path
+            or labeling_path.is_symlink()
+            or not labeling_path.is_file()
+        ):
+            raise ValueError("curation labeling manifest path is unsafe")
+        if (
+            file_sha256(labeling_path)
+            != _validate_sha256(
+                labeling_manifest_hash,
+                "curation labeling manifest hash",
+            )
+        ):
+            raise ValueError("curation labeling manifest changed")
+        try:
+            labeling_manifest = json.loads(
+                labeling_path.read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("curation labeling manifest is invalid") from exc
+        if not isinstance(labeling_manifest, dict):
+            raise ValueError("curation labeling manifest root is invalid")
+        labeling_payload = dict(labeling_manifest)
+        supplied_identity = labeling_payload.pop("manifest_sha256", None)
+        if (
+            labeling_manifest.get("contract")
+            not in {
+                "risk-score-position-bank-labeling-v2",
+                "risk-score-position-bank-combined-labeling-v2",
+            }
+            or supplied_identity != canonical_sha256(labeling_payload)
+            or supplied_identity != labeling_manifest_identity
+        ):
+            raise ValueError("curation labeling ancestry is invalid")
+        from risk_score.curate_position_bank import (
+            finalize_consensus_reviewed_bank,
+        )
+
+        machine_path = labeling_path.parent / "machine-labeled.jsonl"
+        rejected_path = labeling_path.parent / "rejected.jsonl"
+        with tempfile.TemporaryDirectory(
+            prefix="risk-score-suite-curation-verify-"
+        ) as temporary:
+            temporary_root = Path(temporary)
+            regenerated_output = temporary_root / "source-positions.jsonl"
+            regenerated_manifest_path = temporary_root / "manifest.json"
+            regenerated = finalize_consensus_reviewed_bank(
+                machine_labeled_path=machine_path,
+                rejected_path=rejected_path,
+                labeling_manifest_path=labeling_path,
+                policy_path=Path(manifest["policy_path"]),
+                output_path=regenerated_output,
+                manifest_path=regenerated_manifest_path,
+            )
+            if regenerated_output.read_bytes() != output.read_bytes():
+                raise ValueError(
+                    "curation source does not match transitive labeling evidence"
+                )
+            expected_manifest = dict(regenerated)
+            expected_manifest["output_path"] = str(output.resolve())
+            expected_manifest.pop("manifest_sha256", None)
+            expected_manifest["manifest_sha256"] = canonical_sha256(
+                expected_manifest
+            )
+            if manifest != expected_manifest:
+                raise ValueError(
+                    "curation final manifest is not reproducible"
+                )
+        rejected_count = manifest.get("rejected_count")
+        rejected_hash = manifest.get("rejected_sha256")
+        if (
+            type(rejected_count) is not int
+            or rejected_count < 0
+            or _validate_sha256(rejected_hash, "curation rejected artifact hash")
+            != rejected_hash
+        ):
+            raise ValueError("curation rejection provenance is invalid")
+        models = manifest.get("models")
+        if not isinstance(models, dict) or set(models) != {"original", "champion"}:
+            raise ValueError("curation manifest model inventory is invalid")
+        model_summary = {}
+        expected_model_roles = {
+            "original": "immutable_original",
+            "champion": "frozen_champion",
+        }
+        for role in ("original", "champion"):
+            model = models[role]
+            if (
+                not isinstance(model, dict)
+                or model.get("role") != expected_model_roles[role]
+            ):
+                raise ValueError(f"curation {role} model binding is invalid")
+            model_summary[role] = {
+                "role": expected_model_roles[role],
+                "sha256": _validate_sha256(
+                    model.get("sha256"), f"curation {role} model hash"
+                ),
+            }
+        if model_summary["original"]["sha256"] == model_summary["champion"]["sha256"]:
+            raise ValueError("curation models must have distinct content hashes")
+        if common_models is None:
+            common_models = model_summary
+        elif model_summary != common_models:
+            raise ValueError(
+                "v3 suite sources use different frozen curation models"
+            )
+        summaries.append(
+            {
+                "source_name": output.name,
+                "contract": MACHINE_REVIEW_MANIFEST_CONTRACT,
+                "review_mode": MACHINE_REVIEW_MODE,
+                "consensus_rules_version": 1,
+                "policy_hash": policy_plan.policy_hash,
+                "allowed_labels": expected_labels,
+                "output_sha256": output_hash,
+                "manifest_sha256": file_sha256(path),
+                "manifest_identity": identity,
+                "rejected_count": rejected_count,
+                "rejected_sha256": rejected_hash,
+                "models": model_summary,
+            }
+        )
+    if seen_outputs != {Path(source).resolve() for source in source_paths}:
+        raise ValueError("not every suite source has a machine-review manifest")
+    return sorted(summaries, key=lambda item: item["source_name"])
 
 
 def _ordinary_counts(total: int, weights: Mapping[str, float]) -> Dict[str, int]:
@@ -862,6 +1134,7 @@ def build_evaluation_suites(
     bot_b_index: int = 1,
     exclude_content_hashes: Sequence[str] = (),
     policy_path: Path = DEFAULT_POLICY_PATH,
+    curation_manifest_paths: Sequence[Path] = (),
 ) -> SuiteBuildResult:
     """Build and atomically publish deterministic position banks and schedules."""
 
@@ -877,6 +1150,86 @@ def build_evaluation_suites(
             "Stage-3 color pair is an independent gameplay-semantic cluster"
         )
     positions, source_manifest = _load_labeled_positions(sources)
+    curation_sources: List[Dict[str, Any]] = []
+    if policy_plan.machine_review_contract:
+        invalid_labels = sorted(
+            {
+                label
+                for position in positions
+                for label in position.labels
+                if label not in MACHINE_REVIEW_LABELS
+            }
+        )
+        if invalid_labels:
+            raise ValueError(
+                "v3 machine-reviewed sources contain forbidden labels: "
+                + ", ".join(invalid_labels)
+            )
+        seen_orbits: Dict[str, str] = {}
+        for item in positions:
+            curation = item.curation
+            source = f"{item.source_name}:{item.source_line}"
+            if (
+                not isinstance(curation, Mapping)
+                or curation.get("classification") != "machine-reviewed"
+                or curation.get("review_mode") != MACHINE_REVIEW_MODE
+                or curation.get("consensus_rules_version") != 1
+                or curation.get("semanticSha256") != item.semantic_sha256
+                or len(item.labels) != 1
+            ):
+                raise ValueError(
+                    f"{source}: v3 source row is not machine-reviewed"
+                )
+            orbit_hash = _validate_sha256(
+                curation.get("symmetryOrbitSha256"),
+                f"{source} symmetry orbit hash",
+            )
+            if orbit_hash != symmetry_orbit_sha256(item.position):
+                raise ValueError(
+                    f"{source}: declared symmetry orbit is invalid"
+                )
+            previous = seen_orbits.get(orbit_hash)
+            if previous is not None:
+                raise ValueError(
+                    f"{source}: duplicate symmetry orbit; first seen at {previous}"
+                )
+            seen_orbits[orbit_hash] = source
+        curation_sources = _load_machine_curation_sources(
+            sources,
+            source_manifest,
+            positions,
+            curation_manifest_paths,
+            policy_plan=policy_plan,
+        )
+    elif curation_manifest_paths:
+        raise ValueError("curation manifests are supported only by v3 suite builds")
+    schema_version = (
+        MACHINE_SCHEMA_VERSION
+        if policy_plan.machine_review_contract
+        else (SCHEMA_VERSION if policy_plan.exact_quota_contract else 1)
+    )
+    generator_contract = (
+        MACHINE_GENERATOR_CONTRACT
+        if policy_plan.machine_review_contract
+        else (
+            GENERATOR_CONTRACT
+            if policy_plan.exact_quota_contract
+            else LEGACY_GENERATOR_CONTRACT
+        )
+    )
+    manifest_contract = (
+        MACHINE_MANIFEST_CONTRACT
+        if policy_plan.machine_review_contract
+        else MANIFEST_CONTRACT
+    )
+    accepted_labels = sorted(
+        MACHINE_REVIEW_LABELS if policy_plan.machine_review_contract else ALL_LABELS
+    )
+    schedule_seed_prefix = (
+        "risk-score-suite-v3-"
+        if policy_plan.machine_review_contract
+        else "risk-score-suite-v2-"
+    )
     exclusions = {
         _validate_sha256(value, "excluded content hash")
         for value in exclude_content_hashes
@@ -976,9 +1329,9 @@ def build_evaluation_suites(
             position_bank_sha = hashlib.sha256(position_data).hexdigest()
             _write_fsynced(temporary / position_relative, position_data)
 
-            schedule_seed = "risk-score-suite-v2-" + canonical_sha256(
+            schedule_seed = schedule_seed_prefix + canonical_sha256(
                 {
-                    "generatorContract": GENERATOR_CONTRACT,
+                    "generatorContract": generator_contract,
                     "purpose": "schedule-seed",
                     "masterSeed": seed,
                     "bank": qualified_bank_name,
@@ -1322,15 +1675,9 @@ def build_evaluation_suites(
         ]
 
         manifest_payload: Dict[str, Any] = {
-            "schemaVersion": (
-                SCHEMA_VERSION if policy_plan.exact_quota_contract else 1
-            ),
-            "manifestContract": MANIFEST_CONTRACT,
-            "generatorContract": (
-                GENERATOR_CONTRACT
-                if policy_plan.exact_quota_contract
-                else LEGACY_GENERATOR_CONTRACT
-            ),
+            "schemaVersion": schema_version,
+            "manifestContract": manifest_contract,
+            "generatorContract": generator_contract,
             "scheduleGeneratorContract": SCHEDULE_GENERATOR_CONTRACT,
             "canonicalJsonContract": "utf-8-sort-keys-compact-json-lines-v1",
             "ordinaryAssignmentContract": (
@@ -1359,7 +1706,7 @@ def build_evaluation_suites(
             "pairsPerPosition": pairs_per_position,
             "botAIndex": bot_a_index,
             "botBIndex": bot_b_index,
-            "acceptedLabels": sorted(ALL_LABELS),
+            "acceptedLabels": accepted_labels,
             "sources": source_manifest,
             "inputRowCount": len(positions),
             "includedRowCount": len(included_rows),
@@ -1397,6 +1744,13 @@ def build_evaluation_suites(
                 else None
             ),
         }
+        if policy_plan.machine_review_contract:
+            manifest_payload.update(
+                {
+                    "machineReviewOnly": True,
+                    "curationSources": curation_sources,
+                }
+            )
         manifest_payload_sha = canonical_sha256(manifest_payload)
         manifest = dict(manifest_payload)
         manifest["manifestPayloadSha256"] = manifest_payload_sha
@@ -1465,6 +1819,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=DEFAULT_POLICY_PATH,
         help="Frozen promotion policy to bind into the suite manifest",
     )
+    parser.add_argument(
+        "--curation-manifest",
+        action="append",
+        default=[],
+        type=Path,
+        help="Machine-review final manifest (one per source; v3 only)",
+    )
     return parser.parse_args(argv)
 
 
@@ -1485,6 +1846,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             bot_b_index=args.bot_b_index,
             exclude_content_hashes=args.exclude_content_hash,
             policy_path=args.policy,
+            curation_manifest_paths=args.curation_manifest,
         )
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)

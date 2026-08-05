@@ -39,6 +39,8 @@ V1_POLICY_VERSION = "risk-seeking-checkpoint-promotion-v1"
 V1_POLICY_HASH = "d3578dfdf99e4aace0461310b7225c1d42051fc4e87770e22d89b8545645d324"
 V2_POLICY_VERSION = "risk-seeking-checkpoint-promotion-v2"
 V2_POLICY_HASH = "8562bcd7b835ae0cfcfe517a290748258da229b3fcf588dc99b3703c2b8f6023"
+V3_POLICY_VERSION = "risk-seeking-checkpoint-promotion-v3"
+V3_POLICY_HASH = "0151ddcdee764b1e599eb5313f9dfae944e671ff8098dd471425f8d646ba3318"
 PINNED_POLICY_REGISTRY = {
     V1_POLICY_VERSION: {
         "schema_version": 1,
@@ -48,10 +50,14 @@ PINNED_POLICY_REGISTRY = {
         "schema_version": 2,
         "policy_hash": V2_POLICY_HASH,
     },
+    V3_POLICY_VERSION: {
+        "schema_version": 3,
+        "policy_hash": V3_POLICY_HASH,
+    },
 }
 POLICY_REGISTRY = PINNED_POLICY_REGISTRY
-EXPECTED_POLICY_VERSION = V2_POLICY_VERSION
-EXPECTED_POLICY_HASH = V2_POLICY_HASH
+EXPECTED_POLICY_VERSION = V3_POLICY_VERSION
+EXPECTED_POLICY_HASH = V3_POLICY_HASH
 PASS = "PASS"
 FAIL = "FAIL"
 INCONCLUSIVE = "INCONCLUSIVE"
@@ -157,10 +163,30 @@ def _policy_errors(policy: Any) -> List[str]:
             ("confidence", "sequential_testing", "data_dependent_thresholds_allowed"),
             False,
         ),
-        (("evaluation_stages", "stage_0_integrity_and_fixed_probes", "fixed_analysis_positions"), 256),
-        (("evaluation_stages", "stage_0_integrity_and_fixed_probes", "fixed_analysis_visits"), 200),
-        (("evaluation_stages", "stage_0_integrity_and_fixed_probes", "exploitability_sentinel_visits"), 2000),
-        (("evaluation_stages", "stage_1_cheap_paired_screen", "ordinary_color_pairs"), 32),
+        (
+            (
+                "evaluation_stages",
+                "stage_0_integrity_and_fixed_probes",
+                "fixed_analysis_positions",
+            ),
+            256,
+        ),
+        (
+            (
+                "evaluation_stages",
+                "stage_0_integrity_and_fixed_probes",
+                "fixed_analysis_visits",
+            ),
+            200,
+        ),
+        (
+            (
+                "evaluation_stages",
+                "stage_1_cheap_paired_screen",
+                "ordinary_color_pairs",
+            ),
+            32,
+        ),
         (("evaluation_stages", "stage_1_cheap_paired_screen", "visits"), 400),
         (("evaluation_stages", "stage_2_finalist_selection", "ordinary_color_pairs"), 128),
         (("evaluation_stages", "stage_2_finalist_selection", "ordinary_visits"), 800),
@@ -168,10 +194,14 @@ def _policy_errors(policy: Any) -> List[str]:
         (("evaluation_stages", "stage_2_finalist_selection", "lead_80_color_pairs"), 32),
         (("evaluation_stages", "stage_2_finalist_selection", "lead_visits"), 800),
         (("evaluation_stages", "stage_2_finalist_selection", "maximum_survivors"), 4),
-        (("evaluation_stages", "stage_3_promotion_confirmation", "powered_visits"), 2000),
-        (("evaluation_stages", "stage_3_promotion_confirmation", "standard_visits"), 800),
-        (("evaluation_stages", "deep_audit", "ordinary_color_pairs"), 1024),
-        (("evaluation_stages", "deep_audit", "exploitability_positions"), 128),
+        (
+            ("evaluation_stages", "stage_3_promotion_confirmation", "powered_visits"),
+            2000,
+        ),
+        (
+            ("evaluation_stages", "stage_3_promotion_confirmation", "standard_visits"),
+            800,
+        ),
         (("evaluation_stages", "deep_audit", "promotion_interval"), 5),
         (("promotion_thresholds", "powered_utility_vs_champion_lower_bound_strictly_above"), 0.0),
         (("promotion_thresholds", "powered_utility_vs_original_lower_bound_strictly_above"), 0.0),
@@ -182,8 +212,6 @@ def _policy_errors(policy: Any) -> List[str]:
         (("promotion_thresholds", "true_no_result_rate_strictly_below"), 0.001),
         (("rollout", "worker_count"), 7),
         (("rollout", "canary_workers"), 1),
-        (("rollout", "canary_games"), 2000),
-        (("rollout", "canary_fresh_audit_color_pairs"), 1024),
         (("rollout", "intermediate_workers"), 3),
         (("rollout", "full_workers"), 7),
         (("rollout", "switch_networks_mid_game"), False),
@@ -209,6 +237,60 @@ def _policy_errors(policy: Any) -> List[str]:
         (("attempt_budget", "maximum_promotions_per_generation"), 1),
     )
     for parts, expected in exact_values:
+        actual = _path(policy, *parts)
+        if actual is _MISSING:
+            errors.append("POLICY_MISSING_" + "_".join(parts).upper())
+        elif actual != expected:
+            errors.append("POLICY_CHANGED_" + "_".join(parts).upper())
+
+    version_exact_values = (
+        (
+            (
+                "evaluation_stages",
+                "stage_0_integrity_and_fixed_probes",
+                "exploitability_sentinel_visits",
+            ),
+            2000,
+        ),
+        (("evaluation_stages", "deep_audit", "ordinary_color_pairs"), 1024),
+        (("evaluation_stages", "deep_audit", "exploitability_positions"), 128),
+        (("rollout", "canary_games"), 2000),
+        (("rollout", "canary_fresh_audit_color_pairs"), 1024),
+    )
+    if policy_version == V3_POLICY_VERSION:
+        version_exact_values = (
+            (("evaluation_stages", "deep_audit", "ordinary_color_pairs"), 2048),
+            (("evaluation_stages", "deep_audit", "lead_40_color_pairs"), 1024),
+            (("evaluation_stages", "deep_audit", "lead_80_color_pairs"), 2048),
+            (("evaluation_stages", "deep_audit", "visits"), [2000, 8000]),
+            (
+                ("evaluation_stages", "deep_audit", "controls"),
+                ["candidate", "champion", "original", "b28"],
+            ),
+            (("rollout", "canary_games"), 4000),
+            (("rollout", "canary_fresh_audit_color_pairs"), 2048),
+        )
+        if (
+            _path(
+                policy,
+                "evaluation_stages",
+                "stage_0_integrity_and_fixed_probes",
+                "exploitability_sentinel_visits",
+            )
+            is not _MISSING
+        ):
+            errors.append("POLICY_V3_FORBIDS_EXPLOITABILITY_SENTINELS")
+        if (
+            _path(
+                policy,
+                "evaluation_stages",
+                "deep_audit",
+                "exploitability_positions",
+            )
+            is not _MISSING
+        ):
+            errors.append("POLICY_V3_FORBIDS_EXPLOITABILITY_AUDIT_BANK")
+    for parts, expected in version_exact_values:
         actual = _path(policy, *parts)
         if actual is _MISSING:
             errors.append("POLICY_MISSING_" + "_".join(parts).upper())
@@ -244,6 +326,10 @@ def _policy_errors(policy: Any) -> List[str]:
             (2, 512, 128, 128, 128),
         ),
         V2_POLICY_VERSION: (
+            (1, 512, 128, 512, 1024),
+            (2, 1024, 128, 1024, 2048),
+        ),
+        V3_POLICY_VERSION: (
             (1, 512, 128, 512, 1024),
             (2, 1024, 128, 1024, 2048),
         ),
@@ -294,12 +380,36 @@ def _policy_errors(policy: Any) -> List[str]:
     if not isinstance(matrix, dict) or set(matrix) != required_cells:
         errors.append("POLICY_INVALID_REQUIRED_CONFIRMATION_MATRIX")
 
-    if policy_version == V2_POLICY_VERSION:
-        if policy.get("supersedes") != {
-            "policy_version": V1_POLICY_VERSION,
-            "policy_hash": V1_POLICY_HASH,
-        }:
+    if policy_version in {V2_POLICY_VERSION, V3_POLICY_VERSION}:
+        expected_supersedes = (
+            {
+                "policy_version": V1_POLICY_VERSION,
+                "policy_hash": V1_POLICY_HASH,
+            }
+            if policy_version == V2_POLICY_VERSION
+            else {
+                "policy_version": V2_POLICY_VERSION,
+                "policy_hash": V2_POLICY_HASH,
+            }
+        )
+        if policy.get("supersedes") != expected_supersedes:
             errors.append("POLICY_INVALID_SUPERSEDES_BINDING")
+
+        if policy_version == V3_POLICY_VERSION:
+            expected_machine_curation = {
+                "final_contract": "risk-score-reviewed-position-bank-v2",
+                "review_mode": "machine-consensus",
+                "consensus_rules_version": 1,
+                "stability_margin": 5.0,
+                "allowed_labels": ["ordinary", "lead-40", "lead-80"],
+                "model_roles": ["immutable_original", "frozen_champion"],
+                "search_modes": ["standard", "powered"],
+                "visits": [2000, 8000],
+                "symmetry_semantics": "katago-shape-preserving-d4-v1",
+                "automatic_promotion_requires_transitive_suite_provenance": True,
+            }
+            if policy.get("machine_curation_contract") != expected_machine_curation:
+                errors.append("POLICY_INVALID_MACHINE_CURATION_CONTRACT")
 
         stage_3 = _path(
             policy,
@@ -850,7 +960,8 @@ def evaluate_promotion_gate(
         )
 
     matrix = evidence.get("confirmation_matrix", _MISSING)
-    v2_policy = active_policy.get("schema_version") == 2
+    v2_policy = active_policy.get("schema_version") in {2, 3}
+    machine_review_v3 = active_policy.get("policy_version") == V3_POLICY_VERSION
     stage_3 = active_policy["evaluation_stages"]["stage_3_promotion_confirmation"]
     cell_specs = active_policy["required_confirmation_matrix"]
     provenance = evidence.get("provenance", _MISSING)
@@ -884,17 +995,58 @@ def evaluate_promotion_gate(
     )
     raw_suite_cells = _path(suite_manifest, "cells")
     authoritative_suite_manifest = isinstance(raw_suite_cells, list)
+    if machine_review_v3 and not authoritative_suite_manifest:
+        add(
+            "PROVENANCE_SUITE_MANIFEST_V3_REQUIRED",
+            FAIL,
+            actual=type(raw_suite_cells).__name__,
+            expected="authoritative v3 cell list",
+        )
     if authoritative_suite_manifest:
         require_equal(
             "PROVENANCE_SUITE_MANIFEST_SCHEMA",
             _path(suite_manifest, "schemaVersion"),
-            2,
+            3 if machine_review_v3 else 2,
         )
         require_equal(
             "PROVENANCE_SUITE_MANIFEST_CONTRACT",
             _path(suite_manifest, "manifestContract"),
-            "risk-score-authoritative-evaluation-manifest-v2",
+            (
+                "risk-score-authoritative-evaluation-manifest-v3"
+                if machine_review_v3
+                else "risk-score-authoritative-evaluation-manifest-v2"
+            ),
         )
+        if machine_review_v3:
+            require_equal(
+                "PROVENANCE_SUITE_MACHINE_REVIEW_ONLY",
+                _path(suite_manifest, "machineReviewOnly"),
+                True,
+            )
+            require_equal(
+                "PROVENANCE_SUITE_ACCEPTED_LABELS",
+                _path(suite_manifest, "acceptedLabels"),
+                ["lead-40", "lead-80", "ordinary"],
+            )
+            curation_sources = _path(suite_manifest, "curationSources")
+            if not isinstance(curation_sources, list) or not curation_sources:
+                add("PROVENANCE_SUITE_CURATION_SOURCES", FAIL)
+            elif any(
+                not isinstance(source, dict)
+                or source.get("contract") != "risk-score-reviewed-position-bank-v2"
+                or source.get("review_mode") != "machine-consensus"
+                or source.get("consensus_rules_version") != 1
+                or source.get("policy_hash") != computed_policy_hash
+                or source.get("allowed_labels") != ["lead-40", "lead-80", "ordinary"]
+                or not _is_sha256(source.get("output_sha256"))
+                or not _is_sha256(source.get("manifest_sha256"))
+                or not _is_nonnegative_integer(source.get("rejected_count"))
+                or not _is_sha256(source.get("rejected_sha256"))
+                for source in curation_sources
+            ):
+                add("PROVENANCE_SUITE_CURATION_SOURCES", FAIL)
+            else:
+                add("PROVENANCE_SUITE_CURATION_SOURCES", PASS)
 
     def selected_suite_manifest_cell(cell_name: str) -> Any:
         if isinstance(raw_suite_cells, dict):
@@ -2408,12 +2560,17 @@ def evaluate_promotion_gate(
         _path(exploitability, "stage_0_passed"),
         True,
     )
-    for field in (
-        "fixed_analysis_positions",
-        "fixed_analysis_visits",
-        "exploitability_sentinel_positions",
-        "exploitability_sentinel_visits",
-    ):
+    stage_0_bound_fields = (
+        ("fixed_analysis_positions", "fixed_analysis_visits")
+        if machine_review_v3
+        else (
+            "fixed_analysis_positions",
+            "fixed_analysis_visits",
+            "exploitability_sentinel_positions",
+            "exploitability_sentinel_visits",
+        )
+    )
+    for field in stage_0_bound_fields:
         require_equal(
             "STAGE_0_" + field.upper(),
             _path(exploitability, field),
@@ -2513,7 +2670,7 @@ def evaluate_promotion_gate(
                 cell_config,
                 provenance_config,
             )
-    for suite_name in ("tactical", "exploitability"):
+    for suite_name in (() if machine_review_v3 else ("tactical", "exploitability")):
         require_sha(
             "PROVENANCE_SUITE_" + suite_name.upper(),
             _path(provenance, "suite_hashes", suite_name),

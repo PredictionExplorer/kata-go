@@ -764,7 +764,7 @@ def build_nonconfirmation_controller_evidence(
     policy = load_policy(Path(policy_path))
     expected_runner_contract = (
         RUNNER_CONTRACT
-        if policy.get("schema_version") == 2
+        if policy.get("schema_version") in {2, 3}
         else RUNNER_CONTRACT_V2
     )
     if canonical_sha256(policy) != plan["policyHash"]:
@@ -1511,7 +1511,7 @@ def build_promotion_evidence(
         )
     policy = load_policy(Path(policy_path))
     policy_hash = canonical_sha256(policy)
-    v2_policy = policy.get("schema_version") == 2
+    v2_policy = policy.get("schema_version") in {2, 3}
     expected_runner_contract = RUNNER_CONTRACT if v2_policy else RUNNER_CONTRACT_V2
     suite_manifest_path = Path(suite_manifest_path)
     suite_manifest = load_suite_manifest(suite_manifest_path)
@@ -1736,7 +1736,13 @@ def build_promotion_evidence(
         for bank in suite_manifest.get("banks", [])
         if isinstance(bank, dict) and isinstance(bank.get("name"), str)
     }
-    for required_bank in ("tactical", "exploitability"):
+    machine_review_v3 = (
+        policy.get("policy_version") == "risk-seeking-checkpoint-promotion-v3"
+    )
+    required_specialized_banks = (
+        () if machine_review_v3 else ("tactical", "exploitability")
+    )
+    for required_bank in required_specialized_banks:
         if required_bank not in banks or not isinstance(
             banks[required_bank].get("positions"), dict
         ):
@@ -1748,11 +1754,14 @@ def build_promotion_evidence(
         "standard_match": specs[2]["config_sha"],
     }
     schedule_hashes = {name: matrix[name]["schedule_hash"] for name in CELL_ORDER}
-    suite_hashes = {
-        **{name: matrix[name]["suite_hash"] for name in CELL_ORDER},
-        "tactical": banks["tactical"]["positions"]["sha256"],
-        "exploitability": banks["exploitability"]["positions"]["sha256"],
-    }
+    suite_hashes = {name: matrix[name]["suite_hash"] for name in CELL_ORDER}
+    if not machine_review_v3:
+        suite_hashes.update(
+            {
+                "tactical": banks["tactical"]["positions"]["sha256"],
+                "exploitability": banks["exploitability"]["positions"]["sha256"],
+            }
+        )
     promotion_evidence = {
         "schema_version": SCHEMA_VERSION,
         "evidence_contract": EVIDENCE_CONTRACT,

@@ -9,6 +9,7 @@ from risk_score.paired_stats import (
     MatchValidationError,
     V1_POLICY_PATH,
     V2_POLICY_PATH,
+    V3_POLICY_PATH,
     canonical_sha256,
     compute_paired_statistics,
     exact_zero_event_upper_bound,
@@ -601,10 +602,10 @@ def test_finalized_statistics_emit_hash_bound_artifact_manifest():
 
 def test_policy_objective_and_sequential_look_values_are_loaded_from_json():
     policy = load_policy()
-    assert DEFAULT_POLICY_PATH == V2_POLICY_PATH
-    assert V1_POLICY_PATH != V2_POLICY_PATH
-    assert policy["schema_version"] == 2
-    assert policy["policy_version"] == "risk-seeking-checkpoint-promotion-v2"
+    assert DEFAULT_POLICY_PATH == V3_POLICY_PATH
+    assert len({V1_POLICY_PATH, V2_POLICY_PATH, V3_POLICY_PATH}) == 3
+    assert policy["schema_version"] == 3
+    assert policy["policy_version"] == "risk-seeking-checkpoint-promotion-v3"
     assert policy["objective"] == {
         "name": "candidate_realized_powered_terminal_utility",
         "candidate_perspective_outcomes": {

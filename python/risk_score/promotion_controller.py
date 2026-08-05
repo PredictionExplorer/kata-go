@@ -70,6 +70,11 @@ _HARDENED_EXPORT_CONTRACTS = frozenset(
     }
 )
 EVALUATION_PLAN_CONTRACT = "risk-score-evaluation-plan-v2"
+PROMOTION_READY_POLICY_VERSION = "risk-seeking-checkpoint-promotion-v3"
+PROMOTION_READY_SUITE_CONTRACT = "risk-score-authoritative-evaluation-manifest-v3"
+PROMOTION_READY_BANK_CONTRACT = "risk-score-reviewed-position-bank-v2"
+PROMOTION_READY_REVIEW_MODE = "machine-consensus"
+PROMOTION_READY_LABELS = ("lead-40", "lead-80", "ordinary")
 
 PROMOTION_FAILURE_STEPS = (
     "promotion-intent-written",
@@ -602,7 +607,7 @@ def _policy_get(
 def _validate_queue_contract(
     controller: ControllerConfig, policy: Mapping[str, Any]
 ) -> None:
-    if policy.get("schema_version") != 2:
+    if policy.get("schema_version") not in {2, 3}:
         return
     queue_policy = policy.get("queue")
     if not isinstance(queue_policy, Mapping):
@@ -1301,6 +1306,197 @@ class PromotionController:
             raise SafetyHalt("frozen suite manifest policy/source binding changed")
         return value, data
 
+    def _promotion_readiness_errors(self) -> Tuple[str, ...]:
+        """Return immutable-provenance reasons that block rollout mutation."""
+
+        errors: List[str] = []
+        expected_labels = list(PROMOTION_READY_LABELS)
+
+        def has_expected_labels(value: Any) -> bool:
+            return (
+                isinstance(value, list)
+                and all(isinstance(label, str) for label in value)
+                and sorted(value) == expected_labels
+            )
+
+        policy = self.runtime.frozen_policy
+        if policy.get("policy_version") != PROMOTION_READY_POLICY_VERSION:
+            errors.append("POLICY_NOT_MACHINE_REVIEW_V3")
+        machine_curation = policy.get("machine_curation_contract")
+        if not isinstance(machine_curation, Mapping):
+            errors.append("POLICY_MACHINE_CURATION_MISSING")
+        else:
+            if machine_curation.get("final_contract") != PROMOTION_READY_BANK_CONTRACT:
+                errors.append("POLICY_MACHINE_CONTRACT_MISMATCH")
+            if machine_curation.get("review_mode") != PROMOTION_READY_REVIEW_MODE:
+                errors.append("POLICY_REVIEW_MODE_MISMATCH")
+            if machine_curation.get("consensus_rules_version") != 1:
+                errors.append("POLICY_CONSENSUS_RULES_MISMATCH")
+            if machine_curation.get("stability_margin") != 5.0:
+                errors.append("POLICY_STABILITY_MARGIN_MISMATCH")
+            if not has_expected_labels(machine_curation.get("allowed_labels")):
+                errors.append("POLICY_ALLOWED_LABELS_MISMATCH")
+            if machine_curation.get("model_roles") != [
+                "immutable_original",
+                "frozen_champion",
+            ]:
+                errors.append("POLICY_MODEL_ROLES_MISMATCH")
+            if machine_curation.get("search_modes") != [
+                "standard",
+                "powered",
+            ]:
+                errors.append("POLICY_SEARCH_MODES_MISMATCH")
+            if machine_curation.get("visits") != [2000, 8000]:
+                errors.append("POLICY_CURATION_VISITS_MISMATCH")
+            if (
+                machine_curation.get("symmetry_semantics")
+                != "katago-shape-preserving-d4-v1"
+            ):
+                errors.append("POLICY_SYMMETRY_SEMANTICS_MISMATCH")
+            if (
+                machine_curation.get(
+                    "automatic_promotion_requires_transitive_suite_provenance"
+                )
+                is not True
+            ):
+                errors.append("POLICY_TRANSITIVE_PROVENANCE_NOT_REQUIRED")
+
+        try:
+            manifest, _ = self._load_suite_manifest()
+        except SafetyHalt as exc:
+            errors.append(f"SUITE_MANIFEST_INVALID:{exc}")
+            return tuple(sorted(set(errors)))
+
+        if manifest.get("manifestContract") != PROMOTION_READY_SUITE_CONTRACT:
+            errors.append("SUITE_CONTRACT_NOT_MACHINE_REVIEW_V3")
+        if not has_expected_labels(manifest.get("acceptedLabels")):
+            errors.append("SUITE_ACCEPTED_LABELS_MISMATCH")
+        if manifest.get("machineReviewOnly") is not True:
+            errors.append("SUITE_MACHINE_REVIEW_ONLY_MISSING")
+
+        raw_sources = manifest.get("sources")
+        source_hashes = (
+            {
+                source.get("sha256")
+                for source in raw_sources
+                if isinstance(source, Mapping) and isinstance(source.get("sha256"), str)
+            }
+            if isinstance(raw_sources, list)
+            else set()
+        )
+        if any(_SHA_RE.fullmatch(value) is None for value in source_hashes):
+            errors.append("SUITE_SOURCE_HASH_INVALID")
+        if (
+            not isinstance(raw_sources, list)
+            or not all(isinstance(source, Mapping) for source in raw_sources)
+            or len(raw_sources) != len(source_hashes)
+        ):
+            errors.append("SUITE_SOURCE_INVENTORY_INVALID")
+        curation_sources = manifest.get("curationSources")
+        if not isinstance(curation_sources, list) or not curation_sources:
+            errors.append("SUITE_CURATION_SOURCES_MISSING")
+            return tuple(sorted(set(errors)))
+        if len(curation_sources) != len(source_hashes):
+            errors.append("SUITE_CURATION_SOURCE_COUNT_MISMATCH")
+
+        bound_source_hashes = set()
+        bound_source_names = set()
+        common_source_models = None
+        for source in curation_sources:
+            if not isinstance(source, Mapping):
+                errors.append("SUITE_CURATION_SOURCE_MALFORMED")
+                continue
+            if source.get("contract") != PROMOTION_READY_BANK_CONTRACT:
+                errors.append("SOURCE_MACHINE_CONTRACT_MISMATCH")
+            source_name = source.get("source_name")
+            raw_source_names = {
+                item.get("name")
+                for item in raw_sources
+                if isinstance(item, Mapping)
+            }
+            if (
+                not isinstance(source_name, str)
+                or source_name not in raw_source_names
+                or source_name in bound_source_names
+            ):
+                errors.append("SOURCE_NAME_BINDING_INVALID")
+            else:
+                bound_source_names.add(source_name)
+            if source.get("review_mode") != PROMOTION_READY_REVIEW_MODE:
+                errors.append("SOURCE_REVIEW_MODE_MISMATCH")
+            if source.get("consensus_rules_version") != 1:
+                errors.append("SOURCE_CONSENSUS_RULES_MISMATCH")
+            if source.get("policy_hash") != self.runtime.controller.policy_hash:
+                errors.append("SOURCE_POLICY_HASH_MISMATCH")
+            if not has_expected_labels(source.get("allowed_labels")):
+                errors.append("SOURCE_ALLOWED_LABELS_MISMATCH")
+            output_hash = source.get("output_sha256")
+            if (
+                not isinstance(output_hash, str)
+                or _SHA_RE.fullmatch(output_hash) is None
+            ):
+                errors.append("SOURCE_OUTPUT_HASH_INVALID")
+            else:
+                bound_source_hashes.add(output_hash)
+                if output_hash not in source_hashes:
+                    errors.append("SOURCE_OUTPUT_NOT_BOUND_TO_SUITE")
+            manifest_hash = source.get("manifest_sha256")
+            if (
+                not isinstance(manifest_hash, str)
+                or _SHA_RE.fullmatch(manifest_hash) is None
+            ):
+                errors.append("SOURCE_MANIFEST_HASH_INVALID")
+            rejected_count = source.get("rejected_count")
+            rejected_hash = source.get("rejected_sha256")
+            if (
+                type(rejected_count) is not int
+                or rejected_count < 0
+                or not isinstance(rejected_hash, str)
+                or _SHA_RE.fullmatch(rejected_hash) is None
+            ):
+                errors.append("SOURCE_REJECTION_PROVENANCE_INVALID")
+            models = source.get("models")
+            if not isinstance(models, Mapping):
+                errors.append("SOURCE_MODELS_MISSING")
+            else:
+                original = models.get("original")
+                champion = models.get("champion")
+                if (
+                    not isinstance(original, Mapping)
+                    or original.get("role") != "immutable_original"
+                    or original.get("sha256") != self.runtime.controller.original_hash
+                ):
+                    errors.append("SOURCE_ORIGINAL_MODEL_MISMATCH")
+                if (
+                    not isinstance(champion, Mapping)
+                    or champion.get("role") != "frozen_champion"
+                    or not isinstance(champion.get("sha256"), str)
+                    or _SHA_RE.fullmatch(champion["sha256"]) is None
+                ):
+                    errors.append("SOURCE_CHAMPION_MODEL_INVALID")
+                elif isinstance(original, Mapping) and champion[
+                    "sha256"
+                ] == original.get("sha256"):
+                    errors.append("SOURCE_MODELS_NOT_INDEPENDENT")
+                normalized_models = (
+                    (
+                        original.get("role"),
+                        original.get("sha256"),
+                        champion.get("role"),
+                        champion.get("sha256"),
+                    )
+                    if isinstance(original, Mapping)
+                    and isinstance(champion, Mapping)
+                    else None
+                )
+                if common_source_models is None:
+                    common_source_models = normalized_models
+                elif normalized_models != common_source_models:
+                    errors.append("SUITE_CURATION_MODELS_MISMATCH")
+        if bound_source_hashes != source_hashes:
+            errors.append("SUITE_SOURCE_HASH_SET_MISMATCH")
+        return tuple(sorted(set(errors)))
+
     @staticmethod
     def _manifest_cells(manifest: Mapping[str, Any]) -> Tuple[Mapping[str, Any], ...]:
         cells = manifest.get("cells")
@@ -1859,7 +2055,7 @@ class PromotionController:
             "evaluation_stages",
             "stage_3_promotion_confirmation",
         )
-        v2_policy = self.runtime.frozen_policy.get("schema_version") == 2
+        v2_policy = self.runtime.frozen_policy.get("schema_version") in {2, 3}
         if canonical_stage == "stage-1":
             if not isinstance(stage_1_policy, Mapping):
                 if v2_policy:
@@ -5525,80 +5721,177 @@ class PromotionController:
         if not isinstance(policy, Mapping):
             raise SafetyHalt("frozen policy has no deep-audit contract")
         manifest, _ = self._load_suite_manifest()
-        audit_bank = next(
-            (
-                bank
-                for bank in manifest.get("banks", [])
-                if isinstance(bank, Mapping)
-                and bank.get("name") == "audit"
-            ),
-            None,
-        )
-        audit_schedule_path = self.runtime.audit_schedule_path
-        audit_schedule_hash = self.runtime.controller.audit_schedule_hash
-        audit_schedule_id = None
-        audit_bank_hash = None
-        if isinstance(audit_bank, Mapping):
-            schedule = audit_bank.get("schedule")
-            positions = audit_bank.get("positions")
-            if not isinstance(schedule, Mapping) or not isinstance(
-                positions, Mapping
-            ):
+        banks = manifest.get("banks")
+        if not isinstance(banks, list):
+            raise SafetyHalt("frozen suite manifest has no audit banks")
+
+        def bind_audit_bank(
+            names: Sequence[str], expected_pairs: Optional[int]
+        ) -> Mapping[str, Any]:
+            bank = next(
+                (
+                    item
+                    for item in banks
+                    if isinstance(item, Mapping)
+                    and (
+                        item.get("qualifiedName") in names or item.get("name") in names
+                    )
+                ),
+                None,
+            )
+            if not isinstance(bank, Mapping):
+                raise SafetyHalt(f"deep-audit bank is missing: {names[0]}")
+            schedule = bank.get("schedule")
+            positions = bank.get("positions")
+            if not isinstance(schedule, Mapping) or not isinstance(positions, Mapping):
                 raise SafetyHalt("audit suite bank is incomplete")
             relative = schedule.get("path")
-            if (
-                not isinstance(relative, str)
-                and manifest.get("schemaVersion") == 2
-            ):
+            if not isinstance(relative, str):
                 raise SafetyHalt("audit suite bank has no schedule path")
-            if isinstance(relative, str):
-                relative_path = Path(relative)
-                if (
-                    relative_path.is_absolute()
-                    or ".." in relative_path.parts
-                ):
-                    raise SafetyHalt(
-                        "deep-audit schedule path is unsafe"
-                    )
-                audit_schedule_path = (
-                    self.runtime.suites / relative_path
+            relative_path = Path(relative)
+            if relative_path.is_absolute() or ".." in relative_path.parts:
+                raise SafetyHalt("deep-audit schedule path is unsafe")
+            schedule_path = self.runtime.suites / relative_path
+            schedule_hash = _hash(schedule.get("sha256"), "deep-audit schedule hash")
+            bank_hash = _hash(positions.get("sha256"), "deep-audit bank hash")
+            schedule_id = _nonempty(
+                schedule.get("scheduleId"), "deep-audit schedule ID"
+            )
+            pair_count = schedule.get("pairCount")
+            if expected_pairs is not None and (
+                type(pair_count) is not int or pair_count != expected_pairs
+            ):
+                raise SafetyHalt("deep-audit schedule pair count contradicts policy")
+            if (
+                schedule_path.is_symlink()
+                or not schedule_path.is_file()
+                or sha256_file(schedule_path) != schedule_hash
+            ):
+                raise SafetyHalt("deep-audit schedule changed")
+            return {
+                "qualified_name": bank.get("qualifiedName", bank.get("name")),
+                "schedule_path": str(schedule_path),
+                "schedule_hash": schedule_hash,
+                "schedule_id": schedule_id,
+                "bank_hash": bank_hash,
+                "color_pairs": pair_count,
+            }
+
+        v3_audit = (
+            self.runtime.frozen_policy.get("policy_version")
+            == PROMOTION_READY_POLICY_VERSION
+        )
+        if v3_audit:
+            counts = (
+                ("ordinary", ("audit",), policy.get("ordinary_color_pairs")),
+                (
+                    "lead-40",
+                    ("lead-40-audit", "lead-40"),
+                    policy.get("lead_40_color_pairs"),
+                ),
+                (
+                    "lead-80",
+                    ("lead-80-audit", "lead-80"),
+                    policy.get("lead_80_color_pairs"),
+                ),
+            )
+            audit_banks = []
+            for label, names, expected_pairs in counts:
+                if type(expected_pairs) is not int or expected_pairs <= 0:
+                    raise SafetyHalt(f"deep-audit {label} color-pair count is invalid")
+                audit_banks.append(
+                    {
+                        "label": label,
+                        **bind_audit_bank(names, expected_pairs),
+                    }
                 )
-                audit_schedule_hash = schedule.get("sha256")
-                audit_schedule_id = schedule.get("scheduleId")
-                audit_bank_hash = positions.get("sha256")
-                _hash(audit_schedule_hash, "deep-audit schedule hash")
-                _hash(audit_bank_hash, "deep-audit bank hash")
-                _nonempty(audit_schedule_id, "deep-audit schedule ID")
-                if (
-                    audit_schedule_path.is_symlink()
-                    or not audit_schedule_path.is_file()
-                    or sha256_file(audit_schedule_path)
-                    != audit_schedule_hash
-                ):
-                    raise SafetyHalt("deep-audit schedule changed")
+            visits = policy.get("visits")
+            controls = policy.get("controls")
+            if (
+                visits != [2000, 8000]
+                or not isinstance(controls, list)
+                or not controls
+                or any(not isinstance(control, str) for control in controls)
+            ):
+                raise SafetyHalt("v3 deep-audit visit/control matrix is invalid")
+            b28_path = (
+                self.runtime.promotion_root
+                / "controls"
+                / "b28"
+                / "model.bin.gz"
+            )
+            if b28_path.is_symlink() or not b28_path.is_file():
+                raise SafetyHalt(
+                    "v3 deep-audit b28 control model is not frozen"
+                )
+            control_model_hashes = {
+                "candidate": candidate_hash,
+                "champion": generation.previous_champion_hash,
+                "original": self.runtime.controller.original_hash,
+                "b28": sha256_file(b28_path),
+            }
+            if set(controls) != set(control_model_hashes):
+                raise SafetyHalt("v3 deep-audit controls are unsupported")
+            audit_cells = []
+            for bank in audit_banks:
+                for visit_count in visits:
+                    for control in controls:
+                        payload = {
+                            "label": bank["label"],
+                            "visit_count": visit_count,
+                            "control": control,
+                            "control_model_hash":
+                                control_model_hashes[control],
+                            "schedule_hash": bank["schedule_hash"],
+                            "bank_hash": bank["bank_hash"],
+                            "color_pairs": bank["color_pairs"],
+                        }
+                        audit_cells.append(
+                            {
+                                "cell_id": "deep-audit-cell-"
+                                + canonical_sha256(payload),
+                                **payload,
+                            }
+                        )
+            primary_audit = audit_banks[0]
+        else:
+            primary_audit = bind_audit_bank(("audit",), None)
+            audit_banks = []
         request = {
-            "schema_version": 1,
-            "contract": "risk-score-deep-audit-request-v1",
+            "schema_version": 2 if v3_audit else 1,
+            "contract": (
+                "risk-score-deep-audit-request-v2"
+                if v3_audit
+                else "risk-score-deep-audit-request-v1"
+            ),
             "generation_id": generation_id,
             "candidate_hash": candidate_hash,
             "previous_champion_hash": generation.previous_champion_hash,
             "policy_path": str(self.runtime.policy_path),
             "policy_hash": self.runtime.controller.policy_hash,
             "policy_version": self.runtime.frozen_policy.get("policy_version"),
-            "suite_manifest_path": str(
-                self.runtime.suites / "manifest.json"
-            ),
-            "suite_manifest_hash":
-                self.runtime.controller.suite_manifest_hash,
-            "audit_schedule_path": str(audit_schedule_path),
-            "audit_schedule_hash": audit_schedule_hash,
-            "audit_schedule_id": audit_schedule_id,
-            "audit_bank_hash": audit_bank_hash,
+            "suite_manifest_path": str(self.runtime.suites / "manifest.json"),
+            "suite_manifest_hash": self.runtime.controller.suite_manifest_hash,
+            "audit_schedule_path": primary_audit["schedule_path"],
+            "audit_schedule_hash": primary_audit["schedule_hash"],
+            "audit_schedule_id": primary_audit["schedule_id"],
+            "audit_bank_hash": primary_audit["bank_hash"],
             "activation_event_hash": activation.event_hash,
             "scheduled_at_utc": activation.timestamp_utc,
             "reasons": normalized_reasons,
             "audit_contract": dict(policy),
         }
+        if v3_audit:
+            request.update(
+                {
+                    "audit_banks": audit_banks,
+                    "visit_tiers": list(visits),
+                    "controls": list(controls),
+                    "control_model_hashes": control_model_hashes,
+                    "b28_model_path": str(b28_path.resolve()),
+                    "audit_cells": audit_cells,
+                }
+            )
         path = (
             self.runtime.promotion_root
             / "audits"
@@ -5680,19 +5973,421 @@ class PromotionController:
         value = json.loads(source.read_text(encoding="utf-8"))
         request = json.loads(queue_path.read_text(encoding="utf-8"))
         expected = {
-            "schema_version": 1,
+            "schema_version": (
+                2
+                if request.get("contract")
+                == "risk-score-deep-audit-request-v2"
+                else 1
+            ),
             "finalized": True,
             "generation_id": generation_id,
             "candidate_hash": request["candidate_hash"],
             "policy_hash": self.runtime.controller.policy_hash,
             "audit_request_hash": sha256_file(queue_path),
         }
-        if (
-            not isinstance(value, dict)
-            or value.get("decision") not in {"PASS", "FAIL"}
-            or any(value.get(key) != expected_value for key, expected_value in expected.items())
+        if not isinstance(value, dict) or any(
+            value.get(key) != expected_value
+            for key, expected_value in expected.items()
         ):
             raise SafetyHalt("deep-audit report contradicts queued request")
+        if request.get("contract") == "risk-score-deep-audit-request-v2":
+            if value.get("contract") != "risk-score-deep-audit-report-v2":
+                raise SafetyHalt("deep-audit report contract is invalid")
+            supplied_identity = value.get("manifest_sha256")
+            payload = dict(value)
+            payload.pop("manifest_sha256", None)
+            if supplied_identity != canonical_sha256(payload):
+                raise SafetyHalt("deep-audit report self-hash is invalid")
+            control_hashes = value.get("control_model_hashes")
+            request_controls = request.get("control_model_hashes")
+            b28_path_value = request.get("b28_model_path")
+            b28_path = (
+                Path(b28_path_value)
+                if isinstance(b28_path_value, str)
+                else None
+            )
+            if (
+                not isinstance(control_hashes, Mapping)
+                or not isinstance(request_controls, Mapping)
+                or set(control_hashes) != set(request_controls)
+                or len(set(control_hashes.values())) != len(control_hashes)
+                or any(
+                    (
+                        control_hashes[control] != expected_hash
+                        if expected_hash is not None
+                        else not isinstance(control_hashes[control], str)
+                        or _SHA_RE.fullmatch(control_hashes[control]) is None
+                    )
+                    for control, expected_hash in request_controls.items()
+                )
+                or b28_path is None
+                or not b28_path.is_absolute()
+                or str(b28_path.resolve()) != b28_path_value
+                or b28_path.is_symlink()
+                or not b28_path.is_file()
+                or sha256_file(b28_path) != request_controls.get("b28")
+            ):
+                raise SafetyHalt("deep-audit control model bindings are invalid")
+            cells = value.get("cells")
+            request_cells = request.get("audit_cells")
+            if (
+                not isinstance(cells, list)
+                or not isinstance(request_cells, list)
+                or len(cells) != len(request_cells)
+                or not all(isinstance(cell, Mapping) for cell in cells)
+                or len({cell.get("cell_id") for cell in cells}) != len(cells)
+            ):
+                raise SafetyHalt("deep-audit report matrix is incomplete")
+            cells_by_id = {
+                cell.get("cell_id"): cell
+                for cell in cells
+                if isinstance(cell, Mapping)
+            }
+            cell_decisions = []
+            for request_cell in request_cells:
+                cell = cells_by_id.get(request_cell.get("cell_id"))
+                control = request_cell.get("control")
+                expected_cell = {
+                    **request_cell,
+                    "control_model_hash": control_hashes.get(control),
+                }
+                if (
+                    not isinstance(cell, Mapping)
+                    or any(
+                        cell.get(key) != expected_value
+                        for key, expected_value in expected_cell.items()
+                    )
+                    or cell.get("decision") not in {"PASS", "FAIL"}
+                    or not isinstance(
+                        cell.get("runner_manifest_path"), str
+                    )
+                    or not isinstance(
+                        cell.get("runner_manifest_sha256"), str
+                    )
+                    or _SHA_RE.fullmatch(
+                        cell["runner_manifest_sha256"]
+                    )
+                    is None
+                    or not isinstance(
+                        cell.get("statistics_artifact_path"), str
+                    )
+                    or not isinstance(
+                        cell.get("statistics_artifact_sha256"), str
+                    )
+                    or _SHA_RE.fullmatch(
+                        cell["statistics_artifact_sha256"]
+                    )
+                    is None
+                ):
+                    raise SafetyHalt(
+                        "deep-audit report matrix cell is invalid"
+                    )
+                runner_outputs = None
+                derived_cell_decision = None
+                derived_candidate_win_rate = None
+                minimum_candidate_win_rate = _policy_get(
+                    self.runtime.frozen_policy,
+                    "promotion_thresholds",
+                    "powered_win_rate_vs_champion_lower_bound_strictly_above",
+                    default=0.47,
+                )
+                if (
+                    not isinstance(minimum_candidate_win_rate, (int, float))
+                    or isinstance(minimum_candidate_win_rate, bool)
+                    or not math.isfinite(
+                        float(minimum_candidate_win_rate)
+                    )
+                ):
+                    raise SafetyHalt(
+                        "deep-audit win-rate threshold is invalid"
+                    )
+                minimum_candidate_win_rate = float(
+                    minimum_candidate_win_rate
+                )
+                for artifact_name, contract in (
+                    (
+                        "runner_manifest",
+                        "risk-score-deep-audit-runner-manifest-v1",
+                    ),
+                    (
+                        "statistics_artifact",
+                        "risk-score-deep-audit-statistics-v1",
+                    ),
+                ):
+                    artifact_path_value = cell[
+                        f"{artifact_name}_path"
+                    ]
+                    artifact_hash = cell[
+                        f"{artifact_name}_sha256"
+                    ]
+                    artifact_path = Path(artifact_path_value)
+                    try:
+                        artifact_path.resolve().relative_to(
+                            self.runtime.promotion_root.resolve()
+                        )
+                    except ValueError as exc:
+                        raise SafetyHalt(
+                            "deep-audit artifact path is outside promotion root"
+                        ) from exc
+                    if (
+                        not artifact_path.is_absolute()
+                        or str(artifact_path.resolve())
+                        != artifact_path_value
+                        or artifact_path.is_symlink()
+                        or not artifact_path.is_file()
+                        or sha256_file(artifact_path) != artifact_hash
+                    ):
+                        raise SafetyHalt(
+                            "deep-audit matrix artifact changed"
+                        )
+                    artifact_data = artifact_path.read_bytes()
+                    try:
+                        artifact = json.loads(artifact_data)
+                    except (
+                        UnicodeDecodeError,
+                        json.JSONDecodeError,
+                    ) as exc:
+                        raise SafetyHalt(
+                            "deep-audit matrix artifact is invalid"
+                        ) from exc
+                    if (
+                        not isinstance(artifact, dict)
+                        or artifact_data
+                        != canonical_json_bytes(artifact) + b"\n"
+                    ):
+                        raise SafetyHalt(
+                            "deep-audit matrix artifact is not canonical"
+                        )
+                    artifact_payload = dict(artifact)
+                    artifact_identity = artifact_payload.pop(
+                        "manifest_sha256", None
+                    )
+                    if (
+                        artifact_identity
+                        != canonical_sha256(artifact_payload)
+                        or artifact.get("schema_version") != 1
+                        or artifact.get("contract") != contract
+                        or artifact.get("finalized") is not True
+                        or artifact.get("cell") != expected_cell
+                        or artifact.get("decision") != cell["decision"]
+                        or artifact.get("policy_hash")
+                        != self.runtime.controller.policy_hash
+                        or artifact.get("audit_request_hash")
+                        != sha256_file(queue_path)
+                    ):
+                        raise SafetyHalt(
+                            "deep-audit matrix artifact contradicts request"
+                        )
+                    if artifact_name == "runner_manifest":
+                        output_hashes = {}
+                        output_paths = {}
+                        for output_name in ("results", "moves"):
+                            output_path_value = artifact.get(
+                                f"{output_name}_path"
+                            )
+                            output_hash = artifact.get(
+                                f"{output_name}_sha256"
+                            )
+                            if (
+                                not isinstance(output_path_value, str)
+                                or not output_path_value
+                                or not isinstance(output_hash, str)
+                                or _SHA_RE.fullmatch(output_hash) is None
+                            ):
+                                raise SafetyHalt(
+                                    "deep-audit runner output binding is missing"
+                                )
+                            output_path = Path(output_path_value)
+                            try:
+                                output_path.resolve().relative_to(
+                                    self.runtime.promotion_root.resolve()
+                                )
+                            except ValueError as exc:
+                                raise SafetyHalt(
+                                    "deep-audit runner output is outside promotion root"
+                                ) from exc
+                            if (
+                                not output_path.is_absolute()
+                                or str(output_path.resolve())
+                                != output_path_value
+                                or output_path.is_symlink()
+                                or not output_path.is_file()
+                                or output_path.stat().st_size <= 0
+                                or sha256_file(output_path) != output_hash
+                            ):
+                                raise SafetyHalt(
+                                    "deep-audit runner output changed"
+                                )
+                            try:
+                                output_rows = [
+                                    json.loads(line)
+                                    for line in output_path.read_text(
+                                        encoding="utf-8"
+                                    ).splitlines()
+                                    if line
+                                ]
+                            except (
+                                UnicodeDecodeError,
+                                json.JSONDecodeError,
+                            ) as exc:
+                                raise SafetyHalt(
+                                    "deep-audit runner output is invalid"
+                                ) from exc
+                            if not output_rows or not all(
+                                isinstance(row, dict)
+                                for row in output_rows
+                            ):
+                                raise SafetyHalt(
+                                    "deep-audit runner output is empty"
+                                )
+                            output_hashes[output_name] = output_hash
+                            output_paths[output_name] = output_path
+                        bank_binding = next(
+                            (
+                                bank
+                                for bank in request.get("audit_banks", [])
+                                if isinstance(bank, Mapping)
+                                and bank.get("schedule_hash")
+                                == expected_cell["schedule_hash"]
+                            ),
+                            None,
+                        )
+                        if not isinstance(bank_binding, Mapping):
+                            raise SafetyHalt(
+                                "deep-audit cell has no schedule binding"
+                            )
+                        bound_schedule_path = Path(
+                            bank_binding["schedule_path"]
+                        )
+                        if (
+                            not bound_schedule_path.is_absolute()
+                            or str(bound_schedule_path.resolve())
+                            != bank_binding["schedule_path"]
+                            or bound_schedule_path.is_symlink()
+                            or not bound_schedule_path.is_file()
+                            or sha256_file(bound_schedule_path)
+                            != bank_binding["schedule_hash"]
+                        ):
+                            raise SafetyHalt(
+                                "deep-audit frozen schedule changed"
+                            )
+                        try:
+                            from risk_score.evaluation_runner import (
+                                load_schedule,
+                                validate_move_jsonl,
+                                validate_result_jsonl,
+                            )
+
+                            schedule_rows = load_schedule(
+                                bound_schedule_path
+                            )
+                            schedule_prefix = schedule_rows[
+                                : 2 * expected_cell["color_pairs"]
+                            ]
+                            if len(schedule_prefix) != 2 * expected_cell[
+                                "color_pairs"
+                            ]:
+                                raise ValueError(
+                                    "deep-audit schedule prefix is incomplete"
+                                )
+                            result_rows = validate_result_jsonl(
+                                output_paths["results"], schedule_prefix
+                            )
+                            validate_move_jsonl(
+                                output_paths["moves"],
+                                schedule_prefix,
+                                result_rows,
+                            )
+                        except (OSError, RuntimeError, ValueError) as exc:
+                            raise SafetyHalt(
+                                "deep-audit game evidence is invalid"
+                            ) from exc
+                        candidate_scores = []
+                        for result_row in result_rows:
+                            winner = result_row.get("winner")
+                            if result_row.get("noResult") is True or winner in {
+                                None,
+                                "D",
+                                "Draw",
+                            }:
+                                candidate_scores.append(0.5)
+                                continue
+                            candidate_color = (
+                                "B"
+                                if result_row.get("blackBot") == "candidate"
+                                else "W"
+                            )
+                            candidate_scores.append(
+                                1.0 if winner == candidate_color else 0.0
+                            )
+                        derived_candidate_win_rate = sum(
+                            candidate_scores
+                        ) / len(candidate_scores)
+                        derived_cell_decision = (
+                            "PASS"
+                            if derived_candidate_win_rate
+                            > minimum_candidate_win_rate
+                            else "FAIL"
+                        )
+                        runner_outputs = output_hashes
+                    if artifact_name == "statistics_artifact":
+                        safety_failures = artifact.get(
+                            "safety_failures"
+                        )
+                        if (
+                            type(safety_failures) is not int
+                            or safety_failures < 0
+                            or (
+                                cell["decision"] == "PASS"
+                                and safety_failures != 0
+                            )
+                            or (
+                                cell["decision"] == "FAIL"
+                                and safety_failures == 0
+                            )
+                            or artifact.get("candidate_win_rate")
+                            != derived_candidate_win_rate
+                            or artifact.get(
+                                "minimum_candidate_win_rate"
+                            )
+                            != minimum_candidate_win_rate
+                        ):
+                            raise SafetyHalt(
+                                "deep-audit statistics decision is invalid"
+                            )
+                        if (
+                            runner_outputs is None
+                            or artifact.get("results_sha256")
+                            != runner_outputs["results"]
+                            or artifact.get("moves_sha256")
+                            != runner_outputs["moves"]
+                        ):
+                            raise SafetyHalt(
+                                "deep-audit statistics are not runner-bound"
+                            )
+                if cell.get("decision") != derived_cell_decision:
+                    raise SafetyHalt(
+                        "deep-audit cell decision is not output-derived"
+                    )
+                cell_decisions.append(cell["decision"])
+            expected_decision = (
+                "PASS"
+                if all(decision == "PASS" for decision in cell_decisions)
+                else "FAIL"
+            )
+            if value.get("decision") != expected_decision:
+                raise SafetyHalt(
+                    "deep-audit report decision contradicts matrix"
+                )
+            if (
+                expected_decision == "FAIL"
+                and value.get("rollback_required") is not True
+            ):
+                raise SafetyHalt(
+                    "deep-audit failure must require rollback"
+                )
+        elif value.get("decision") not in {"PASS", "FAIL"}:
+            raise SafetyHalt("deep-audit report decision is invalid")
         stored = {
             **value,
             "source_report_path": str(source),
@@ -5790,10 +6485,23 @@ class PromotionController:
             return ()
         outcomes = []
         state = self.registry.reconstruct()
+        readiness_errors: Optional[Tuple[str, ...]] = None
         for candidate in sorted(
             state.candidates.values(), key=lambda item: item.candidate_hash
         ):
             if candidate.state != CandidateState.CONFIRMED:
+                continue
+            if readiness_errors is None:
+                readiness_errors = self._promotion_readiness_errors()
+            if readiness_errors:
+                outcomes.append(
+                    {
+                        "status": "PROMOTION_BLOCKED",
+                        "candidate_hash": candidate.candidate_hash,
+                        "reason": "machine-review-readiness",
+                        "readiness_errors": list(readiness_errors),
+                    }
+                )
                 continue
             report_path = (
                 self.runtime.reports / f"{candidate.evaluation_key}.final.json"
@@ -6440,19 +7148,259 @@ class PromotionController:
             "throughput_pass": True,
             "crash_error_pass": True,
             "behavior_pass": True,
-            "tactical_pass": True,
-            "exploitability_pass": True,
             "catastrophe_pass": True,
         }
+        if (
+            self.runtime.frozen_policy.get("policy_version")
+            != PROMOTION_READY_POLICY_VERSION
+        ):
+            expected.update(
+                {
+                    "tactical_pass": True,
+                    "exploitability_pass": True,
+                }
+            )
         if not isinstance(report, dict) or any(
             report.get(key) != value for key, value in expected.items()
         ):
             raise SafetyHalt(f"{phase} report does not satisfy frozen policy")
-        if phase == "canary" and (
-            report.get("game_count", 0) < 2000
-            or report.get("fresh_audit_pairs", 0) < 1024
-        ):
-            raise SafetyHalt("canary report lacks required games/fresh audit")
+        if phase == "canary":
+            rollout = self.runtime.frozen_policy.get("rollout")
+            if not isinstance(rollout, Mapping):
+                raise SafetyHalt("frozen policy has no rollout contract")
+            required_games = rollout.get("canary_games")
+            required_pairs = rollout.get("canary_fresh_audit_color_pairs")
+            if (
+                type(required_games) is not int
+                or required_games <= 0
+                or type(required_pairs) is not int
+                or required_pairs <= 0
+                or type(report.get("game_count")) is not int
+                or report["game_count"] < required_games
+                or type(report.get("fresh_audit_pairs")) is not int
+                or report["fresh_audit_pairs"] < required_pairs
+            ):
+                raise SafetyHalt("canary report lacks required games/fresh audit")
+            if (
+                self.runtime.frozen_policy.get("policy_version")
+                == PROMOTION_READY_POLICY_VERSION
+            ):
+                pair_ids = report.get("fresh_audit_pair_ids")
+                pair_ids_hash = report.get("fresh_audit_pair_ids_sha256")
+                if (
+                    not isinstance(pair_ids, list)
+                    or len(pair_ids) != required_pairs
+                    or len(set(pair_ids)) != len(pair_ids)
+                    or any(
+                        not isinstance(pair_id, str)
+                        or not pair_id
+                        or "\n" in pair_id
+                        or "\r" in pair_id
+                        for pair_id in pair_ids
+                    )
+                    or pair_ids != sorted(pair_ids)
+                    or pair_ids_hash != canonical_sha256(pair_ids)
+                ):
+                    raise SafetyHalt("canary fresh-audit pair identities are invalid")
+                schedule_pair_counts: Dict[str, int] = {}
+                if (
+                    self.runtime.audit_schedule_path.is_symlink()
+                    or not self.runtime.audit_schedule_path.is_file()
+                    or sha256_file(self.runtime.audit_schedule_path)
+                    != self.runtime.controller.audit_schedule_hash
+                ):
+                    raise SafetyHalt(
+                        "canary frozen audit schedule changed"
+                    )
+                try:
+                    for raw_line in self.runtime.audit_schedule_path.read_text(
+                        encoding="utf-8"
+                    ).splitlines():
+                        if not raw_line:
+                            continue
+                        schedule_row = json.loads(raw_line)
+                        if not isinstance(schedule_row, dict):
+                            raise ValueError("invalid audit schedule row")
+                        schedule_pair_id = schedule_row.get("pairId")
+                        if not isinstance(schedule_pair_id, str) or not schedule_pair_id:
+                            raise ValueError("invalid audit schedule pair ID")
+                        schedule_pair_counts[schedule_pair_id] = (
+                            schedule_pair_counts.get(schedule_pair_id, 0) + 1
+                        )
+                except (
+                    OSError,
+                    UnicodeDecodeError,
+                    json.JSONDecodeError,
+                    ValueError,
+                ) as exc:
+                    raise SafetyHalt(
+                        "canary audit schedule is invalid"
+                    ) from exc
+                scheduled_pair_ids = sorted(schedule_pair_counts)
+                if (
+                    any(count != 2 for count in schedule_pair_counts.values())
+                    or scheduled_pair_ids != pair_ids
+                ):
+                    raise SafetyHalt(
+                        "canary pair identities do not match frozen schedule"
+                    )
+                audit_manifest_path_value = report.get(
+                    "fresh_audit_manifest_path"
+                )
+                audit_manifest_hash = report.get(
+                    "fresh_audit_manifest_sha256"
+                )
+                if (
+                    not isinstance(audit_manifest_path_value, str)
+                    or not audit_manifest_path_value
+                    or not isinstance(audit_manifest_hash, str)
+                    or _SHA_RE.fullmatch(audit_manifest_hash) is None
+                ):
+                    raise SafetyHalt(
+                        "canary fresh-audit manifest binding is missing"
+                    )
+                audit_manifest_path = Path(audit_manifest_path_value)
+                try:
+                    audit_manifest_path.resolve().relative_to(
+                        self.runtime.promotion_root.resolve()
+                    )
+                except ValueError as exc:
+                    raise SafetyHalt(
+                        "canary fresh-audit manifest path is outside promotion root"
+                    ) from exc
+                if (
+                    not audit_manifest_path.is_absolute()
+                    or str(audit_manifest_path.resolve())
+                    != audit_manifest_path_value
+                    or audit_manifest_path.is_symlink()
+                    or not audit_manifest_path.is_file()
+                    or sha256_file(audit_manifest_path)
+                    != audit_manifest_hash
+                ):
+                    raise SafetyHalt("canary fresh-audit manifest changed")
+                audit_data = audit_manifest_path.read_bytes()
+                try:
+                    audit_manifest = json.loads(audit_data)
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise SafetyHalt(
+                        "canary fresh-audit manifest is invalid"
+                    ) from exc
+                if (
+                    not isinstance(audit_manifest, dict)
+                    or audit_data
+                    != canonical_json_bytes(audit_manifest) + b"\n"
+                ):
+                    raise SafetyHalt(
+                        "canary fresh-audit manifest is not canonical"
+                    )
+                audit_payload = dict(audit_manifest)
+                audit_identity = audit_payload.pop("manifest_sha256", None)
+                expected_audit = {
+                    "schema_version": 1,
+                    "contract": "risk-score-canary-fresh-audit-v1",
+                    "finalized": True,
+                    "decision": "PASS",
+                    "generation_id": generation_id,
+                    "candidate_hash": candidate_hash,
+                    "reference_hash": promotion_intent[
+                        "tested_champion_hash"
+                    ],
+                    "policy_hash": self.runtime.controller.policy_hash,
+                    "suite_manifest_hash":
+                        self.runtime.controller.suite_manifest_hash,
+                    "audit_schedule_hash":
+                        self.runtime.controller.audit_schedule_hash,
+                    "color_pairs": required_pairs,
+                    "pair_ids_sha256": pair_ids_hash,
+                    "safety_failures": 0,
+                }
+                statistics_hash = audit_manifest.get(
+                    "statistics_artifact_sha256"
+                )
+                statistics_path_value = audit_manifest.get(
+                    "statistics_artifact_path"
+                )
+                if (
+                    audit_identity != canonical_sha256(audit_payload)
+                    or any(
+                        audit_manifest.get(key) != value
+                        for key, value in expected_audit.items()
+                    )
+                    or not isinstance(statistics_hash, str)
+                    or _SHA_RE.fullmatch(statistics_hash) is None
+                    or not isinstance(statistics_path_value, str)
+                    or not statistics_path_value
+                ):
+                    raise SafetyHalt(
+                        "canary fresh-audit evidence does not satisfy policy"
+                    )
+                statistics_path = Path(statistics_path_value)
+                try:
+                    statistics_path.resolve().relative_to(
+                        self.runtime.promotion_root.resolve()
+                    )
+                except ValueError as exc:
+                    raise SafetyHalt(
+                        "canary statistics path is outside promotion root"
+                    ) from exc
+                if (
+                    not statistics_path.is_absolute()
+                    or str(statistics_path.resolve())
+                    != statistics_path_value
+                    or statistics_path.is_symlink()
+                    or not statistics_path.is_file()
+                    or sha256_file(statistics_path) != statistics_hash
+                ):
+                    raise SafetyHalt("canary statistics artifact changed")
+                statistics_data = statistics_path.read_bytes()
+                try:
+                    statistics = json.loads(statistics_data)
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise SafetyHalt(
+                        "canary statistics artifact is invalid"
+                    ) from exc
+                if (
+                    not isinstance(statistics, dict)
+                    or statistics_data
+                    != canonical_json_bytes(statistics) + b"\n"
+                ):
+                    raise SafetyHalt(
+                        "canary statistics artifact is not canonical"
+                    )
+                statistics_payload = dict(statistics)
+                statistics_identity = statistics_payload.pop(
+                    "manifest_sha256", None
+                )
+                expected_statistics = {
+                    "schema_version": 1,
+                    "contract": "risk-score-canary-fresh-audit-statistics-v1",
+                    "finalized": True,
+                    "decision": "PASS",
+                    "candidate_hash": candidate_hash,
+                    "reference_hash": promotion_intent[
+                        "tested_champion_hash"
+                    ],
+                    "policy_hash": self.runtime.controller.policy_hash,
+                    "suite_manifest_hash":
+                        self.runtime.controller.suite_manifest_hash,
+                    "audit_schedule_hash":
+                        self.runtime.controller.audit_schedule_hash,
+                    "color_pairs": required_pairs,
+                    "pair_ids": pair_ids,
+                    "pair_ids_sha256": pair_ids_hash,
+                    "safety_failures": 0,
+                }
+                if (
+                    statistics_identity
+                    != canonical_sha256(statistics_payload)
+                    or any(
+                        statistics.get(key) != value
+                        for key, value in expected_statistics.items()
+                    )
+                ):
+                    raise SafetyHalt(
+                        "canary statistics artifact does not satisfy policy"
+                    )
         return {**report, "report_hash": report_hash}
 
     def mark_canary_passed(
@@ -6690,6 +7638,12 @@ class PromotionController:
 
         if not self.automatic:
             raise SafetyHalt("promotion requires --automatic and mutationEnabled=true")
+        readiness_errors = self._promotion_readiness_errors()
+        if readiness_errors:
+            raise SafetyHalt(
+                "promotion readiness invariant is not satisfied: "
+                + ",".join(readiness_errors)
+            )
         for name, value in (
             ("candidate_hash", candidate_hash),
             ("pass_report_hash", pass_report_hash),
@@ -6756,11 +7710,19 @@ class PromotionController:
                 report.candidate_hash != candidate_hash
                 or report.tested_champion_hash != tested_champion
                 or report.original_hash != self.runtime.controller.original_hash
+                or report.policy_hash != self.runtime.controller.policy_hash
+                or report.evaluation_key != candidate.evaluation_key
             ):
                 raise SafetyHalt("promotion report identity is stale")
             if (
                 report_value.get("selfplay_config_hash")
                 != self.runtime.controller.selfplay_config_hash
+                or report_value.get("policy_version")
+                != self.runtime.frozen_policy.get("policy_version")
+                or report_value.get("suite_manifest_path")
+                != str(self.runtime.suites / "manifest.json")
+                or report_value.get("suite_manifest_hash")
+                != self.runtime.controller.suite_manifest_hash
                 or report_value.get("topology") != "7-workers-100-threads"
                 or not _SHA_RE.fullmatch(
                     str(report_value.get("gpu_handoff_hash", ""))

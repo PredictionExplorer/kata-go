@@ -17,6 +17,12 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from risk_score.board_symmetry import (
+    inverse_transform_gtp_location,
+    shape_preserving_symmetries,
+    symmetry_orbit,
+    symmetry_orbit_sha256,
+)
 from risk_score.build_evaluation_suites import ALL_LABELS
 from risk_score.paired_stats import load_policy
 from risk_score.position_samples import (
@@ -39,6 +45,44 @@ LABELING_CONTRACT = "risk-score-position-bank-labeling-v1"
 SCORE_PREFILTER_CONTRACT = "risk-score-position-score-prefilter-v1"
 COMBINED_LABELING_CONTRACT = "risk-score-position-bank-combined-labeling-v1"
 FINAL_MANIFEST_CONTRACT = "risk-score-reviewed-position-bank-v1"
+CONSENSUS_QUERY_BUNDLE_CONTRACT = "risk-score-position-analysis-query-bundle-v2"
+CONSENSUS_LABELING_CONTRACT = "risk-score-position-bank-labeling-v2"
+CONSENSUS_COMBINED_LABELING_CONTRACT = "risk-score-position-bank-combined-labeling-v2"
+CONSENSUS_FINAL_MANIFEST_CONTRACT = "risk-score-reviewed-position-bank-v2"
+MACHINE_CONSENSUS_REVIEW_MODE = "machine-consensus"
+CONSENSUS_RULES_VERSION = 1
+CONSENSUS_ALLOWED_LABELS = frozenset({"ordinary", "lead-40", "lead-80"})
+CONSENSUS_VISITS = (2000, 8000)
+CONSENSUS_MODELS = ("original", "champion")
+CONSENSUS_SEARCH_MODES = ("standard", "powered")
+CONSENSUS_REJECTION_REASONS = (
+    "visit_unstable",
+    "model_disagreement",
+    "symmetry_disagreement",
+    "top_move_disagreement",
+    "threshold_boundary",
+    "specialized_signal",
+    "label_unclassifiable",
+)
+# Explicit version aliases make contract selection unambiguous to API callers.
+QUERY_BUNDLE_CONTRACT_V2 = CONSENSUS_QUERY_BUNDLE_CONTRACT
+LABELING_CONTRACT_V2 = CONSENSUS_LABELING_CONTRACT
+COMBINED_LABELING_CONTRACT_V2 = CONSENSUS_COMBINED_LABELING_CONTRACT
+FINAL_MANIFEST_CONTRACT_V2 = CONSENSUS_FINAL_MANIFEST_CONTRACT
+QUERY_BUNDLE_V2_CONTRACT = CONSENSUS_QUERY_BUNDLE_CONTRACT
+LABELING_V2_CONTRACT = CONSENSUS_LABELING_CONTRACT
+COMBINED_LABELING_V2_CONTRACT = CONSENSUS_COMBINED_LABELING_CONTRACT
+FINAL_MANIFEST_V2_CONTRACT = CONSENSUS_FINAL_MANIFEST_CONTRACT
+MACHINE_REVIEW_MODE = MACHINE_CONSENSUS_REVIEW_MODE
+MACHINE_REVIEW_LABELS = CONSENSUS_ALLOWED_LABELS
+QUERY_BUNDLE_CONSENSUS_CONTRACT = CONSENSUS_QUERY_BUNDLE_CONTRACT
+LABELING_CONSENSUS_CONTRACT = CONSENSUS_LABELING_CONTRACT
+COMBINED_LABELING_CONSENSUS_CONTRACT = CONSENSUS_COMBINED_LABELING_CONTRACT
+FINAL_MANIFEST_CONSENSUS_CONTRACT = CONSENSUS_FINAL_MANIFEST_CONTRACT
+ALLOWED_CONSENSUS_LABELS = CONSENSUS_ALLOWED_LABELS
+EMITTED_LABELS = CONSENSUS_ALLOWED_LABELS
+CONSENSUS_REVIEW_MODE = MACHINE_CONSENSUS_REVIEW_MODE
+CONSENSUS_LABELS = CONSENSUS_ALLOWED_LABELS
 REVIEW_ONLY_LABELS = frozenset(
     {
         "tactical",
@@ -819,6 +863,271 @@ def generate_query_bundle(
     return manifest
 
 
+def _machine_curation_policy(policy: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Validate and return the frozen v3 machine-curation declaration."""
+
+    policy_version = policy.get("policy_version")
+    if (
+        policy.get("schema_version") != 3
+        or not isinstance(policy_version, str)
+        or not policy_version.startswith("risk-seeking-checkpoint-promotion-v3")
+    ):
+        raise ValueError("machine-consensus curation requires a v3 promotion policy")
+    declaration = policy.get("machine_curation")
+    if declaration is None:
+        declaration = policy.get("machine_curation_contract")
+    if not isinstance(declaration, Mapping):
+        raise ValueError("v3 promotion policy has no machine_curation contract")
+    final_contract = declaration.get(
+        "final_manifest_contract", declaration.get("final_contract")
+    )
+    if (
+        final_contract != CONSENSUS_FINAL_MANIFEST_CONTRACT
+        or declaration.get("review_mode") != MACHINE_CONSENSUS_REVIEW_MODE
+        or declaration.get("consensus_rules_version") != CONSENSUS_RULES_VERSION
+        or declaration.get("stability_margin") != 5.0
+        or not isinstance(declaration.get("allowed_labels"), list)
+        or any(
+            not isinstance(label, str)
+            for label in declaration.get("allowed_labels", [])
+        )
+        or set(declaration["allowed_labels"]) != CONSENSUS_ALLOWED_LABELS
+        or len(declaration["allowed_labels"]) != len(CONSENSUS_ALLOWED_LABELS)
+        or not isinstance(declaration.get("model_roles"), list)
+        or any(
+            not isinstance(model_role, str)
+            for model_role in declaration.get("model_roles", [])
+        )
+        or set(declaration["model_roles"]) != {"immutable_original", "frozen_champion"}
+        or len(declaration["model_roles"]) != 2
+        or not isinstance(declaration.get("search_modes"), list)
+        or any(
+            not isinstance(mode, str) for mode in declaration.get("search_modes", [])
+        )
+        or set(declaration["search_modes"]) != set(CONSENSUS_SEARCH_MODES)
+        or len(declaration["search_modes"]) != len(CONSENSUS_SEARCH_MODES)
+        or declaration.get("visits") != list(CONSENSUS_VISITS)
+        or declaration.get("symmetry_semantics") != "katago-shape-preserving-d4-v1"
+        or declaration.get("automatic_promotion_requires_transitive_suite_provenance")
+        is not True
+    ):
+        raise ValueError("v3 machine_curation declaration is not the frozen contract")
+    return declaration
+
+
+def _consensus_role_specs() -> List[Tuple[str, str, str, bool, int]]:
+    return [
+        (
+            f"{model}/{mode}-{visits}",
+            model,
+            mode,
+            mode == "powered",
+            visits,
+        )
+        for model in CONSENSUS_MODELS
+        for mode in CONSENSUS_SEARCH_MODES
+        for visits in CONSENSUS_VISITS
+    ]
+
+
+def _consensus_query_id(
+    canonical_semantic_sha256: str,
+    symmetry: int,
+) -> str:
+    return f"{canonical_semantic_sha256}@{symmetry}"
+
+
+def _consensus_orbits(
+    positions: Sequence[Mapping[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    orbits = []
+    transformed_by_id: Dict[str, Dict[str, Any]] = {}
+    seen_orbits: Dict[str, str] = {}
+    for raw_position in positions:
+        canonical_hash = raw_position["semanticSha256"]
+        position = normalize_position_sample(
+            raw_position, f"consensus position {canonical_hash}"
+        )
+        entries = []
+        for symmetry, transformed in symmetry_orbit(position):
+            normalized_transformed = normalize_position_sample(
+                transformed,
+                f"consensus position {canonical_hash} symmetry {symmetry}",
+            )
+            transformed_hash = semantic_position_sha256(normalized_transformed)
+            query_id = _consensus_query_id(canonical_hash, symmetry)
+            if query_id in transformed_by_id:
+                raise ValueError("consensus symmetry expansion produced a duplicate ID")
+            transformed_by_id[query_id] = normalized_transformed
+            entries.append(
+                {
+                    "symmetry": symmetry,
+                    "transformed_semantic_sha256": transformed_hash,
+                    "query_id": query_id,
+                }
+            )
+        allowed_symmetries = shape_preserving_symmetries(
+            position["xSize"], position["ySize"]
+        )
+        if not entries or len(entries) > len(allowed_symmetries):
+            raise ValueError("consensus symmetry orbit is malformed")
+        orbit_identity = symmetry_orbit_sha256(position)
+        previous = seen_orbits.get(orbit_identity)
+        if previous is not None:
+            raise ValueError(
+                "consensus source positions share a symmetry orbit: "
+                f"{previous}, {canonical_hash}"
+            )
+        seen_orbits[orbit_identity] = canonical_hash
+        orbit = {
+            "canonical_semantic_sha256": canonical_hash,
+            "symmetry_orbit_sha256": orbit_identity,
+            "x_size": position["xSize"],
+            "y_size": position["ySize"],
+            "shape_preserving_symmetry_count": len(allowed_symmetries),
+            "distinct_symmetry_count": len(entries),
+            "entries": entries,
+            "entries_sha256": canonical_sha256(entries),
+        }
+        orbits.append(orbit)
+    return orbits, transformed_by_id
+
+
+def generate_consensus_query_bundle(
+    normalized: Path,
+    output: Path,
+    katago: Path,
+    config: Path,
+    original_model: Path,
+    champion_model: Path,
+    policy: Path,
+) -> Mapping[str, Any]:
+    """Publish the immutable two-model, full-orbit consensus query bundle."""
+
+    normalized = Path(normalized)
+    output = Path(output)
+    katago = Path(katago)
+    config = Path(config)
+    policy = Path(policy)
+    model_paths = {
+        "original": Path(original_model),
+        "champion": Path(champion_model),
+    }
+    frozen_paths = {
+        "normalized positions": normalized,
+        "KataGo binary": katago,
+        "analysis config": config,
+        "original model": model_paths["original"],
+        "champion model": model_paths["champion"],
+        "promotion policy": policy,
+    }
+    for role, source in frozen_paths.items():
+        if source.is_symlink() or not source.is_file():
+            raise ValueError(f"{role} must be a regular non-symlink file")
+    if model_paths["original"].resolve() == model_paths["champion"].resolve():
+        raise ValueError("original and champion models must be distinct files")
+    validate_deterministic_analysis_config(config)
+    active_policy = load_policy(policy)
+    machine_curation = _machine_curation_policy(active_policy)
+    positions = _normalized_positions(normalized)
+    orbits, transformed_by_id = _consensus_orbits(positions)
+    ordered_query_ids = [
+        entry["query_id"] for orbit in orbits for entry in orbit["entries"]
+    ]
+    if len(ordered_query_ids) != len(set(ordered_query_ids)):
+        raise ValueError("consensus query IDs are not unique")
+
+    frozen_hashes = {role: file_sha256(source) for role, source in frozen_paths.items()}
+    if frozen_hashes["original model"] == frozen_hashes["champion model"]:
+        raise ValueError("original and champion models must have distinct hashes")
+    if frozen_hashes["original model"] == frozen_hashes["champion model"]:
+        raise ValueError("original and champion models must have distinct hashes")
+    models = {
+        "original": {
+            "role": "immutable_original",
+            "path": str(model_paths["original"].resolve()),
+            "sha256": frozen_hashes["original model"],
+        },
+        "champion": {
+            "role": "frozen_champion",
+            "path": str(model_paths["champion"].resolve()),
+            "sha256": frozen_hashes["champion model"],
+        },
+    }
+    files: Dict[str, bytes] = {}
+    query_manifest = {}
+    for role, model, mode, powered, visits in _consensus_role_specs():
+        rows = [
+            build_analysis_query(
+                transformed_by_id[query_id],
+                query_id=query_id,
+                max_visits=visits,
+                powered=powered,
+            )
+            for query_id in ordered_query_ids
+        ]
+        relative = f"queries/{role}.jsonl"
+        data = _canonical_jsonl(rows)
+        files[relative] = data
+        query_manifest[role] = {
+            "path": relative,
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "row_count": len(rows),
+            "ids_sha256": canonical_sha256(ordered_query_ids),
+            "model": model,
+            "model_sha256": models[model]["sha256"],
+            "mode": mode,
+            "powered": powered,
+            "visits": visits,
+        }
+
+    manifest = {
+        "schema_version": 2,
+        "contract": CONSENSUS_QUERY_BUNDLE_CONTRACT,
+        "review_mode": MACHINE_CONSENSUS_REVIEW_MODE,
+        "consensus_rules_version": CONSENSUS_RULES_VERSION,
+        "allowed_labels": sorted(CONSENSUS_ALLOWED_LABELS),
+        "normalized_path": str(normalized.resolve()),
+        "normalized_sha256": frozen_hashes["normalized positions"],
+        "katago_path": str(katago.resolve()),
+        "katago_sha256": frozen_hashes["KataGo binary"],
+        "analysis_config_path": str(config.resolve()),
+        "analysis_config_sha256": frozen_hashes["analysis config"],
+        "models": models,
+        "policy_path": str(policy.resolve()),
+        "policy_sha256": frozen_hashes["promotion policy"],
+        "policy_hash": canonical_sha256(active_policy),
+        "symmetry_semantics": "katago-shape-preserving-d4-v1",
+        "visit_roles": [
+            f"{mode}-{visits}"
+            for mode in CONSENSUS_SEARCH_MODES
+            for visits in CONSENSUS_VISITS
+        ],
+        "position_count": len(positions),
+        "semantic_hashes_sha256": canonical_sha256(
+            [position["semanticSha256"] for position in positions]
+        ),
+        "expanded_position_count": len(ordered_query_ids),
+        "orbit_member_count": len(ordered_query_ids),
+        "query_ids_sha256": canonical_sha256(ordered_query_ids),
+        "orbits": orbits,
+        "orbit_metadata_sha256": canonical_sha256(orbits),
+        "queries": query_manifest,
+    }
+    manifest["manifest_sha256"] = canonical_sha256(manifest)
+    files["manifest.json"] = (canonical_json(manifest) + "\n").encode("utf-8")
+
+    for role, source in frozen_paths.items():
+        if (
+            source.is_symlink()
+            or not source.is_file()
+            or file_sha256(source) != frozen_hashes[role]
+        ):
+            raise ValueError(f"{role} changed while generating consensus queries")
+    _publish_bundle(output, files)
+    return manifest
+
+
 def run_analysis(
     *,
     katago: Path,
@@ -1239,14 +1548,14 @@ def _analysis_map(path: Path, expected_ids: Iterable[str], role: str) -> Dict[st
 
 
 def _validate_manifest(
-    path: Path, role: str, *, contract: str
+    path: Path, role: str, *, contract: str, schema_version: int = 1
 ) -> Tuple[Dict[str, Any], str]:
     manifest = _load_json(Path(path), role)
     payload = dict(manifest)
     identity = payload.pop("manifest_sha256", None)
     if (
         type(manifest.get("schema_version")) is not int
-        or manifest.get("schema_version") != 1
+        or manifest.get("schema_version") != schema_version
         or manifest.get("contract") != contract
         or identity != canonical_sha256(payload)
     ):
@@ -1740,6 +2049,644 @@ def label_positions(
     return manifest
 
 
+def _validate_consensus_query_bundle(
+    normalized_path: Path,
+    query_manifest_path: Path,
+) -> Dict[str, Any]:
+    normalized_path = Path(normalized_path)
+    query_manifest_path = Path(query_manifest_path)
+    positions = _normalized_positions(normalized_path)
+    position_ids = [position["semanticSha256"] for position in positions]
+    manifest, identity = _validate_manifest(
+        query_manifest_path,
+        "consensus query manifest",
+        contract=CONSENSUS_QUERY_BUNDLE_CONTRACT,
+        schema_version=2,
+    )
+    if (
+        manifest.get("review_mode") != MACHINE_CONSENSUS_REVIEW_MODE
+        or manifest.get("consensus_rules_version") != CONSENSUS_RULES_VERSION
+        or manifest.get("allowed_labels") != sorted(CONSENSUS_ALLOWED_LABELS)
+        or manifest.get("symmetry_semantics") != "katago-shape-preserving-d4-v1"
+        or manifest.get("visit_roles")
+        != [
+            f"{mode}-{visits}"
+            for mode in CONSENSUS_SEARCH_MODES
+            for visits in CONSENSUS_VISITS
+        ]
+        or manifest.get("normalized_path") != str(normalized_path.resolve())
+        or manifest.get("normalized_sha256") != file_sha256(normalized_path)
+        or manifest.get("position_count") != len(positions)
+        or manifest.get("semantic_hashes_sha256") != canonical_sha256(position_ids)
+    ):
+        raise ValueError("consensus query manifest names another normalized bundle")
+
+    katago_path = _manifest_bound_file(
+        manifest,
+        path_key="katago_path",
+        hash_key="katago_sha256",
+        role="KataGo binary",
+    )
+    config_path = _manifest_bound_file(
+        manifest,
+        path_key="analysis_config_path",
+        hash_key="analysis_config_sha256",
+        role="analysis config",
+    )
+    policy_path = _manifest_bound_file(
+        manifest,
+        path_key="policy_path",
+        hash_key="policy_sha256",
+        role="promotion policy",
+    )
+    validate_deterministic_analysis_config(config_path)
+    active_policy = load_policy(policy_path)
+    machine_curation = _machine_curation_policy(active_policy)
+    if manifest.get("policy_hash") != canonical_sha256(active_policy):
+        raise ValueError("promotion policy changed after consensus query generation")
+
+    raw_models = manifest.get("models")
+    if not isinstance(raw_models, Mapping) or set(raw_models) != set(CONSENSUS_MODELS):
+        raise ValueError("consensus query model inventory is malformed")
+    model_paths = {}
+    expected_model_roles = {
+        "original": "immutable_original",
+        "champion": "frozen_champion",
+    }
+    for model in CONSENSUS_MODELS:
+        spec = raw_models[model]
+        if not isinstance(spec, Mapping) or set(spec) != {"role", "path", "sha256"}:
+            raise ValueError(f"consensus {model} model binding is malformed")
+        if spec.get("role") != expected_model_roles[model]:
+            raise ValueError(f"consensus {model} model role is invalid")
+        path_value = spec.get("path")
+        model_hash = _require_sha256(
+            spec.get("sha256"), f"consensus {model} model hash"
+        )
+        if not isinstance(path_value, str) or not path_value:
+            raise ValueError(f"consensus {model} model path is missing")
+        model_path = Path(path_value)
+        if (
+            not model_path.is_absolute()
+            or str(model_path.resolve()) != path_value
+            or model_path.is_symlink()
+            or not model_path.is_file()
+            or file_sha256(model_path) != model_hash
+        ):
+            raise ValueError(f"consensus {model} model changed")
+        model_paths[model] = model_path
+    if model_paths["original"].resolve() == model_paths["champion"].resolve():
+        raise ValueError("consensus query models are not independent files")
+    if raw_models["original"]["sha256"] == raw_models["champion"]["sha256"]:
+        raise ValueError("consensus query model hashes are not independent")
+    if raw_models["original"]["sha256"] == raw_models["champion"]["sha256"]:
+        raise ValueError("consensus query model hashes are not independent")
+
+    orbits, transformed_by_id = _consensus_orbits(positions)
+    query_ids = [entry["query_id"] for orbit in orbits for entry in orbit["entries"]]
+    if (
+        manifest.get("orbits") != orbits
+        or manifest.get("orbit_metadata_sha256") != canonical_sha256(orbits)
+        or manifest.get("expanded_position_count") != len(query_ids)
+        or manifest.get("orbit_member_count") != len(query_ids)
+        or manifest.get("query_ids_sha256") != canonical_sha256(query_ids)
+    ):
+        raise ValueError("consensus symmetry orbit metadata changed")
+
+    queries = manifest.get("queries")
+    expected_specs = {
+        role: (model, mode, powered, visits)
+        for role, model, mode, powered, visits in _consensus_role_specs()
+    }
+    if not isinstance(queries, Mapping) or set(queries) != set(expected_specs):
+        raise ValueError("consensus query inventory must contain exactly eight roles")
+    query_rows = {}
+    query_paths = {}
+    frozen_files: List[Tuple[Path, str, str]] = [
+        (normalized_path, manifest["normalized_sha256"], "normalized positions"),
+        (
+            query_manifest_path,
+            file_sha256(query_manifest_path),
+            "consensus query manifest",
+        ),
+        (katago_path, manifest["katago_sha256"], "KataGo binary"),
+        (
+            config_path,
+            manifest["analysis_config_sha256"],
+            "analysis config",
+        ),
+        (policy_path, manifest["policy_sha256"], "promotion policy"),
+        (
+            model_paths["original"],
+            raw_models["original"]["sha256"],
+            "original model",
+        ),
+        (
+            model_paths["champion"],
+            raw_models["champion"]["sha256"],
+            "champion model",
+        ),
+    ]
+    bundle_root = query_manifest_path.parent.resolve()
+    for role, (model, mode, powered, visits) in expected_specs.items():
+        artifact = queries[role]
+        expected_keys = {
+            "path",
+            "sha256",
+            "row_count",
+            "ids_sha256",
+            "model",
+            "model_sha256",
+            "mode",
+            "powered",
+            "visits",
+        }
+        if not isinstance(artifact, Mapping) or set(artifact) != expected_keys:
+            raise ValueError(f"consensus query role {role} is malformed")
+        relative = artifact.get("path")
+        query_hash = _require_sha256(
+            artifact.get("sha256"), f"consensus query {role} hash"
+        )
+        if (
+            artifact.get("row_count") != len(query_ids)
+            or artifact.get("ids_sha256") != canonical_sha256(query_ids)
+            or artifact.get("model") != model
+            or artifact.get("model_sha256") != raw_models[model]["sha256"]
+            or artifact.get("mode") != mode
+            or artifact.get("powered") is not powered
+            or artifact.get("visits") != visits
+            or not isinstance(relative, str)
+            or not relative
+            or Path(relative).is_absolute()
+            or ".." in Path(relative).parts
+        ):
+            raise ValueError(f"consensus query role {role} coordinates changed")
+        query_path = query_manifest_path.parent / relative
+        if (
+            query_path.is_symlink()
+            or not query_path.is_file()
+            or not _is_within(query_path, bundle_root)
+            or file_sha256(query_path) != query_hash
+        ):
+            raise ValueError(f"consensus query role {role} artifact changed")
+        expected_rows = [
+            build_analysis_query(
+                transformed_by_id[query_id],
+                query_id=query_id,
+                max_visits=visits,
+                powered=powered,
+            )
+            for query_id in query_ids
+        ]
+        if query_path.read_bytes() != _canonical_jsonl(expected_rows):
+            raise ValueError(f"consensus query role {role} content changed")
+        query_rows[role] = expected_rows
+        query_paths[role] = query_path
+        frozen_files.append((query_path, query_hash, f"{role} queries"))
+    return {
+        "positions": positions,
+        "position_by_id": {
+            position["semanticSha256"]: position for position in positions
+        },
+        "manifest": manifest,
+        "manifest_identity": identity,
+        "manifest_file_sha256": file_sha256(query_manifest_path),
+        "manifest_path": query_manifest_path,
+        "orbits": orbits,
+        "query_ids": query_ids,
+        "query_rows": query_rows,
+        "query_paths": query_paths,
+        "model_paths": model_paths,
+        "machine_curation": machine_curation,
+        "frozen_files": frozen_files,
+    }
+
+
+def _canonical_consensus_move(
+    move: str,
+    *,
+    x_size: int,
+    y_size: int,
+    symmetry: int,
+) -> str:
+    mapped = inverse_transform_gtp_location(move, x_size, y_size, symmetry).strip()
+    lowered = mapped.lower()
+    if lowered in {"pass", "pss"}:
+        return "pass"
+    if lowered == "null":
+        return "null"
+    return mapped.upper()
+
+
+def _buffered_consensus_label(score: float) -> Optional[str]:
+    if abs(score) < 25.0:
+        return "ordinary"
+    if 45.0 <= score < 75.0:
+        return "lead-40"
+    if score >= 85.0:
+        return "lead-80"
+    return None
+
+
+def _is_threshold_boundary(score: float) -> bool:
+    return (
+        abs(abs(score) - 30.0) <= 5.0
+        or abs(score - 40.0) <= 5.0
+        or abs(score - 80.0) <= 5.0
+    )
+
+
+def label_positions_consensus(
+    *,
+    normalized_path: Path,
+    query_manifest_path: Path,
+    analysis_paths: Mapping[str, Path],
+    output_dir: Path,
+    stability_margin: float = 5.0,
+) -> Mapping[str, Any]:
+    """Classify only unanimous, provenance-complete machine-consensus rows."""
+
+    margin = _finite(stability_margin, "consensus stability margin")
+    if margin < 0:
+        raise ValueError("consensus stability margin must be nonnegative")
+    context = _validate_consensus_query_bundle(
+        Path(normalized_path), Path(query_manifest_path)
+    )
+    if margin != context["machine_curation"]["stability_margin"]:
+        raise ValueError(
+            "consensus stability margin differs from the frozen v3 policy"
+        )
+    queries = context["manifest"]["queries"]
+    if not isinstance(analysis_paths, Mapping) or set(analysis_paths) != set(queries):
+        raise ValueError(
+            "consensus analysis paths must exactly match the eight query roles"
+        )
+
+    analyses = {}
+    analysis_manifest = {}
+    frozen_files = list(context["frozen_files"])
+    for role in sorted(queries):
+        path = Path(analysis_paths[role])
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"{role} analysis must be a regular non-symlink file")
+        rows = _load_jsonl(path, f"{role} consensus analysis")
+        by_id = {}
+        for row in rows:
+            record_id = row.get("id")
+            if (
+                not isinstance(record_id, str)
+                or not record_id
+                or record_id in by_id
+                or "error" in row
+            ):
+                raise ValueError(f"{role} analysis IDs or results are invalid")
+            by_id[record_id] = row
+        if set(by_id) != set(context["query_ids"]):
+            raise ValueError(f"{role} analysis IDs do not match the query orbit")
+        canonical_result = _canonical_jsonl(
+            by_id[record_id] for record_id in sorted(by_id)
+        )
+        if path.read_bytes() != canonical_result:
+            raise ValueError(f"{role} analysis must be canonical and ID-sorted")
+        result_hash = file_sha256(path)
+        execution_path = Path(str(path) + ".manifest.json")
+        execution, execution_identity = _validate_manifest(
+            execution_path,
+            f"{role} analysis run manifest",
+            contract=ANALYSIS_RUN_CONTRACT,
+        )
+        artifact = queries[role]
+        model = artifact["model"]
+        if (
+            execution.get("katago_sha256") != context["manifest"].get("katago_sha256")
+            or execution.get("config_sha256")
+            != context["manifest"].get("analysis_config_sha256")
+            or execution.get("model_sha256")
+            != context["manifest"]["models"][model]["sha256"]
+            or execution.get("query_path")
+            != str(context["query_paths"][role].resolve())
+            or execution.get("query_sha256") != artifact["sha256"]
+            or execution.get("output_path") != str(path.resolve())
+            or execution.get("output_sha256") != result_hash
+            or type(execution.get("row_count")) is not int
+            or execution.get("row_count") != len(by_id)
+        ):
+            raise ValueError(f"{role} analysis run provenance changed")
+        analyses[role] = by_id
+        execution_file_hash = file_sha256(execution_path)
+        analysis_manifest[role] = {
+            "path": str(path.resolve()),
+            "sha256": result_hash,
+            "row_count": len(by_id),
+            "execution_manifest": {
+                "path": str(execution_path.resolve()),
+                "sha256": execution_file_hash,
+                "identity": execution_identity,
+            },
+        }
+        frozen_files.extend(
+            (
+                (path, result_hash, f"{role} analysis"),
+                (
+                    execution_path,
+                    execution_file_hash,
+                    f"{role} analysis run manifest",
+                ),
+            )
+        )
+
+    orbit_by_id = {
+        orbit["canonical_semantic_sha256"]: orbit for orbit in context["orbits"]
+    }
+    role_specs = {
+        role: (model, mode, powered, visits)
+        for role, model, mode, powered, visits in _consensus_role_specs()
+    }
+    machine_rows = []
+    rejected_rows = []
+    for semantic_hash in sorted(context["position_by_id"]):
+        position = normalize_position_sample(
+            context["position_by_id"][semantic_hash],
+            f"consensus normalized {semantic_hash}",
+        )
+        orbit = orbit_by_id[semantic_hash]
+        records = []
+        by_slice = {}
+        for role in sorted(role_specs):
+            model, mode, _, requested_visits = role_specs[role]
+            for entry in orbit["entries"]:
+                query_id = entry["query_id"]
+                symmetry = entry["symmetry"]
+                feature = analysis_features(
+                    analyses[role][query_id],
+                    f"{role} {query_id}",
+                    expected_visits=requested_visits,
+                )
+                transformed_move = feature["top_move"]
+                canonical_move = _canonical_consensus_move(
+                    transformed_move,
+                    x_size=position["xSize"],
+                    y_size=position["ySize"],
+                    symmetry=symmetry,
+                )
+                canonical_feature = {
+                    **feature,
+                    "top_move": canonical_move,
+                    "transformed_top_move": transformed_move,
+                }
+                record = {
+                    "model": model,
+                    "mode": mode,
+                    "requested_visits": requested_visits,
+                    "symmetry": symmetry,
+                    "query_id": query_id,
+                    "features": canonical_feature,
+                }
+                records.append(record)
+                by_slice[(model, mode, requested_visits, query_id)] = record
+
+        reasons = set()
+        score_ranges = {}
+        for mode in CONSENSUS_SEARCH_MODES:
+            scores = [
+                record["features"]["score_lead"]
+                for record in records
+                if record["mode"] == mode
+            ]
+            score_ranges[mode] = {
+                "minimum": min(scores),
+                "maximum": max(scores),
+                "spread": max(scores) - min(scores),
+            }
+
+        dimension_spreads = {
+            "visit_unstable": 0.0,
+            "model_disagreement": 0.0,
+            "symmetry_disagreement": 0.0,
+        }
+        for model in CONSENSUS_MODELS:
+            for mode in CONSENSUS_SEARCH_MODES:
+                for entry in orbit["entries"]:
+                    scores = [
+                        by_slice[(model, mode, visits, entry["query_id"])]["features"][
+                            "score_lead"
+                        ]
+                        for visits in CONSENSUS_VISITS
+                    ]
+                    dimension_spreads["visit_unstable"] = max(
+                        dimension_spreads["visit_unstable"],
+                        max(scores) - min(scores),
+                    )
+        for mode in CONSENSUS_SEARCH_MODES:
+            for visits in CONSENSUS_VISITS:
+                for entry in orbit["entries"]:
+                    scores = [
+                        by_slice[(model, mode, visits, entry["query_id"])]["features"][
+                            "score_lead"
+                        ]
+                        for model in CONSENSUS_MODELS
+                    ]
+                    dimension_spreads["model_disagreement"] = max(
+                        dimension_spreads["model_disagreement"],
+                        max(scores) - min(scores),
+                    )
+        for model in CONSENSUS_MODELS:
+            for mode in CONSENSUS_SEARCH_MODES:
+                for visits in CONSENSUS_VISITS:
+                    scores = [
+                        by_slice[(model, mode, visits, entry["query_id"])]["features"][
+                            "score_lead"
+                        ]
+                        for entry in orbit["entries"]
+                    ]
+                    dimension_spreads["symmetry_disagreement"] = max(
+                        dimension_spreads["symmetry_disagreement"],
+                        max(scores) - min(scores),
+                    )
+        for reason, spread in dimension_spreads.items():
+            if spread > margin:
+                reasons.add(reason)
+        if any(
+            item["spread"] > margin for item in score_ranges.values()
+        ) and not reasons.intersection(dimension_spreads):
+            largest_dimension_spread = max(dimension_spreads.values())
+            for reason, spread in dimension_spreads.items():
+                if spread == largest_dimension_spread:
+                    reasons.add(reason)
+
+        canonical_moves = sorted({record["features"]["top_move"] for record in records})
+        if len(canonical_moves) != 1:
+            reasons.add("top_move_disagreement")
+
+        specialized_signals = []
+        for model in CONSENSUS_MODELS:
+            for visits in CONSENSUS_VISITS:
+                for entry in orbit["entries"]:
+                    standard = by_slice[(model, "standard", visits, entry["query_id"])][
+                        "features"
+                    ]
+                    powered = by_slice[(model, "powered", visits, entry["query_id"])][
+                        "features"
+                    ]
+                    suggestions = _suggest_specialized(standard, powered)
+                    if suggestions:
+                        specialized_signals.append(
+                            {
+                                "model": model,
+                                "visits": visits,
+                                "symmetry": entry["symmetry"],
+                                "query_id": entry["query_id"],
+                                "labels": suggestions,
+                            }
+                        )
+        if specialized_signals:
+            reasons.add("specialized_signal")
+
+        standard_scores = [
+            record["features"]["score_lead"]
+            for record in records
+            if record["mode"] == "standard"
+        ]
+        labels = [_buffered_consensus_label(score) for score in standard_scores]
+        for score, label in zip(standard_scores, labels):
+            if label is None:
+                reasons.add(
+                    "threshold_boundary"
+                    if _is_threshold_boundary(score)
+                    else "label_unclassifiable"
+                )
+        valid_labels = {label for label in labels if label is not None}
+        consensus_label = (
+            next(iter(valid_labels))
+            if len(valid_labels) == 1 and all(label is not None for label in labels)
+            else None
+        )
+        if len(valid_labels) > 1:
+            reasons.add("label_unclassifiable")
+
+        records.sort(
+            key=lambda item: (
+                item["model"],
+                item["mode"],
+                item["requested_visits"],
+                item["symmetry"],
+                item["query_id"],
+            )
+        )
+        consensus = {
+            "stability_margin": margin,
+            "score_ranges": score_ranges,
+            "dimension_score_spreads": dimension_spreads,
+            "canonical_top_moves": canonical_moves,
+            "specialized_signals": specialized_signals,
+            "analyses": records,
+        }
+        ordered_reasons = [
+            reason for reason in CONSENSUS_REJECTION_REASONS if reason in reasons
+        ]
+        if not ordered_reasons and consensus_label is not None:
+            machine_rows.append(
+                {
+                    **position,
+                    "labels": [consensus_label],
+                    "curation": {
+                        "classification": "machine-reviewed",
+                        "review_mode": MACHINE_CONSENSUS_REVIEW_MODE,
+                        "consensus_rules_version": CONSENSUS_RULES_VERSION,
+                        "semanticSha256": semantic_hash,
+                        "symmetryOrbitSha256": orbit["symmetry_orbit_sha256"],
+                        "query_manifest_identity": context["manifest_identity"],
+                        "models": {
+                            f"{model}_sha256": context["manifest"]["models"][model][
+                                "sha256"
+                            ]
+                            for model in CONSENSUS_MODELS
+                        },
+                        "consensus": consensus,
+                    },
+                }
+            )
+        else:
+            if not ordered_reasons:
+                ordered_reasons = ["label_unclassifiable"]
+            rejected_rows.append(
+                {
+                    "semantic_sha256": semantic_hash,
+                    "canonical_semantic_sha256": semantic_hash,
+                    "symmetry_orbit_sha256": orbit["symmetry_orbit_sha256"],
+                    "classification": "rejected",
+                    "review_mode": MACHINE_CONSENSUS_REVIEW_MODE,
+                    "consensus_rules_version": CONSENSUS_RULES_VERSION,
+                    "position": position,
+                    "reasons": ordered_reasons,
+                    "rejection_reasons": ordered_reasons,
+                    "consensus_label": consensus_label,
+                    "query_manifest_identity": context["manifest_identity"],
+                    "consensus": consensus,
+                }
+            )
+
+    machine_data = _canonical_jsonl(machine_rows)
+    rejected_data = _canonical_jsonl(rejected_rows)
+    manifest = {
+        "schema_version": 2,
+        "contract": CONSENSUS_LABELING_CONTRACT,
+        "review_mode": MACHINE_CONSENSUS_REVIEW_MODE,
+        "consensus_rules_version": CONSENSUS_RULES_VERSION,
+        "allowed_labels": sorted(CONSENSUS_ALLOWED_LABELS),
+        "normalized_path": str(Path(normalized_path).resolve()),
+        "normalized_sha256": context["manifest"]["normalized_sha256"],
+        "query_manifest_path": str(Path(query_manifest_path).resolve()),
+        "query_manifest_sha256": context["manifest_file_sha256"],
+        "query_manifest_identity": context["manifest_identity"],
+        "policy_hash": context["manifest"]["policy_hash"],
+        "models": context["manifest"]["models"],
+        "symmetry_semantics": "katago-shape-preserving-d4-v1",
+        "visit_roles": [
+            f"{mode}-{visits}"
+            for mode in CONSENSUS_SEARCH_MODES
+            for visits in CONSENSUS_VISITS
+        ],
+        "stability_margin": margin,
+        "machine_labeled_count": len(machine_rows),
+        "rejected_count": len(rejected_rows),
+        "review_count": 0,
+        "machine_labeled_sha256": hashlib.sha256(machine_data).hexdigest(),
+        "rejected_sha256": hashlib.sha256(rejected_data).hexdigest(),
+        "rejection_reason_counts": {
+            reason: sum(reason in row["reasons"] for row in rejected_rows)
+            for reason in CONSENSUS_REJECTION_REASONS
+        },
+        "machine_labeled_ids_sha256": canonical_sha256(
+            [row["curation"]["semanticSha256"] for row in machine_rows]
+        ),
+        "rejected_ids_sha256": canonical_sha256(
+            [row["semantic_sha256"] for row in rejected_rows]
+        ),
+        "analysis": analysis_manifest,
+    }
+    manifest["manifest_sha256"] = canonical_sha256(manifest)
+    files = {
+        "machine-labeled.jsonl": machine_data,
+        "rejected.jsonl": rejected_data,
+        "manifest.json": (canonical_json(manifest) + "\n").encode("utf-8"),
+    }
+
+    if _paths_overlap(Path(output_dir), Path(query_manifest_path).parent):
+        raise ValueError(
+            "consensus labeling output may not overlap the immutable query bundle"
+        )
+    for source, expected_hash, role in frozen_files:
+        if (
+            source.is_symlink()
+            or not source.is_file()
+            or file_sha256(source) != expected_hash
+        ):
+            raise ValueError(f"{role} changed while labeling consensus positions")
+    _publish_bundle(Path(output_dir), files)
+    return manifest
+
+
 def _automatic_row_identity(row: Mapping[str, Any], role: str) -> str:
     position = normalize_position_sample(row, role)
     semantic_hash = semantic_position_sha256(position)
@@ -1940,6 +2887,621 @@ def merge_labeling_bundles(
 combine_labeling_bundles = merge_labeling_bundles
 
 
+def _validate_consensus_models(
+    value: Any,
+    role: str,
+) -> Dict[str, Dict[str, Any]]:
+    if not isinstance(value, Mapping) or set(value) != set(CONSENSUS_MODELS):
+        raise ValueError(f"{role} model inventory is invalid")
+    expected_roles = {
+        "original": "immutable_original",
+        "champion": "frozen_champion",
+    }
+    result = {}
+    for model in CONSENSUS_MODELS:
+        spec = value[model]
+        if (
+            not isinstance(spec, Mapping)
+            or set(spec) != {"role", "path", "sha256"}
+            or spec.get("role") != expected_roles[model]
+        ):
+            raise ValueError(f"{role} {model} model binding is invalid")
+        model_hash = _require_sha256(spec.get("sha256"), f"{role} {model} model hash")
+        raw_path = spec.get("path")
+        if not isinstance(raw_path, str) or not raw_path:
+            raise ValueError(f"{role} {model} model path is missing")
+        path = Path(raw_path)
+        if (
+            not path.is_absolute()
+            or str(path.resolve()) != raw_path
+            or path.is_symlink()
+            or not path.is_file()
+            or file_sha256(path) != model_hash
+        ):
+            raise ValueError(f"{role} {model} model changed")
+        result[model] = {
+            "role": expected_roles[model],
+            "path": raw_path,
+            "sha256": model_hash,
+        }
+    if (
+        Path(result["original"]["path"]).resolve()
+        == Path(result["champion"]["path"]).resolve()
+    ):
+        raise ValueError(f"{role} models are not independent files")
+    if result["original"]["sha256"] == result["champion"]["sha256"]:
+        raise ValueError(f"{role} model hashes are not independent")
+    if result["original"]["sha256"] == result["champion"]["sha256"]:
+        raise ValueError(f"{role} model hashes are not independent")
+    return result
+
+
+def _consensus_machine_row_identity(row: Mapping[str, Any], role: str) -> str:
+    position = normalize_position_sample(row, role)
+    semantic_hash = semantic_position_sha256(position)
+    labels = row.get("labels")
+    curation = row.get("curation")
+    row_models = curation.get("models") if isinstance(curation, Mapping) else None
+    if (
+        not isinstance(labels, list)
+        or len(labels) != 1
+        or labels[0] not in CONSENSUS_ALLOWED_LABELS
+        or not isinstance(curation, Mapping)
+        or curation.get("classification") != "machine-reviewed"
+        or curation.get("review_mode") != MACHINE_CONSENSUS_REVIEW_MODE
+        or curation.get("consensus_rules_version") != CONSENSUS_RULES_VERSION
+        or curation.get("semanticSha256") != semantic_hash
+        or not isinstance(curation.get("symmetryOrbitSha256"), str)
+        or len(curation["symmetryOrbitSha256"]) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in curation["symmetryOrbitSha256"]
+        )
+        or curation["symmetryOrbitSha256"]
+        != symmetry_orbit_sha256(position)
+        or not isinstance(row_models, Mapping)
+        or set(row_models) != {"original_sha256", "champion_sha256"}
+        or any(
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+            for value in row_models.values()
+        )
+        or not isinstance(curation.get("consensus"), Mapping)
+    ):
+        raise ValueError(f"{role} is not a valid machine-reviewed row")
+    return semantic_hash
+
+
+def _consensus_rejected_row_identity(row: Mapping[str, Any], role: str) -> str:
+    semantic_hash = row.get("semantic_sha256")
+    position = normalize_position_sample(row, role)
+    reasons = row.get("reasons")
+    if (
+        not isinstance(semantic_hash, str)
+        or row.get("canonical_semantic_sha256") != semantic_hash
+        or semantic_position_sha256(position) != semantic_hash
+        or not isinstance(row.get("symmetry_orbit_sha256"), str)
+        or len(row["symmetry_orbit_sha256"]) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in row["symmetry_orbit_sha256"]
+        )
+        or row["symmetry_orbit_sha256"] != symmetry_orbit_sha256(position)
+        or row.get("classification") != "rejected"
+        or row.get("review_mode") != MACHINE_CONSENSUS_REVIEW_MODE
+        or row.get("consensus_rules_version") != CONSENSUS_RULES_VERSION
+        or not isinstance(reasons, list)
+        or not reasons
+        or any(not isinstance(reason, str) for reason in reasons)
+        or len(reasons) != len(set(reasons))
+        or reasons
+        != [reason for reason in CONSENSUS_REJECTION_REASONS if reason in set(reasons)]
+        or any(reason not in CONSENSUS_REJECTION_REASONS for reason in reasons)
+        or row.get("rejection_reasons") != reasons
+        or not isinstance(row.get("consensus"), Mapping)
+    ):
+        raise ValueError(f"{role} is not a valid deterministic rejection row")
+    return semantic_hash
+
+
+def _load_consensus_labeling_artifacts(
+    *,
+    machine_path: Path,
+    rejected_path: Path,
+    manifest_path: Path,
+    role: str,
+    _visited: Optional[set[Path]] = None,
+) -> Dict[str, Any]:
+    machine_path = Path(machine_path)
+    rejected_path = Path(rejected_path)
+    manifest_path = Path(manifest_path)
+    visited = set() if _visited is None else _visited
+    resolved_manifest = manifest_path.resolve()
+    if resolved_manifest in visited:
+        raise ValueError(f"{role} labeling ancestry is cyclic or duplicated")
+    visited.add(resolved_manifest)
+    for source, source_role in (
+        (machine_path, "machine-labeled positions"),
+        (rejected_path, "rejected positions"),
+        (manifest_path, "labeling manifest"),
+    ):
+        if source.is_symlink() or not source.is_file():
+            raise ValueError(f"{role} {source_role} is missing or unsafe")
+    raw_manifest = _load_json(manifest_path, f"{role} labeling manifest")
+    contract = raw_manifest.get("contract")
+    if contract not in {
+        CONSENSUS_LABELING_CONTRACT,
+        CONSENSUS_COMBINED_LABELING_CONTRACT,
+    }:
+        raise ValueError(f"{role} labeling manifest contract is unsupported")
+    manifest, identity = _validate_manifest(
+        manifest_path,
+        f"{role} labeling manifest",
+        contract=contract,
+        schema_version=2,
+    )
+    if (
+        manifest.get("review_mode") != MACHINE_CONSENSUS_REVIEW_MODE
+        or manifest.get("consensus_rules_version") != CONSENSUS_RULES_VERSION
+        or manifest.get("allowed_labels") != sorted(CONSENSUS_ALLOWED_LABELS)
+        or manifest.get("symmetry_semantics") != "katago-shape-preserving-d4-v1"
+        or manifest.get("visit_roles")
+        != [
+            f"{mode}-{visits}"
+            for mode in CONSENSUS_SEARCH_MODES
+            for visits in CONSENSUS_VISITS
+        ]
+        or manifest.get("review_count") != 0
+    ):
+        raise ValueError(f"{role} labeling manifest is not machine-consensus")
+    policy_hash = _require_sha256(
+        manifest.get("policy_hash"), f"{role} labeling policy hash"
+    )
+    models = _validate_consensus_models(manifest.get("models"), role)
+    margin = _finite(
+        manifest.get("stability_margin"), f"{role} labeling stability margin"
+    )
+    if margin != 5.0:
+        raise ValueError(
+            f"{role} labeling stability margin differs from frozen policy"
+        )
+
+    def require_bound_file(
+        raw_path: Any, raw_hash: Any, bound_role: str
+    ) -> Path:
+        expected_hash = _require_sha256(raw_hash, f"{bound_role} hash")
+        if not isinstance(raw_path, str) or not raw_path:
+            raise ValueError(f"{bound_role} path is missing")
+        source = Path(raw_path)
+        if (
+            not source.is_absolute()
+            or str(source.resolve()) != raw_path
+            or source.is_symlink()
+            or not source.is_file()
+            or file_sha256(source) != expected_hash
+        ):
+            raise ValueError(f"{bound_role} provenance changed")
+        return source
+
+    ancestry_machine: List[Tuple[str, Dict[str, Any]]] = []
+    ancestry_rejected: List[Tuple[str, Dict[str, Any]]] = []
+    if contract == CONSENSUS_LABELING_CONTRACT:
+        normalized_source = require_bound_file(
+            manifest.get("normalized_path"),
+            manifest.get("normalized_sha256"),
+            f"{role} normalized positions",
+        )
+        query_manifest_path = require_bound_file(
+            manifest.get("query_manifest_path"),
+            manifest.get("query_manifest_sha256"),
+            f"{role} consensus query manifest",
+        )
+        query_manifest, query_identity = _validate_manifest(
+            query_manifest_path,
+            f"{role} consensus query manifest",
+            contract=CONSENSUS_QUERY_BUNDLE_CONTRACT,
+            schema_version=2,
+        )
+        if (
+            query_identity != manifest.get("query_manifest_identity")
+            or query_manifest.get("policy_hash") != policy_hash
+            or query_manifest.get("models") != models
+        ):
+            raise ValueError(f"{role} query provenance changed")
+        analysis = manifest.get("analysis")
+        expected_analysis_roles = {
+            spec[0] for spec in _consensus_role_specs()
+        }
+        if not isinstance(analysis, Mapping) or set(analysis) != expected_analysis_roles:
+            raise ValueError(f"{role} analysis provenance is incomplete")
+        analysis_paths = {}
+        for analysis_role, artifact in analysis.items():
+            if not isinstance(artifact, Mapping):
+                raise ValueError(f"{role} {analysis_role} analysis is malformed")
+            analysis_paths[analysis_role] = require_bound_file(
+                artifact.get("path"),
+                artifact.get("sha256"),
+                f"{role} {analysis_role} analysis",
+            )
+            execution = artifact.get("execution_manifest")
+            if not isinstance(execution, Mapping):
+                raise ValueError(
+                    f"{role} {analysis_role} execution provenance is missing"
+                )
+            execution_path = require_bound_file(
+                execution.get("path"),
+                execution.get("sha256"),
+                f"{role} {analysis_role} execution manifest",
+            )
+            _, execution_identity = _validate_manifest(
+                execution_path,
+                f"{role} {analysis_role} execution manifest",
+                contract=ANALYSIS_RUN_CONTRACT,
+            )
+            if execution_identity != execution.get("identity"):
+                raise ValueError(
+                    f"{role} {analysis_role} execution identity changed"
+                )
+        with tempfile.TemporaryDirectory(
+            prefix="risk-score-consensus-revalidate-"
+        ) as temporary:
+            regenerated_root = Path(temporary) / "labeling"
+            label_positions_consensus(
+                normalized_path=normalized_source,
+                query_manifest_path=query_manifest_path,
+                analysis_paths=analysis_paths,
+                output_dir=regenerated_root,
+                stability_margin=margin,
+            )
+            if (
+                (regenerated_root / "machine-labeled.jsonl").read_bytes()
+                != machine_path.read_bytes()
+                or (regenerated_root / "rejected.jsonl").read_bytes()
+                != rejected_path.read_bytes()
+            ):
+                raise ValueError(
+                    f"{role} labels do not match bound analysis results"
+                )
+    else:
+        source_bundles = manifest.get("source_bundles")
+        if (
+            not isinstance(source_bundles, list)
+            or not source_bundles
+            or manifest.get("source_bundle_count") != len(source_bundles)
+            or manifest.get("source_bundles_sha256")
+            != canonical_sha256(source_bundles)
+        ):
+            raise ValueError(f"{role} combined labeling ancestry is incomplete")
+        for index, source_bundle in enumerate(source_bundles):
+            if not isinstance(source_bundle, Mapping):
+                raise ValueError(f"{role} source bundle {index} is malformed")
+            root_value = source_bundle.get("path")
+            if not isinstance(root_value, str) or not root_value:
+                raise ValueError(f"{role} source bundle {index} path is missing")
+            root = Path(root_value)
+            if (
+                not root.is_absolute()
+                or str(root.resolve()) != root_value
+                or root.is_symlink()
+                or not root.is_dir()
+            ):
+                raise ValueError(f"{role} source bundle {index} path is unsafe")
+            nested = _load_consensus_labeling_artifacts(
+                machine_path=root / "machine-labeled.jsonl",
+                rejected_path=root / "rejected.jsonl",
+                manifest_path=root / "manifest.json",
+                role=f"{role} source bundle {index}",
+                _visited=visited,
+            )
+            ancestry_machine.extend(nested["machine"])
+            ancestry_rejected.extend(nested["rejected"])
+            if (
+                source_bundle.get("manifest_path")
+                != str((root / "manifest.json").resolve())
+                or source_bundle.get("manifest_sha256")
+                != nested["manifest_file_sha256"]
+                or source_bundle.get("manifest_identity")
+                != nested["manifest_identity"]
+                or source_bundle.get("machine_labeled_sha256")
+                != nested["machine_sha256"]
+                or source_bundle.get("machine_labeled_count")
+                != len(nested["machine"])
+                or source_bundle.get("rejected_sha256")
+                != nested["rejected_sha256"]
+                or source_bundle.get("rejected_count")
+                != len(nested["rejected"])
+                or nested["policy_hash"] != policy_hash
+                or nested["models"] != models
+                or nested["stability_margin"] != margin
+            ):
+                raise ValueError(
+                    f"{role} source bundle {index} provenance changed"
+                )
+    machine_rows = _load_jsonl(
+        machine_path, f"{role} machine-labeled positions", allow_empty=True
+    )
+    rejected_rows = _load_jsonl(
+        rejected_path, f"{role} rejected positions", allow_empty=True
+    )
+    machine_hash = file_sha256(machine_path)
+    rejected_hash = file_sha256(rejected_path)
+    if (
+        manifest.get("machine_labeled_count") != len(machine_rows)
+        or manifest.get("rejected_count") != len(rejected_rows)
+        or manifest.get("machine_labeled_sha256") != machine_hash
+        or manifest.get("rejected_sha256") != rejected_hash
+    ):
+        raise ValueError(f"{role} labeling file counts or hashes changed")
+
+    machine = []
+    rejected = []
+    seen: Dict[str, str] = {}
+    for index, row in enumerate(machine_rows, start=1):
+        row_role = f"{role} machine-labeled row {index}"
+        semantic_hash = _consensus_machine_row_identity(row, row_role)
+        if row["curation"]["models"] != {
+            f"{model}_sha256": models[model]["sha256"] for model in CONSENSUS_MODELS
+        }:
+            raise ValueError(f"{row_role} names other consensus models")
+        if semantic_hash in seen:
+            raise ValueError(
+                f"{row_role} duplicates semantic identity from {seen[semantic_hash]}"
+            )
+        seen[semantic_hash] = row_role
+        machine.append((semantic_hash, row))
+    for index, row in enumerate(rejected_rows, start=1):
+        row_role = f"{role} rejected row {index}"
+        semantic_hash = _consensus_rejected_row_identity(row, row_role)
+        if semantic_hash in seen:
+            raise ValueError(
+                f"{row_role} conflicts with semantic identity from "
+                f"{seen[semantic_hash]}"
+            )
+        seen[semantic_hash] = row_role
+        rejected.append((semantic_hash, row))
+    machine_ids = [semantic_hash for semantic_hash, _ in machine]
+    rejected_ids = [semantic_hash for semantic_hash, _ in rejected]
+    if (
+        manifest.get("machine_labeled_ids_sha256") != canonical_sha256(machine_ids)
+        or manifest.get("rejected_ids_sha256") != canonical_sha256(rejected_ids)
+        or manifest.get("rejection_reason_counts")
+        != {
+            reason: sum(reason in row["reasons"] for _, row in rejected)
+            for reason in CONSENSUS_REJECTION_REASONS
+        }
+    ):
+        raise ValueError(f"{role} labeling semantic inventory changed")
+    if contract == CONSENSUS_COMBINED_LABELING_CONTRACT:
+        ancestry_machine.sort(key=lambda item: item[0])
+        ancestry_rejected.sort(key=lambda item: item[0])
+        ancestry_ids = [
+            semantic_hash
+            for semantic_hash, _ in (*ancestry_machine, *ancestry_rejected)
+        ]
+        ancestry_orbits = [
+            row["curation"]["symmetryOrbitSha256"]
+            for _, row in ancestry_machine
+        ] + [
+            row["symmetry_orbit_sha256"] for _, row in ancestry_rejected
+        ]
+        if len(ancestry_ids) != len(set(ancestry_ids)):
+            raise ValueError(f"{role} combined ancestry contains duplicates")
+        if len(ancestry_orbits) != len(set(ancestry_orbits)):
+            raise ValueError(
+                f"{role} combined ancestry contains symmetry duplicates"
+            )
+        if (
+            _canonical_jsonl(row for _, row in ancestry_machine)
+            != machine_path.read_bytes()
+            or _canonical_jsonl(row for _, row in ancestry_rejected)
+            != rejected_path.read_bytes()
+        ):
+            raise ValueError(
+                f"{role} combined rows differ from source-bundle union"
+            )
+    return {
+        "manifest": manifest,
+        "manifest_identity": identity,
+        "manifest_file_sha256": file_sha256(manifest_path),
+        "machine": machine,
+        "rejected": rejected,
+        "machine_sha256": machine_hash,
+        "rejected_sha256": rejected_hash,
+        "policy_hash": policy_hash,
+        "models": models,
+        "stability_margin": margin,
+    }
+
+
+def merge_consensus_labeling_bundles(
+    bundle_dirs: Sequence[Path],
+    output_dir: Path,
+) -> Mapping[str, Any]:
+    """Merge disjoint machine-consensus labeling bundles deterministically."""
+
+    if len(bundle_dirs) < 2:
+        raise ValueError("at least two consensus labeling bundles are required")
+    output_dir = Path(output_dir)
+    roots = []
+    seen_roots = set()
+    for raw_root in map(Path, bundle_dirs):
+        if raw_root.is_symlink() or not raw_root.is_dir():
+            raise ValueError(
+                f"consensus labeling bundle is not a regular directory: {raw_root}"
+            )
+        root = raw_root.resolve()
+        if root in seen_roots:
+            raise ValueError("a consensus labeling bundle was supplied more than once")
+        if _paths_overlap(output_dir, root):
+            raise ValueError(
+                "combined consensus output may not overlap a source bundle"
+            )
+        seen_roots.add(root)
+        roots.append(root)
+    roots.sort(key=str)
+
+    machine_rows: List[Tuple[str, Dict[str, Any]]] = []
+    rejected_rows: List[Tuple[str, Dict[str, Any]]] = []
+    seen_semantic: Dict[str, Tuple[str, str]] = {}
+    seen_orbits: Dict[str, Tuple[str, str]] = {}
+    source_bundles = []
+    frozen_files: List[Tuple[Path, str, str]] = []
+    common_policy_hash = None
+    common_models = None
+    common_margin = None
+    for root in roots:
+        machine_path = root / "machine-labeled.jsonl"
+        rejected_path = root / "rejected.jsonl"
+        manifest_path = root / "manifest.json"
+        bundle = _load_consensus_labeling_artifacts(
+            machine_path=machine_path,
+            rejected_path=rejected_path,
+            manifest_path=manifest_path,
+            role=str(root),
+        )
+        coordinates = (
+            bundle["policy_hash"],
+            canonical_sha256(bundle["models"]),
+            bundle["stability_margin"],
+        )
+        if common_policy_hash is None:
+            common_policy_hash = coordinates[0]
+            common_models = bundle["models"]
+            common_margin = coordinates[2]
+        elif coordinates != (
+            common_policy_hash,
+            canonical_sha256(common_models),
+            common_margin,
+        ):
+            if coordinates[0] != common_policy_hash:
+                raise ValueError("consensus labeling bundles disagree on policy")
+            if coordinates[1] != canonical_sha256(common_models):
+                raise ValueError("consensus labeling bundles disagree on models")
+            raise ValueError("consensus labeling bundles disagree on stability margin")
+
+        for status, rows, destination in (
+            ("accepted", bundle["machine"], machine_rows),
+            ("rejected", bundle["rejected"], rejected_rows),
+        ):
+            for semantic_hash, row in rows:
+                previous = seen_semantic.get(semantic_hash)
+                if previous is not None:
+                    if previous[0] != status:
+                        raise ValueError(
+                            "consensus accepted/rejected semantic conflict: "
+                            f"{semantic_hash}"
+                        )
+                    raise ValueError(f"consensus semantic duplicate: {semantic_hash}")
+                orbit_hash = (
+                    row["curation"]["symmetryOrbitSha256"]
+                    if status == "accepted"
+                    else row["symmetry_orbit_sha256"]
+                )
+                previous_orbit = seen_orbits.get(orbit_hash)
+                if previous_orbit is not None:
+                    raise ValueError(
+                        "consensus symmetry-orbit duplicate: "
+                        f"{semantic_hash}; first seen at {previous_orbit[1]}"
+                    )
+                seen_semantic[semantic_hash] = (status, str(root))
+                seen_orbits[orbit_hash] = (status, semantic_hash)
+                destination.append((semantic_hash, row))
+
+        source_bundles.append(
+            {
+                "path": str(root),
+                "manifest_path": str(manifest_path.resolve()),
+                "manifest_sha256": bundle["manifest_file_sha256"],
+                "manifest_identity": bundle["manifest_identity"],
+                "machine_labeled_sha256": bundle["machine_sha256"],
+                "machine_labeled_count": len(bundle["machine"]),
+                "rejected_sha256": bundle["rejected_sha256"],
+                "rejected_count": len(bundle["rejected"]),
+            }
+        )
+        frozen_files.extend(
+            (
+                (
+                    machine_path,
+                    bundle["machine_sha256"],
+                    f"{root} machine-labeled positions",
+                ),
+                (
+                    rejected_path,
+                    bundle["rejected_sha256"],
+                    f"{root} rejected positions",
+                ),
+                (
+                    manifest_path,
+                    bundle["manifest_file_sha256"],
+                    f"{root} labeling manifest",
+                ),
+            )
+        )
+
+    machine_rows.sort(key=lambda item: item[0])
+    rejected_rows.sort(key=lambda item: item[0])
+    machine_ids = [semantic_hash for semantic_hash, _ in machine_rows]
+    rejected_ids = [semantic_hash for semantic_hash, _ in rejected_rows]
+    machine_data = _canonical_jsonl(row for _, row in machine_rows)
+    rejected_data = _canonical_jsonl(row for _, row in rejected_rows)
+    assert common_policy_hash is not None
+    assert common_models is not None
+    assert common_margin is not None
+    manifest = {
+        "schema_version": 2,
+        "contract": CONSENSUS_COMBINED_LABELING_CONTRACT,
+        "review_mode": MACHINE_CONSENSUS_REVIEW_MODE,
+        "consensus_rules_version": CONSENSUS_RULES_VERSION,
+        "allowed_labels": sorted(CONSENSUS_ALLOWED_LABELS),
+        "policy_hash": common_policy_hash,
+        "models": common_models,
+        "symmetry_semantics": "katago-shape-preserving-d4-v1",
+        "visit_roles": [
+            f"{mode}-{visits}"
+            for mode in CONSENSUS_SEARCH_MODES
+            for visits in CONSENSUS_VISITS
+        ],
+        "stability_margin": common_margin,
+        "source_bundle_count": len(source_bundles),
+        "source_bundles": source_bundles,
+        "source_bundles_sha256": canonical_sha256(source_bundles),
+        "machine_labeled_count": len(machine_rows),
+        "rejected_count": len(rejected_rows),
+        "review_count": 0,
+        "machine_labeled_sha256": hashlib.sha256(machine_data).hexdigest(),
+        "rejected_sha256": hashlib.sha256(rejected_data).hexdigest(),
+        "rejection_reason_counts": {
+            reason: sum(reason in row["reasons"] for _, row in rejected_rows)
+            for reason in CONSENSUS_REJECTION_REASONS
+        },
+        "machine_labeled_ids_sha256": canonical_sha256(machine_ids),
+        "rejected_ids_sha256": canonical_sha256(rejected_ids),
+        "semantic_hashes_sha256": canonical_sha256(
+            sorted((*machine_ids, *rejected_ids))
+        ),
+    }
+    manifest["manifest_sha256"] = canonical_sha256(manifest)
+    files = {
+        "machine-labeled.jsonl": machine_data,
+        "rejected.jsonl": rejected_data,
+        "manifest.json": (canonical_json(manifest) + "\n").encode("utf-8"),
+    }
+    for source, expected_hash, role in frozen_files:
+        if (
+            source.is_symlink()
+            or not source.is_file()
+            or file_sha256(source) != expected_hash
+        ):
+            raise ValueError(f"{role} changed while merging consensus bundles")
+    _publish_bundle(output_dir, files)
+    return manifest
+
+
+combine_consensus_labeling_bundles = merge_consensus_labeling_bundles
+
+
 def policy_pool_minima(policy: Mapping[str, Any]) -> Dict[str, int]:
     stages = policy["evaluation_stages"]
     stage_1 = stages["stage_1_cheap_paired_screen"]
@@ -1949,8 +3511,7 @@ def policy_pool_minima(policy: Mapping[str, Any]) -> Dict[str, int]:
         key=lambda look: look["look_number"],
     )
     audit = stages["deep_audit"]
-    stage_0 = stages["stage_0_integrity_and_fixed_probes"]
-    return {
+    basic_minima = {
         "ordinary": (
             max(
                 stage_1["ordinary_color_pairs"],
@@ -1972,6 +3533,17 @@ def policy_pool_minima(policy: Mapping[str, Any]) -> Dict[str, int]:
             + latest["lead_80_color_pairs"]
             + audit["lead_80_color_pairs"]
         ),
+    }
+    policy_version = policy.get("policy_version")
+    if (
+        policy.get("schema_version") == 3
+        and isinstance(policy_version, str)
+        and policy_version.startswith("risk-seeking-checkpoint-promotion-v3")
+    ):
+        return basic_minima
+    stage_0 = stages["stage_0_integrity_and_fixed_probes"]
+    return {
+        **basic_minima,
         "exploitability": max(
             stage_0["exploitability_sentinel_positions"],
             audit["exploitability_positions"],
@@ -1983,6 +3555,176 @@ def policy_pool_minima(policy: Mapping[str, Any]) -> Dict[str, int]:
         "small-gain": 1,
         "adversarial": 1,
     }
+
+
+def finalize_consensus_reviewed_bank(
+    *,
+    machine_labeled_path: Path,
+    rejected_path: Path,
+    labeling_manifest_path: Path,
+    policy_path: Path,
+    output_path: Path,
+    manifest_path: Path,
+) -> Mapping[str, Any]:
+    """Finalize a v2 reviewed bank without any human-decision input."""
+
+    machine_labeled_path = Path(machine_labeled_path)
+    rejected_path = Path(rejected_path)
+    labeling_manifest_path = Path(labeling_manifest_path)
+    policy_path = Path(policy_path)
+    output_path = Path(output_path)
+    manifest_path = Path(manifest_path)
+    if output_path.resolve() == manifest_path.resolve():
+        raise ValueError("consensus output and manifest paths must be distinct")
+    if policy_path.is_symlink() or not policy_path.is_file():
+        raise ValueError("v3 promotion policy must be a regular non-symlink file")
+    policy = load_policy(policy_path)
+    _machine_curation_policy(policy)
+    policy_hash = canonical_sha256(policy)
+    policy_file_hash = file_sha256(policy_path)
+    bundle = _load_consensus_labeling_artifacts(
+        machine_path=machine_labeled_path,
+        rejected_path=rejected_path,
+        manifest_path=labeling_manifest_path,
+        role="consensus finalization",
+    )
+    if bundle["policy_hash"] != policy_hash:
+        raise ValueError("consensus labeling manifest names another v3 policy")
+
+    final_rows = []
+    seen = set()
+    seen_orbits = set()
+    for semantic_hash, row in bundle["machine"]:
+        position = normalize_position_sample(
+            row, f"machine-reviewed position {semantic_hash}"
+        )
+        position.pop("metadata", None)
+        if semantic_position_sha256(position) != semantic_hash:
+            raise ValueError("machine-reviewed position identity changed")
+        if semantic_hash in seen:
+            raise ValueError("machine-reviewed positions contain a duplicate")
+        orbit_hash = row["curation"]["symmetryOrbitSha256"]
+        if orbit_hash in seen_orbits:
+            raise ValueError("machine-reviewed positions share a symmetry orbit")
+        seen.add(semantic_hash)
+        seen_orbits.add(orbit_hash)
+        labels = row["labels"]
+        consensus = row["curation"]["consensus"]
+        final_rows.append(
+            {
+                **position,
+                "labels": labels,
+                "curation": {
+                    "classification": "machine-reviewed",
+                    "review_mode": MACHINE_CONSENSUS_REVIEW_MODE,
+                    "consensus_rules_version": CONSENSUS_RULES_VERSION,
+                    "semanticSha256": semantic_hash,
+                    "symmetryOrbitSha256": orbit_hash,
+                    "consensusSha256": canonical_sha256(consensus),
+                    "labeling_contract": bundle["manifest"]["contract"],
+                },
+            }
+        )
+    rejected_ids = {semantic_hash for semantic_hash, _ in bundle["rejected"]}
+    if seen.intersection(rejected_ids):
+        raise ValueError("accepted and rejected consensus positions conflict")
+    rejected_orbits = {
+        row["symmetry_orbit_sha256"] for _, row in bundle["rejected"]
+    }
+    if seen_orbits.intersection(rejected_orbits):
+        raise ValueError(
+            "accepted and rejected consensus symmetry orbits conflict"
+        )
+    final_rows.sort(key=lambda row: row["curation"]["semanticSha256"])
+    counts = Counter(label for row in final_rows for label in row["labels"])
+    if any(label not in CONSENSUS_ALLOWED_LABELS for label in counts):
+        raise ValueError("consensus final bank contains a non-basic label")
+    minima = policy_pool_minima(policy)
+    if set(minima) != set(CONSENSUS_ALLOWED_LABELS):
+        raise ValueError("v3 policy pool minima include non-machine labels")
+    deficits = {
+        label: minimum - counts.get(label, 0)
+        for label, minimum in minima.items()
+        if counts.get(label, 0) < minimum
+    }
+    if deficits:
+        raise ValueError(
+            f"machine-reviewed position pool is below v3 policy minima: {deficits}"
+        )
+
+    data = _canonical_jsonl(final_rows)
+    manifest = {
+        "schema_version": 2,
+        "contract": CONSENSUS_FINAL_MANIFEST_CONTRACT,
+        "review_mode": MACHINE_CONSENSUS_REVIEW_MODE,
+        "consensus_rules_version": CONSENSUS_RULES_VERSION,
+        "allowed_labels": sorted(CONSENSUS_ALLOWED_LABELS),
+        "models": bundle["models"],
+        "policy_path": str(policy_path.resolve()),
+        "policy_sha256": policy_file_hash,
+        "policy_hash": policy_hash,
+        "labeling_manifest_path": str(labeling_manifest_path.resolve()),
+        "labeling_manifest_sha256": bundle["manifest_file_sha256"],
+        "labeling_manifest_identity": bundle["manifest_identity"],
+        "machine_labeled_input_sha256": bundle["machine_sha256"],
+        "machine_labeled_count": len(bundle["machine"]),
+        "rejected_input_sha256": bundle["rejected_sha256"],
+        "rejected_sha256": bundle["rejected_sha256"],
+        "rejected_count": len(bundle["rejected"]),
+        "row_count": len(final_rows),
+        "label_counts": dict(sorted(counts.items())),
+        "required_minima": minima,
+        "semantic_hashes_sha256": canonical_sha256(
+            [row["curation"]["semanticSha256"] for row in final_rows]
+        ),
+        "symmetry_orbits_sha256": canonical_sha256(
+            [row["curation"]["symmetryOrbitSha256"] for row in final_rows]
+        ),
+        "output_path": str(output_path.resolve()),
+        "output_sha256": hashlib.sha256(data).hexdigest(),
+    }
+    manifest["manifest_sha256"] = canonical_sha256(manifest)
+
+    protected = {
+        machine_labeled_path.resolve(),
+        rejected_path.resolve(),
+        labeling_manifest_path.resolve(),
+        policy_path.resolve(),
+    }
+    if output_path.resolve() in protected or manifest_path.resolve() in protected:
+        raise ValueError("consensus final outputs may not replace provenance inputs")
+    frozen_files = [
+        (
+            machine_labeled_path,
+            bundle["machine_sha256"],
+            "machine-labeled positions",
+        ),
+        (rejected_path, bundle["rejected_sha256"], "rejected positions"),
+        (
+            labeling_manifest_path,
+            bundle["manifest_file_sha256"],
+            "consensus labeling manifest",
+        ),
+        (policy_path, policy_file_hash, "v3 promotion policy"),
+    ]
+    frozen_files.extend(
+        (
+            Path(spec["path"]),
+            spec["sha256"],
+            f"{model} model",
+        )
+        for model, spec in bundle["models"].items()
+    )
+    for source, expected_hash, role in frozen_files:
+        if (
+            source.is_symlink()
+            or not source.is_file()
+            or file_sha256(source) != expected_hash
+        ):
+            raise ValueError(f"{role} changed while finalizing consensus bank")
+    _publish_file(output_path, data)
+    _publish_file(manifest_path, (canonical_json(manifest) + "\n").encode("utf-8"))
+    return manifest
 
 
 def finalize_reviewed_bank(
@@ -2199,6 +3941,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     queries.add_argument("--reference-model", required=True, type=Path)
     queries.add_argument("--policy", required=True, type=Path)
 
+    consensus_queries = subparsers.add_parser("queries-consensus")
+    consensus_queries.add_argument("normalized", type=Path)
+    consensus_queries.add_argument("--output-dir", required=True, type=Path)
+    consensus_queries.add_argument("--katago", required=True, type=Path)
+    consensus_queries.add_argument("--analysis-config", required=True, type=Path)
+    consensus_queries.add_argument("--original-model", required=True, type=Path)
+    consensus_queries.add_argument("--champion-model", required=True, type=Path)
+    consensus_queries.add_argument("--policy", required=True, type=Path)
+
     analyze = subparsers.add_parser("run-analysis")
     analyze.add_argument("--katago", required=True, type=Path)
     analyze.add_argument("--config", required=True, type=Path)
@@ -2234,11 +3985,24 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     label.add_argument("--output-dir", required=True, type=Path)
     label.add_argument("--stability-margin", type=float, default=5.0)
 
+    consensus_label = subparsers.add_parser("label-consensus")
+    consensus_label.add_argument("normalized", type=Path)
+    consensus_label.add_argument("--query-manifest", required=True, type=Path)
+    consensus_label.add_argument(
+        "--analysis", action="append", default=[], required=True
+    )
+    consensus_label.add_argument("--output-dir", required=True, type=Path)
+    consensus_label.add_argument("--stability-margin", type=float, default=5.0)
+
     merge_labels = subparsers.add_parser(
         "merge-labeling", aliases=["merge-labeling-bundles"]
     )
     merge_labels.add_argument("bundles", nargs="+", type=Path)
     merge_labels.add_argument("--output-dir", required=True, type=Path)
+
+    consensus_merge = subparsers.add_parser("merge-labeling-consensus")
+    consensus_merge.add_argument("bundles", nargs="+", type=Path)
+    consensus_merge.add_argument("--output-dir", required=True, type=Path)
 
     finalize = subparsers.add_parser("finalize")
     finalize.add_argument("--auto", required=True, type=Path)
@@ -2248,6 +4012,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     finalize.add_argument("--policy", required=True, type=Path)
     finalize.add_argument("-o", "--output", required=True, type=Path)
     finalize.add_argument("--manifest", required=True, type=Path)
+
+    consensus_finalize = subparsers.add_parser("finalize-consensus")
+    consensus_finalize.add_argument("--machine-labeled", required=True, type=Path)
+    consensus_finalize.add_argument("--rejected", required=True, type=Path)
+    consensus_finalize.add_argument("--labeling-manifest", required=True, type=Path)
+    consensus_finalize.add_argument("--policy", required=True, type=Path)
+    consensus_finalize.add_argument("-o", "--output", required=True, type=Path)
+    consensus_finalize.add_argument("--manifest", required=True, type=Path)
     return parser.parse_args(argv)
 
 
@@ -2283,6 +4055,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 analysis_config=args.analysis_config,
                 reference_model=args.reference_model,
                 policy_path=args.policy,
+            )
+        elif args.command == "queries-consensus":
+            result = generate_consensus_query_bundle(
+                args.normalized,
+                args.output_dir,
+                args.katago,
+                args.analysis_config,
+                args.original_model,
+                args.champion_model,
+                args.policy,
             )
         elif args.command == "run-analysis":
             if args.gpu_index < 0:
@@ -2327,13 +4109,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 output_dir=args.output_dir,
                 stability_margin=args.stability_margin,
             )
+        elif args.command == "label-consensus":
+            result = label_positions_consensus(
+                normalized_path=args.normalized,
+                query_manifest_path=args.query_manifest,
+                analysis_paths=_analysis_arguments(args.analysis),
+                output_dir=args.output_dir,
+                stability_margin=args.stability_margin,
+            )
         elif args.command in {"merge-labeling", "merge-labeling-bundles"}:
             result = merge_labeling_bundles(args.bundles, args.output_dir)
+        elif args.command == "merge-labeling-consensus":
+            result = merge_consensus_labeling_bundles(args.bundles, args.output_dir)
         elif args.command == "finalize":
             result = finalize_reviewed_bank(
                 auto_path=args.auto,
                 review_queue_path=args.review_queue,
                 decisions_path=args.decisions,
+                labeling_manifest_path=args.labeling_manifest,
+                policy_path=args.policy,
+                output_path=args.output,
+                manifest_path=args.manifest,
+            )
+        elif args.command == "finalize-consensus":
+            result = finalize_consensus_reviewed_bank(
+                machine_labeled_path=args.machine_labeled,
+                rejected_path=args.rejected,
                 labeling_manifest_path=args.labeling_manifest,
                 policy_path=args.policy,
                 output_path=args.output,

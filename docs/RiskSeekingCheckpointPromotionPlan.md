@@ -56,16 +56,16 @@ yet alter later self-play.
 
 ## Implementation status
 
-Last updated: 2026-07-29.
+Last updated: 2026-08-04.
 
 Checked items have repository evidence. Live-run items remain unchecked until
 they are verified on the actual training filesystem and H100 hosts.
 The repository-foundation checklist records implemented building blocks; it
 does not by itself establish an end-to-end automatic promotion path.
-Repository Stage 0–2 execution alignment and position-bank curation tooling
-are complete. That does not establish a reviewed live bank or deployment.
-Mutation-enabled operation remains blocked until every required
-live-environment item is checked.
+Repository Stage 0–2 execution alignment and machine-consensus position-bank
+curation are complete. Screening may run before promotion readiness, but direct
+and automatic promotion remain blocked until the v3 suite transitively proves
+machine-review provenance and every required live-environment item is checked.
 
 ### Existing prerequisites
 
@@ -96,8 +96,8 @@ live-environment item is checked.
 
 ### Repository closure
 
-- [x] Publish an immutable, statistically feasible promotion policy v2 while
-  retaining v1 byte-for-byte for historical evidence.
+- [x] Retain promotion policies v1/v2 for historical replay and publish the
+  immutable machine-consensus policy v3.
 - [x] Publish exact cumulative look-1/look-2 schedules with independent
   position-cluster quotas and separate Lead discovery/confirmation holdouts.
 - [x] Build an in-repository evaluator evidence adapter from finalized match
@@ -133,23 +133,36 @@ position bank.
 
 ### Position-bank curation pipeline
 
-The suite builder deliberately consumes reviewed labeled positions; no such
-source bank currently exists in the repository or live run.
+The suite builder deliberately consumes machine-reviewed labeled positions; no
+such source bank currently exists in the repository or live run.
 
 - [x] Implement deterministic PositionSample normalization, C++-readable
   output, semantic deduplication, and source provenance.
-- [x] Implement hash-bound analysis-query generation and result ingestion
-  against an immutable reference model.
-- [x] Implement conservative ordinary, Lead-40, and Lead-80 auto-labeling with
-  visit-stability checks.
-- [x] Implement provenance-bound SGFS-margin and score prefiltering plus
-  immutable labeling bundle merging for targeted supplemental Lead corpora.
-- [x] Implement explicit human-review queues for tactical, exploitability,
-  bait, score-tail, sacrifice, small-gain/large-lead, and adversarial cases.
-- [x] Publish a canonical curation manifest and fail closed when policy-v2 pool
-  minima or review approvals are missing.
+- [x] Implement hash-bound analysis against distinct frozen original and
+  champion model hashes.
+- [x] Run standard and powered analysis at 2,000 and 8,000 visits over every
+  distinct shape-preserving symmetry.
+- [x] Accept only buffered ordinary, Lead-40, and Lead-80 consensus rows as
+  `machine-reviewed`; write every ambiguity permanently to `rejected.jsonl`.
+- [x] Implement provenance-bound SGFS-margin filtering and immutable consensus
+  bundle merging for targeted supplemental Lead corpora.
+- [x] Expose the active `queries-consensus`, `label-consensus`,
+  `merge-labeling-consensus`, and `finalize-consensus` commands with no
+  decisions-file input.
+- [x] Publish the `risk-score-reviewed-position-bank-v2` manifest and fail
+  closed below policy-v3 minima: 3,200 ordinary, 2,080 Lead-40, and 4,128
+  Lead-80.
 - [x] Cover deterministic curation and suite-builder handoff with automated
   tests.
+
+The older `queries`/`label`/`merge-labeling`/`finalize` path and its human
+review queue remain historical curation-v1 support only. A policy-v3 suite
+requires `--curation-manifest` for every source and emits the
+`risk-score-authoritative-evaluation-manifest-v3` contract.
+
+Resource warning: a non-symmetric square position expands to as many as 64
+analyses (2 models × 2 modes × 2 visit counts × 8 symmetries). Production
+curation must shard each role.
 
 ### Production host integration
 
@@ -214,6 +227,8 @@ Repository verification recorded so far:
   63 tests passed, respectively.
 - Policy v2 canonical SHA-256 (2026-07-29):
   `8562bcd7b835ae0cfcfe517a290748258da229b3fcf588dc99b3703c2b8f6023`.
+- Policy v3 canonical SHA-256 (2026-08-04):
+  `0151ddcdee764b1e599eb5313f9dfae944e671ff8098dd471425f8d646ba3318`.
 - Final `compileall`, v1/v2 policy and runtime JSON parsing, promotion CLI
   help smokes, exporter shell syntax, GitHub workflow YAML parsing, pinned
   policy validation, and `git diff --check` (2026-07-29): passed.
@@ -257,10 +272,10 @@ Repository verification recorded so far:
   provenance, and publish read-only generation model copies.
 - [x] Enforce path containment/alias safety and require the gated exporter
   model-load/finite-output probe.
-- [x] Preserve frozen v1 as historical evidence and publish v2 with feasible
-  final-look sample sizes. V2 requires 1,024 independent ordinary/Lead-40
-  clusters and 2,048 Lead-80 clusters at look 2, giving exact zero-event upper
-  bounds of approximately 0.470% and 0.235%, respectively.
+- [x] Preserve frozen v1/v2 as historical evidence and publish v3 with
+  transitive machine-review provenance. V3 requires 1,024 independent
+  ordinary/Lead-40 clusters and 2,048 Lead-80 clusters at look 2, giving exact
+  zero-event upper bounds of approximately 0.470% and 0.235%, respectively.
 
 ### Live environment validation
 
@@ -273,8 +288,8 @@ Repository verification recorded so far:
 - [ ] Inventory and hash the staged candidate backlog.
 - [ ] Generate a quarantined original-model SGF corpus that is never admitted
   to the shuffler or trainer, and bind its exclusion roots in the harvest plan.
-- [ ] Freeze real discovery, confirmation, audit, tactical, and exploitability
-  position banks.
+- [ ] Freeze a real machine-reviewed ordinary/Lead-40/Lead-80 source bank and
+  its v3 discovery, confirmation, and audit suites.
 - [ ] Validate atomic rename and fsync semantics on the training filesystem.
 - [ ] Run CUDA model-load and fixed-position probes on representative b40
   checkpoints.
@@ -315,6 +330,9 @@ The controller must enforce these invariants before performance optimization:
 - trainer and evaluator never compute concurrently on GPU 7;
 - a candidate identity is its SHA-256, not its path or mtime;
 - all evaluation inputs are immutable and content-addressed;
+- screening may precede readiness, but activation requires a policy-v3 suite
+  whose sources transitively bind `risk-score-reviewed-position-bank-v2`
+  machine-consensus manifests;
 - every counted result belongs to a complete color pair;
 - a promotion uses the champion SHA that the evaluation actually tested;
 - no candidate is activated without a finalized gate report;
@@ -403,15 +421,18 @@ loading, and training-data generation remain the execution engines.
   - Stage 0 and discovery provenance;
   - canonical controller evidence publication.
 - `python/risk_score/build_evaluation_suites.py`
-  - frozen ordinary, Lead-40, Lead-80, tactical, and exploitability suites;
+  - machine-review-only ordinary, Lead-40, and Lead-80 suites;
+  - transitive v3 curation-manifest provenance;
   - independent discovery, confirmation, and audit holdouts.
 - `python/risk_score/position_samples.py`
   - shared PositionSample validation and gameplay-semantic identity;
   - deterministic analysis query construction.
+- `python/risk_score/board_symmetry.py`
+  - distinct shape-preserving symmetry orbits and coordinate inversion.
 - `python/risk_score/curate_position_bank.py`
   - content-bound SGF harvest plans and analysis execution;
-  - conservative automatic labels and explicit specialized review queues;
-  - policy-minimum validation and canonical reviewed-bank publication.
+  - original/champion, standard/powered, 2,000/8,000-visit consensus;
+  - permanent ambiguity rejection and canonical machine-reviewed publication.
 - `python/risk_score/model_probe.py`
   - deterministic CUDA model-load and finite-output publication probe.
 - `python/risk_score/stage0_probe.py`
@@ -446,8 +467,11 @@ loading, and training-data generation remain the execution engines.
 - `python/risk_score/promotion_policy_v1.json`
   - immutable historical policy and evidence identity.
 - `python/risk_score/promotion_policy_v2.json`
-  - feasible cumulative sample/cluster counts, confidence levels, safety
-    margins, queue limits, sequential boundaries, and rollout thresholds.
+  - immutable superseded policy and evidence identity.
+- `python/risk_score/promotion_policy_v3.json`
+  - active machine-curation, evaluation, audit, and rollout contract;
+  - canonical hash
+    `0151ddcdee764b1e599eb5313f9dfae944e671ff8098dd471425f8d646ba3318`.
 - `docs/RiskSeekingCheckpointPromotionRunbook.md`
   - installation, supervision, recovery, manual override, and incident
     procedures.
@@ -575,16 +599,10 @@ The implementation freezes three independent ordinary-position banks:
 - **confirmation:** the only bank that may authorize promotion;
 - **audit:** periodic deep checks and rollback investigations.
 
-It also freezes:
-
-- Lead-40 positions;
-- Lead-80 positions;
-- ordinary tactical refutations;
-- low-probability high-score baits;
-- exaggerated score-tail positions;
-- whole-board sacrifice traps;
-- small-gain/large-lead risks; and
-- adversarial continuations where the opponent declines cooperation.
+It also freezes independent Lead-40 and Lead-80 discovery, confirmation, and
+audit banks. Policy v3 accepts no specialized curation labels. Tactical,
+exploitability, bait, tail, sacrifice, small-gain, adversarial, or otherwise
+ambiguous signals cause permanent curation rejection.
 
 Every position appears from both player perspectives. Repetitions from one
 position remain one statistical cluster.
@@ -642,7 +660,6 @@ Run for every selected anchor:
 - model/checkpoint hash and architecture compatibility;
 - CUDA load and finite-output smoke;
 - 256 fixed analysis positions at 200 visits;
-- exploitability sentinels at 2,000 visits;
 - perspective and legal-bound checks;
 - utility decomposition and endpoint-tail checks; and
 - policy distance from champion.
@@ -671,6 +688,7 @@ Reject immediately for:
 - catastrophe harm already beyond the maximum allowed margin.
 
 Stage 1 is discovery only and can never authorize promotion.
+It may run before machine-review readiness is complete.
 
 ### Stage 2: finalist selection
 
@@ -690,31 +708,27 @@ Exactly one candidate advances.
 
 ### Stage 3: promotion confirmation
 
-Fast confirmation defaults:
+Policy v3 uses powered search at 2,000 visits and the standard control at 800:
 
-- 256 ordinary pairs at 2,000 visits;
-- 64 Lead-40 pairs;
-- 64 Lead-80 pairs;
-- candidate versus champion;
-- candidate versus immutable original;
-- 128 standard-utility pairs at 800 visits against original; and
+- look 1: 512 powered ordinary pairs per candidate/champion and
+  candidate/original matchup, 128 standard candidate/original pairs, 512
+  Lead-40 pairs, and 1,024 Lead-80 pairs;
+- look 2: cumulative prefixes of 1,024 powered ordinary pairs per matchup, 128
+  standard pairs, 1,024 Lead-40 pairs, and 2,048 Lead-80 pairs; and
 - full per-move diagnostics.
 
-Use a first look at half the sample. Promote early only when every condition
-passes. Stop early for proven harm or prespecified low conditional power.
-
-If inconclusive, extend the ordinary sample to 512 pairs and lead suites to 128
-pairs each.
+Promote at look 1 only when every condition passes. Stop for proven harm or
+prespecified low conditional power; otherwise continue to look 2.
 
 ### Deep audit lane
 
 Every fifth promotion, and any candidate near a safety boundary, receives:
 
-- at least 1,024 ordinary pairs;
-- expanded lead suites;
-- the full 128-position exploitability bank;
+- 2,048 ordinary pairs;
+- 1,024 Lead-40 pairs;
+- 2,048 Lead-80 pairs;
 - candidate/champion/original/b28 controls;
-- 2,000 and 8,000 visit stability checks; and
+- the same pair banks at both 2,000 and 8,000 visits; and
 - higher-precision reruns for suspicious endpoint-tail choices.
 
 Deep audits run asynchronously and can trigger rollback. They do not block every
@@ -722,9 +736,9 @@ routine safe promotion.
 
 ## Confidence and sequential testing
 
-Historical v1 thresholds remain frozen in `promotion_policy_v1.json`; all new
-automatic evaluations use the independently frozen
-`promotion_policy_v2.json`.
+Historical v1/v2 thresholds remain frozen for replay. All new automatic
+evaluations use `promotion_policy_v3.json`, canonical hash
+`0151ddcdee764b1e599eb5313f9dfae944e671ff8098dd471425f8d646ba3318`.
 
 Primary inference:
 
@@ -886,7 +900,8 @@ Before the first automated promotion:
 
 Rollout sequence:
 
-1. **1/7 canary:** 2,000 games, quarantined from training.
+1. **1/7 canary:** 4,000 games plus a fresh 2,048-pair audit, quarantined from
+   training.
 2. **3/7 rollout:** require throughput, schema, purity, and behavioral checks.
 3. **7/7 rollout:** all workers acknowledge the same SHA.
 4. **Generation commit:** canary data becomes admissible and shuffling resumes.
@@ -905,8 +920,8 @@ It must pass:
 - crash/error-rate checks;
 - throughput floor;
 - game purity (one network SHA);
-- 1,024-pair fresh audit against previous champion;
-- no hard exploit/tactical regression; and
+- 2,048-pair fresh audit against previous champion;
+- no unresolved behavioral regression; and
 - catastrophe boundaries from the promotion policy.
 
 Rollback levels:
@@ -935,8 +950,8 @@ Rollback levels:
 - run bounded recovery smoke; and
 - resume only after a written rollback event.
 
-One ordinary catastrophe triggers forensic review, not automatic rollback,
-unless it reproduces a predefined exploit failure.
+One ordinary catastrophe triggers forensic investigation, not automatic
+rollback, unless it reproduces a predefined exploit failure.
 
 ## Export hardening
 
@@ -1071,7 +1086,8 @@ pending.
 Duration: approximately half a day.
 
 - inventory and hash all staged candidates;
-- retain promotion policy v1 and freeze the corrected policy v2;
+- retain promotion policies v1/v2 and freeze policy v3;
+- freeze the original/champion machine-consensus curation inputs;
 - freeze discovery/confirmation/audit schedules;
 - verify current source, binary, configs, GPU identity, and filesystems;
 - measure candidate storage and export cadence;
@@ -1087,7 +1103,7 @@ Duration: 1–2 days.
 - build statistical golden fixtures;
 - replay existing Phase 1 results;
 - run controller in recommendation-only mode;
-- compare decisions with independent review; and
+- compare decisions with frozen golden fixtures; and
 - produce no filesystem promotions.
 
 ### Phase 2: controller, registry, and GPU lease
@@ -1121,7 +1137,8 @@ Duration: approximately one day.
 - run shadow and manual promotion cycles;
 - benchmark evaluator process count;
 - tune candidate/export cadence;
-- enable automatic PASS promotion after policy equivalence is demonstrated;
+- enable automatic PASS promotion only after transitive v3 machine-review
+  readiness passes;
 - install monitoring/alerts; and
 - execute first closed-loop promotion.
 
@@ -1159,12 +1176,15 @@ Implementation is complete only when:
 - controller restart is idempotent in every state;
 - GPU trainer/evaluator overlap is impossible by construction;
 - current backlog is inventoried and bounded;
+- every suite source has a valid `risk-score-reviewed-position-bank-v2`
+  machine-consensus manifest and the v3 suite binds it transitively;
 - candidate screening and confirmation run from immutable inputs;
 - gate decisions use paired, position-clustered statistics;
 - first promotion transaction survives injected failures;
 - seven self-play workers acknowledge the intended generation SHA;
 - mid-game switching is disabled;
-- canary data remains quarantined until commit;
+- the 4,000-game canary and 2,048 fresh audit pairs pass while canary data
+  remains quarantined until commit;
 - rollback is demonstrated before and after data admission;
 - one candidate is promoted and produces self-play data;
 - that data is shuffled and consumed by the trainer;

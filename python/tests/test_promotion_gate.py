@@ -18,6 +18,8 @@ from risk_score.promotion_gate import (
     V1_POLICY_VERSION,
     V2_POLICY_HASH,
     V2_POLICY_VERSION,
+    V3_POLICY_HASH,
+    V3_POLICY_VERSION,
     evaluate_promotion_gate,
     policy_hash,
     validate_policy,
@@ -119,6 +121,8 @@ def passing_evidence(
     authoritative_manifest=False,
 ):
     policy = load_policy() if policy is None else policy
+    if policy.get("schema_version") == 3:
+        authoritative_manifest = True
     candidate = sha("candidate")
     champion = sha("champion")
     original = sha("original")
@@ -138,7 +142,7 @@ def passing_evidence(
     catastrophe_alpha = alpha_look["catastrophe_one_sided_alpha"]
     runner_contract = (
         "risk-score-pair-safe-evaluation-runner-v3"
-        if policy.get("schema_version") == 2
+        if policy.get("schema_version") in {2, 3}
         else "risk-score-pair-safe-evaluation-runner-v2"
     )
     powered_pairs = stage_look["powered_ordinary_color_pairs_per_matchup"]
@@ -263,9 +267,36 @@ def passing_evidence(
     suite_payload = {
         **(
             {
-                "schemaVersion": 2,
+                "schemaVersion": policy.get("schema_version"),
                 "manifestContract": (
-                    "risk-score-authoritative-evaluation-manifest-v2"
+                    "risk-score-authoritative-evaluation-manifest-v3"
+                    if policy.get("schema_version") == 3
+                    else "risk-score-authoritative-evaluation-manifest-v2"
+                ),
+                **(
+                    {
+                        "machineReviewOnly": True,
+                        "acceptedLabels": ["lead-40", "lead-80", "ordinary"],
+                        "curationSources": [
+                            {
+                                "contract": "risk-score-reviewed-position-bank-v2",
+                                "review_mode": "machine-consensus",
+                                "consensus_rules_version": 1,
+                                "policy_hash": policy_hash(policy),
+                                "allowed_labels": [
+                                    "lead-40",
+                                    "lead-80",
+                                    "ordinary",
+                                ],
+                                "output_sha256": sha("machine-source"),
+                                "manifest_sha256": sha("machine-manifest"),
+                                "rejected_count": 1,
+                                "rejected_sha256": sha("machine-rejected"),
+                            }
+                        ],
+                    }
+                    if policy.get("schema_version") == 3
+                    else {}
                 ),
             }
             if authoritative_manifest
@@ -333,7 +364,7 @@ def passing_evidence(
             "suite_bank_sha": suite_hash,
             "schedule_id": schedule_id,
         }
-        if policy.get("schema_version") == 2:
+        if policy.get("schema_version") in {2, 3}:
             runner_spec["max_visits"] = definition["visits"]
         execution_manifest = {
             "katagoBinarySha256": binary_hash,
@@ -398,7 +429,7 @@ def passing_evidence(
             },
             "shards": [],
         }
-        if policy.get("schema_version") == 2:
+        if policy.get("schema_version") in {2, 3}:
             runner_payload["cell"]["maxVisits"] = definition["visits"]
         runner_manifest = dict(runner_payload)
         runner_manifest["manifestPayloadSha256"] = canonical_hash(runner_payload)
@@ -716,6 +747,13 @@ def rehash_suite_manifest(evidence):
     evidence["provenance"]["suite_manifest_hash"] = canonical_file_hash(manifest)
 
 
+def suite_manifest_cell(evidence, cell_name):
+    cells = evidence["provenance"]["suite_manifest"]["cells"]
+    if isinstance(cells, dict):
+        return cells[cell_name]
+    return next(cell for cell in cells if cell["cell_name"] == cell_name)
+
+
 def test_v1_is_byte_stable_and_remains_a_pinned_historical_policy():
     policy = load_policy(V1_POLICY_PATH)
     validate_policy(policy)
@@ -734,18 +772,25 @@ def test_non_object_evidence_fails_closed_without_raising():
     assert check_by_code(report, "EVIDENCE_OBJECT")["status"] == FAIL
 
 
-def test_v2_is_the_default_pinned_frozen_policy_with_cumulative_counts():
+def test_v3_is_the_default_pinned_frozen_policy_with_machine_review():
     policy = load_policy()
     validate_policy(policy)
-    assert policy["schema_version"] == 2
-    assert policy["policy_version"] == V2_POLICY_VERSION
+    assert policy["schema_version"] == 3
+    assert policy["policy_version"] == V3_POLICY_VERSION
     assert policy["status"] == "frozen"
     assert policy["supersedes"] == {
-        "policy_version": V1_POLICY_VERSION,
-        "policy_hash": V1_POLICY_HASH,
+        "policy_version": V2_POLICY_VERSION,
+        "policy_hash": V2_POLICY_HASH,
     }
     assert policy_hash(policy) == policy_hash(copy.deepcopy(policy))
-    assert policy_hash(policy) == V2_POLICY_HASH == EXPECTED_POLICY_HASH
+    assert policy_hash(policy) == V3_POLICY_HASH == EXPECTED_POLICY_HASH
+    assert policy["machine_curation_contract"]["allowed_labels"] == [
+        "ordinary",
+        "lead-40",
+        "lead-80",
+    ]
+    assert policy["rollout"]["canary_games"] == 4000
+    assert policy["rollout"]["canary_fresh_audit_color_pairs"] == 2048
     stage_3 = policy["evaluation_stages"]["stage_3_promotion_confirmation"]
     assert stage_3["look_data_relationship"] == "cumulative_prefix"
     assert stage_3["color_pairs_per_independent_position_cluster"] == 1
@@ -795,7 +840,7 @@ def test_v1_historical_evidence_still_validates_under_the_v1_gate_contract():
         ("targeted_lead_80_suite_loss", "lead_80"),
     ],
 )
-def test_v2_final_look_zero_event_bound_is_feasible_for_every_risk(
+def test_v3_final_look_zero_event_bound_is_feasible_for_every_risk(
     risk_name, source_cell
 ):
     policy = load_policy()
@@ -859,7 +904,7 @@ def test_all_complete_confirmation_evidence_passes_deterministically():
     }
 
 
-def test_authoritative_v2_suite_manifest_is_bound_through_runner_and_gate():
+def test_authoritative_v3_suite_manifest_is_bound_through_runner_and_gate():
     evidence = passing_evidence(authoritative_manifest=True)
     report = evaluate_promotion_gate(evidence)
     assert report["decision"] == PASS
@@ -1112,7 +1157,7 @@ def test_zero_event_risk_recomputes_exact_bound_from_independent_clusters():
     )
 
 
-def test_missing_required_v2_matrix_cell_fails_closed():
+def test_missing_required_exact_matrix_cell_fails_closed():
     evidence = passing_evidence()
     del evidence["confirmation_matrix"]["powered_candidate_vs_original"]
 
@@ -1218,9 +1263,7 @@ def test_two_position_clusters_never_pass_even_with_full_pair_count():
                 "position_clusters"
             ] = 2
     cell["statistics_manifest"]["position_ids"] = position_ids
-    evidence["provenance"]["suite_manifest"]["cells"][cell_name][
-        "position_ids"
-    ] = position_ids
+    suite_manifest_cell(evidence, cell_name)["position_ids"] = position_ids
     rehash_suite_manifest(evidence)
     for name, value in artifact["risk_differences"].items():
         evidence["risk_differences"][name] = copy.deepcopy(value)
@@ -1255,7 +1298,7 @@ def test_two_position_clusters_never_pass_even_with_full_pair_count():
         ("lead_80", "RISK_LEAD_80_LOSS_INFERENCE"),
     ],
 )
-def test_v2_rejects_g_minus_one_clusters_even_when_pair_count_is_exact(
+def test_exact_policy_rejects_g_minus_one_clusters_even_when_pair_count_is_exact(
     cell_name, inference_check
 ):
     evidence = passing_evidence()
@@ -1277,9 +1320,9 @@ def test_v2_rejects_g_minus_one_clusters_even_when_pair_count_is_exact(
     cell["statistics_manifest"]["position_ids"] = cell["statistics_manifest"][
         "position_ids"
     ][:-1]
-    evidence["provenance"]["suite_manifest"]["cells"][cell_name][
-        "position_ids"
-    ] = cell["statistics_manifest"]["position_ids"]
+    suite_manifest_cell(evidence, cell_name)["position_ids"] = cell[
+        "statistics_manifest"
+    ]["position_ids"]
     for name, metric_value in artifact["risk_differences"].items():
         evidence["risk_differences"][name] = copy.deepcopy(metric_value)
     rehash_statistics_cell(evidence, cell_name)

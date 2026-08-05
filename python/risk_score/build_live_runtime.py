@@ -144,7 +144,7 @@ def build_live_runtime(
     output.mkdir(parents=True, exist_ok=True)
     atomic_write_json(gpu_path, gpu)
 
-    policy_path = repository / "python" / "risk_score" / "promotion_policy_v2.json"
+    policy_path = repository / "python" / "risk_score" / "promotion_policy_v3.json"
     powered = repository / "cpp" / "configs" / "risk_score" / "promotion_powered_match.cfg"
     standard = repository / "cpp" / "configs" / "risk_score" / "promotion_standard_match.cfg"
     selfplay = (

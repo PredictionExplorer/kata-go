@@ -5,7 +5,6 @@ from types import SimpleNamespace
 import pytest
 
 from risk_score.build_evaluation_suites import (
-    DEFAULT_POLICY_PATH,
     build_evaluation_suites,
 )
 from risk_score.curate_position_bank import (
@@ -35,6 +34,10 @@ from risk_score.position_samples import (
     file_sha256,
     normalize_position_sample,
     semantic_position_sha256,
+)
+
+LEGACY_POLICY_PATH = (
+    Path(__file__).parents[1] / "risk_score" / "promotion_policy_v2.json"
 )
 
 
@@ -72,7 +75,7 @@ reportAnalysisWinratesAs = SIDETOMOVE
 
 
 def write_tiny_policy(path):
-    policy = json.loads(DEFAULT_POLICY_PATH.read_text(encoding="utf-8"))
+    policy = json.loads(LEGACY_POLICY_PATH.read_text(encoding="utf-8"))
     policy["policy_version"] = "risk-seeking-checkpoint-promotion-v2-curation-test"
     stages = policy["evaluation_stages"]
     stages["stage_0_integrity_and_fixed_probes"].update(

@@ -326,11 +326,24 @@ def run_stage0_probe(
     stage = policy["evaluation_stages"]["stage_0_integrity_and_fixed_probes"]
     fixed_count = stage["fixed_analysis_positions"]
     fixed_visits = stage["fixed_analysis_visits"]
-    exploit_count = stage["exploitability_sentinel_positions"]
-    exploit_visits = stage["exploitability_sentinel_visits"]
+    machine_review_v3 = (
+        policy.get("policy_version") == "risk-seeking-checkpoint-promotion-v3"
+    )
+    exploit_count = (
+        0 if machine_review_v3 else stage["exploitability_sentinel_positions"]
+    )
+    exploit_visits = 0 if machine_review_v3 else stage["exploitability_sentinel_visits"]
     fixed = _suite_positions(suite_manifest_path, "audit", fixed_count)
-    exploit = _suite_positions(suite_manifest_path, "exploitability", exploit_count)
-    tactical = _suite_positions(suite_manifest_path, "tactical", 1)
+    exploit = (
+        []
+        if machine_review_v3
+        else _suite_positions(suite_manifest_path, "exploitability", exploit_count)
+    )
+    tactical = (
+        []
+        if machine_review_v3
+        else _suite_positions(suite_manifest_path, "tactical", 1)
+    )
     analysis_env = {**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu_index)}
     with tempfile.TemporaryDirectory(prefix="risk-score-stage0-") as temporary:
         root = Path(temporary)
@@ -382,29 +395,37 @@ def run_stage0_probe(
             env=analysis_env,
             subprocess_runner=subprocess_runner,
         )
-        exploit_candidate = _run_queries(
-            root=root,
-            role="candidate-powered-exploit",
-            positions=exploit,
-            visits=exploit_visits,
-            powered=True,
-            model=candidate_model,
-            katago=katago,
-            config=analysis_config,
-            env=analysis_env,
-            subprocess_runner=subprocess_runner,
+        exploit_candidate = (
+            {}
+            if machine_review_v3
+            else _run_queries(
+                root=root,
+                role="candidate-powered-exploit",
+                positions=exploit,
+                visits=exploit_visits,
+                powered=True,
+                model=candidate_model,
+                katago=katago,
+                config=analysis_config,
+                env=analysis_env,
+                subprocess_runner=subprocess_runner,
+            )
         )
-        tactical_candidate = _run_queries(
-            root=root,
-            role="candidate-powered-tactical",
-            positions=tactical,
-            visits=exploit_visits,
-            powered=True,
-            model=candidate_model,
-            katago=katago,
-            config=analysis_config,
-            env=analysis_env,
-            subprocess_runner=subprocess_runner,
+        tactical_candidate = (
+            {}
+            if machine_review_v3
+            else _run_queries(
+                root=root,
+                role="candidate-powered-tactical",
+                positions=tactical,
+                visits=exploit_visits,
+                powered=True,
+                model=candidate_model,
+                katago=katago,
+                config=analysis_config,
+                env=analysis_env,
+                subprocess_runner=subprocess_runner,
+            )
         )
         stability_positions = fixed[: min(32, len(fixed))]
         stability_candidate = _run_queries(

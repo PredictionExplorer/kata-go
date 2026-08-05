@@ -25,7 +25,8 @@ from typing import Any, DefaultDict, Dict, Iterable, List, Mapping, Optional, Se
 SCHEMA_VERSION = 1
 V1_POLICY_PATH = Path(__file__).with_name("promotion_policy_v1.json")
 V2_POLICY_PATH = Path(__file__).with_name("promotion_policy_v2.json")
-DEFAULT_POLICY_PATH = V2_POLICY_PATH
+V3_POLICY_PATH = Path(__file__).with_name("promotion_policy_v3.json")
+DEFAULT_POLICY_PATH = V3_POLICY_PATH
 RISK_METRICS = (
     "final_20",
     "final_50",
