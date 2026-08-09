@@ -20,6 +20,7 @@ import itertools
 import copy
 import atexit
 from collections import defaultdict
+from pathlib import Path
 from typing import Dict, List
 
 import threading
@@ -51,6 +52,10 @@ from katago.train.training_controls import (
     export_interval_ready,
     validate_validation_manifest,
     validation_data_dir,
+)
+from risk_score.promotion_feedback import (
+    TrainerProvenanceRecorder,
+    file_sha256 as provenance_file_sha256,
 )
 
 
@@ -138,6 +143,21 @@ if __name__ == "__main__":
     optional_args.add_argument('-no-export', help='Do not export models', required=False, action='store_true')
     optional_args.add_argument('-no-repeat-files', help='Track what shuffled data was used and do not repeat, even when killed and resumed', required=False, action='store_true')
     optional_args.add_argument('-quit-if-no-data', help='If no data, quit instead of waiting for data', required=False, action='store_true')
+    optional_args.add_argument(
+        '-generation-provenance-dir',
+        '-provenance-dir',
+        dest='generation_provenance_dir',
+        help='Absolute directory for immutable shuffle-consumption/checkpoint/export lineage receipts',
+        default=os.environ.get('KATAGO_TRAINER_PROVENANCE_DIR'),
+        required=False,
+    )
+    optional_args.add_argument(
+        '-require-shuffle-provenance',
+        help='Fail closed if shuffled data lacks a valid generation-provenance manifest',
+        default=os.environ.get('KATAGO_REQUIRE_SHUFFLE_PROVENANCE') == '1',
+        required=False,
+        action='store_true',
+    )
 
     optional_args.add_argument('-no-lr-warmup', help='Disable LR warmup schedule', required=False, action='store_true')
     optional_args.add_argument('-gnorm-stats-debug', required=False, action='store_true')
@@ -409,6 +429,8 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
     no_export = args["no_export"]
     no_repeat_files = args["no_repeat_files"]
     quit_if_no_data = args["quit_if_no_data"]
+    generation_provenance_dir = args["generation_provenance_dir"]
+    require_shuffle_provenance = args["require_shuffle_provenance"]
 
     gnorm_stats_debug = args["gnorm_stats_debug"]
     no_lr_warmup = args["no_lr_warmup"]
@@ -463,6 +485,21 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
             raise ValueError("-fixed-val-manifest must be an absolute regular file")
         fixed_val_manifest = os.path.realpath(fixed_val_manifest)
         validate_validation_manifest(fixed_val_datadir, fixed_val_manifest)
+    if generation_provenance_dir is not None:
+        if (
+            not os.path.isabs(generation_provenance_dir)
+            or os.path.islink(generation_provenance_dir)
+        ):
+            raise ValueError(
+                "-generation-provenance-dir must be an absolute non-symlink path"
+            )
+        generation_provenance_dir = os.path.realpath(
+            generation_provenance_dir
+        )
+    elif require_shuffle_provenance:
+        raise ValueError(
+            "-require-shuffle-provenance requires -generation-provenance-dir"
+        )
 
     if samples_per_epoch is None:
         samples_per_epoch = 1000000
@@ -485,6 +522,15 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
         lookahead_k = None
 
     longterm_checkpoints_dir = get_longterm_checkpoints_dir(traindir)
+    trainer_provenance = (
+        TrainerProvenanceRecorder(
+            Path(generation_provenance_dir),
+            strict=require_shuffle_provenance,
+        )
+        if generation_provenance_dir is not None and rank == 0
+        else None
+    )
+    current_provenance_binding = None
 
     assert (swa_period_samples is None) == (swa_scale is None)
     assert (lookahead_k is None) == (lookahead_alpha is None)
@@ -660,6 +706,18 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
                     shutil.copy(get_checkpoint_path(), get_checkpoint_prev_path(0))
                 torch.save(state_dict, get_checkpoint_path() + ".tmp")
                 os.replace(get_checkpoint_path() + ".tmp", get_checkpoint_path())
+                if (
+                    trainer_provenance is not None
+                    and current_provenance_binding is not None
+                ):
+                    receipt_path = trainer_provenance.record_checkpoint(
+                        Path(get_checkpoint_path()),
+                        sample_count=int(train_state["global_step_samples"]),
+                    )
+                    train_state["generation_provenance_checkpoint"] = {
+                        "path": str(receipt_path),
+                        "sha256": provenance_file_sha256(receipt_path),
+                    }
 
     def get_is_muon_suitable(group_name: str):
         if group_name == "normal" or group_name == "normal_attn" or group_name == "normal_gab" or group_name == "gab_mlp" or group_name == "tab_module":
@@ -1239,6 +1297,7 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
     def maybe_reload_training_data():
         nonlocal last_curdatadir
         nonlocal vdatadir
+        nonlocal current_provenance_binding
 
         assert rank == 0, "Helper ddp training processes should not call maybe_reload_training_data"
 
@@ -1276,6 +1335,29 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
                     continue
 
                 logging.info("Updated training data: " + curdatadir)
+                if trainer_provenance is not None:
+                    current_provenance_binding = trainer_provenance.bind_shuffle(
+                        Path(curdatadir),
+                        required=require_shuffle_provenance,
+                    )
+                    if current_provenance_binding is not None:
+                        manifest = current_provenance_binding["manifest"]
+                        train_state["generation_provenance_binding"] = {
+                            "shuffle_path": curdatadir,
+                            "shuffle_manifest_path": str(
+                                current_provenance_binding["manifest_path"]
+                            ),
+                            "shuffle_manifest_file_sha256":
+                                current_provenance_binding[
+                                    "manifest_file_sha256"
+                                ],
+                            "generation_ids": manifest["generation_ids"],
+                            "candidate_hashes": manifest["candidate_hashes"],
+                        }
+                    else:
+                        train_state.pop(
+                            "generation_provenance_binding", None
+                        )
                 last_curdatadir = curdatadir
 
                 with open(trainjsonpath) as f:
@@ -1549,6 +1631,7 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
             logging.info("Beginning training subepoch!")
             logging.info("This subepoch, using files: " + str(train_files_to_use))
             logging.info("Currently up to data row " + str(train_state["total_num_data_rows"]))
+            subepoch_samples_before = int(train_state["global_step_samples"])
             lookahead_counter = 0
             for batch in data_processing_pytorch.read_npz_training_data(
                 train_files_to_use,
@@ -1769,6 +1852,21 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
                         logging.info("Accumulating SWA")
                         swa_model.update_parameters(raw_model)
 
+            if (
+                rank == 0
+                and trainer_provenance is not None
+                and current_provenance_binding is not None
+                and train_state["global_step_samples"] > subepoch_samples_before
+            ):
+                receipt_path = trainer_provenance.record_consumption(
+                    train_files_to_use,
+                    samples_before=subepoch_samples_before,
+                    samples_after=int(train_state["global_step_samples"]),
+                )
+                train_state["generation_provenance_consumption"] = {
+                    "path": str(receipt_path),
+                    "sha256": provenance_file_sha256(receipt_path),
+                }
             logging.info("Finished training subepoch!")
 
         # END SUB EPOCH LOOP ------------
@@ -1947,6 +2045,18 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
                     save(ddp_model, swa_model, optimizer, metrics_obj, running_metrics, train_state, last_val_metrics, path=os.path.join(savepathtmp,"model.ckpt"), skip_optimizer=True)
                     time.sleep(2)
                     os.rename(savepathtmp,savepath)
+                if (
+                    trainer_provenance is not None
+                    and current_provenance_binding is not None
+                ):
+                    receipt_path = trainer_provenance.record_export(
+                        Path(savepath),
+                        sample_count=int(train_state["global_step_samples"]),
+                    )
+                    train_state["generation_provenance_export"] = {
+                        "path": str(receipt_path),
+                        "sha256": provenance_file_sha256(receipt_path),
+                    }
 
         # Finally save, now after validation and exports are done
         save(ddp_model, swa_model, optimizer, metrics_obj, running_metrics, train_state, last_val_metrics)

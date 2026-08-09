@@ -111,7 +111,9 @@ python3 -m risk_score.promotion_preflight candidate-inventory \
 Materialize runtime JSON only after suites, trainer/consumer specs, the CUDA
 binary, and the deployment Python environment are frozen. The builder rejects
 a dirty or mismatched source revision and writes a deployment manifest that
-automatic mode rechecks on every poll:
+automatic mode rechecks on every poll. Set `SHUFFLER_ARGV_JSON` and
+`EXPORTER_ARGV_JSON` to reviewed JSON argv arrays for foreground loops; do not
+embed shell command strings:
 
 ```bash
 python3 -m risk_score.build_live_runtime \
@@ -125,7 +127,10 @@ python3 -m risk_score.build_live_runtime \
   --trainer-checkpoint "$TRAIN_BASE/train/$TRAINING_NAME/checkpoint.ckpt" \
   --gpu-uuid "$GPU7_UUID" --actor "$CONTROLLER_ID" \
   --source-revision "$(git -C "$DEPLOY_REPO" rev-parse HEAD)" \
-  --output-dir "$RUN_DIR/configs"
+  --output-dir "$RUN_DIR/configs" \
+  --service-user ubuntu \
+  --shuffler-command-json "$SHUFFLER_ARGV_JSON" \
+  --exporter-command-json "$EXPORTER_ARGV_JSON"
 ```
 
 The host supervisor is safe to start with mutation disabled: it publishes
@@ -133,6 +138,25 @@ identity snapshots and a heartbeat but launches no process. After validated
 runtime regeneration with mutation enabled, it adopts or starts exactly one
 trainer, respects every GPU-lease phase, supervises rollout acknowledgements,
 and keeps seven continuous workers synchronized to `champion.json`.
+
+The generated `promotion-services.json` and `systemd/` units bind the host
+supervisor, controller, rollout/deep-audit producer, feedback watcher, shuffler,
+and exporter into the deployment manifest. Link and enable the generated
+system-level units only in the activation phase; the host has no user-service
+linger. A mutation-enabled build additionally requires the trainer spec to
+include `-generation-provenance-dir
+$TRAIN_BASE/promotion/provenance/trainer` and
+`-require-shuffle-provenance`.
+
+Before strict shuffling or the automatic controller starts, initialize
+historical baselines and rollback watermarks once with the mutation-disabled
+runtime:
+
+```bash
+python3 -m risk_score.promotion_feedback \
+  --runtime-config "$RUN_DIR/configs/promotion-runtime.json" \
+  --run-root "$TRAIN_BASE" --mode once
+```
 
 ## Promotion filesystem
 
@@ -218,6 +242,24 @@ Resource warning: one non-symmetric square position requires up to 64 analyses
 (2 models × 2 modes × 2 visit counts × 8 symmetries). Keep
 `numAnalysisThreads=1` and shard each role; do not launch one monolithic query
 file.
+
+Use the restartable orchestrator for production. It validates all eight roles,
+assigns bounded per-GPU work, resumes only missing shards, merges each role, and
+atomically publishes progress and ETA to `WORK_DIR/status.json`:
+
+```bash
+python3 -m risk_score.curation_orchestrator watch \
+  --query-manifest "$RUN_DIR/evaluation/curation/query-bundle-v2/manifest.json" \
+  --work-dir "$RUN_DIR/evaluation/curation/consensus-work-v2" \
+  --shards-per-role 8 \
+  --gpus 0 1 2 3 4 5 6 7 \
+  --per-gpu-parallelism 4 \
+  --poll-interval 30
+```
+
+Benchmark per-GPU parallelism on a bounded pilot before using the example
+value. The manual commands below remain useful for diagnosis, but do not use
+detached SSH children as the production scheduler.
 
 ```bash
 ROLE=original/standard-2000
@@ -555,8 +597,21 @@ candidate/reference, suite, policy, schedule, pair-identity, and
 statistics-artifact hashes. The 2,048 pair IDs must equal the complete
 two-member pair set in the frozen audit schedule.
 
+Run `risk_score.promotion_auditor` as the generated auditor service. It derives
+canary/intermediate decisions from closed worker trees and manifest-bound game
+outputs, and executes queued deep-audit matrices under the GPU 7 lease. It
+publishes both PASS and FAIL rollout reports; the controller advances PASS,
+quarantines failed pre-activation generations, and routes failed active deep
+audits through replay-safe rollback.
+
 After commit, record the first game, tdata file, admitted directory, shuffle,
-and trainer consumption that reference the new generation.
+and trainer consumption that reference the new generation. The generated
+feedback service maintains generation-indexed rollback watermarks and immutable
+trainer receipts. Inspect the combined live view with:
+
+```bash
+python3 -m risk_score.promotion_status --run-root "$TRAIN_BASE"
+```
 
 ## Enabling automatic promotion
 

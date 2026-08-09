@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -15,6 +16,7 @@ from risk_score.paired_stats import canonical_sha256 as policy_sha256
 from risk_score.paired_stats import load_policy
 from risk_score.position_samples import canonical_json, file_sha256
 from risk_score.promotion_host import HostCommandError, atomic_write_json
+from risk_score.promotion_state import atomic_write_bytes
 
 
 def _replace(value: Any, replacements: Mapping[str, str]) -> Any:
@@ -40,6 +42,110 @@ def _required_file(path: Path, role: str) -> Path:
     return source
 
 
+def _service_argv(value: Optional[Sequence[str]], role: str) -> list[str]:
+    if value is None:
+        return []
+    result = list(value)
+    if not result or any(
+        not isinstance(argument, str)
+        or not argument
+        or "\n" in argument
+        or "\r" in argument
+        for argument in result
+    ):
+        raise HostCommandError(f"{role} service command must be a nonempty argv")
+    if not Path(result[0]).is_absolute():
+        raise HostCommandError(f"{role} service executable must be absolute")
+    return result
+
+
+def _systemd_quote(value: str) -> str:
+    return (
+        '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"'
+    )
+
+
+def _systemd_service(
+    *,
+    description: str,
+    argv: Sequence[str],
+    service_user: str,
+    working_directory: Path,
+    run_root: Path,
+    environment: Optional[Mapping[str, str]] = None,
+    after: Sequence[str] = (),
+    requires: Sequence[str] = (),
+) -> str:
+    unit_after = ["network-online.target", *after]
+    lines = [
+        "[Unit]",
+        f"Description={description}",
+        "Wants=network-online.target",
+        "After=" + " ".join(unit_after),
+        "RequiresMountsFor=" + _systemd_quote(str(run_root)),
+        "StartLimitIntervalSec=300",
+        "StartLimitBurst=3",
+    ]
+    if requires:
+        lines.append("Requires=" + " ".join(requires))
+    lines.extend(
+        [
+            "",
+            "[Service]",
+            "Type=simple",
+            f"User={service_user}",
+            "WorkingDirectory=" + _systemd_quote(str(working_directory)),
+            "Environment=" + _systemd_quote(f"PYTHONPATH={working_directory}"),
+        ]
+    )
+    for key, value in sorted((environment or {}).items()):
+        if (
+            re.fullmatch(r"[A-Z_][A-Z0-9_]*", key) is None
+            or not isinstance(value, str)
+            or "\n" in value
+            or "\r" in value
+        ):
+            raise HostCommandError("systemd service environment is invalid")
+        lines.append("Environment=" + _systemd_quote(f"{key}={value}"))
+    lines.extend(
+        [
+            "ExecStart=" + " ".join(_systemd_quote(value) for value in argv),
+            "Restart=on-failure",
+            "RestartSec=5",
+            "KillSignal=SIGINT",
+            "KillMode=control-group",
+            "TimeoutStopSec=300",
+            "",
+            "[Install]",
+            "WantedBy=katago-risk-training.target",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _write_text_file(path: Path, data: str) -> None:
+    encoded = data.encode("utf-8")
+    if path.exists():
+        if path.is_symlink() or not path.is_file() or path.read_bytes() != encoded:
+            raise HostCommandError(f"generated service artifact conflicts: {path}")
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_bytes(path, encoded)
+
+
+def _parse_command_json(value: Optional[str], role: str) -> Optional[Sequence[str]]:
+    if value is None:
+        return None
+    try:
+        command = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise HostCommandError(f"{role} command JSON is invalid: {exc}") from exc
+    if not isinstance(command, list):
+        raise HostCommandError(f"{role} command JSON must be an argv array")
+    return command
+
+
 def build_live_runtime(
     *,
     repo: Path,
@@ -57,6 +163,9 @@ def build_live_runtime(
     output_dir: Path,
     mutation_enabled: bool = False,
     require_clean_source: bool = True,
+    service_user: Optional[str] = None,
+    shuffler_command: Optional[Sequence[str]] = None,
+    exporter_command: Optional[Sequence[str]] = None,
 ) -> Mapping[str, Any]:
     repository = Path(repo).resolve()
     root = Path(run_root).resolve()
@@ -70,12 +179,49 @@ def build_live_runtime(
         raise HostCommandError("suite directory must be a non-symlink directory")
     if not actor or not gpu_uuid.startswith("GPU-"):
         raise HostCommandError("actor and verified GPU UUID are required")
+    shuffler_argv = _service_argv(shuffler_command, "shuffler")
+    exporter_argv = _service_argv(exporter_command, "exporter")
+    if mutation_enabled and (
+        service_user is None or not shuffler_argv or not exporter_argv
+    ):
+        raise HostCommandError(
+            "automatic runtime requires service user, shuffler, and exporter commands"
+        )
     original = _required_file(original_model, "original model")
     checkpoint = _required_file(trainer_checkpoint, "trainer checkpoint")
     katago = _required_file(katago_binary, "KataGo binary")
     python = _required_file(Path(python_executable).resolve(), "Python executable")
     trainer_spec_path = _required_file(trainer_spec, "trainer launch spec")
     consumer_spec_path = _required_file(consumer_spec, "consumer stop spec")
+    try:
+        trainer_spec_value = json.loads(
+            trainer_spec_path.read_text(encoding="utf-8")
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HostCommandError(f"trainer launch spec is invalid: {exc}") from exc
+    if not isinstance(trainer_spec_value, dict):
+        raise HostCommandError("trainer launch spec must be an object")
+    if mutation_enabled:
+        trainer_argv = trainer_spec_value.get("argv")
+        provenance_root = str(
+            root / "promotion" / "provenance" / "trainer"
+        )
+        provenance_index = (
+            trainer_argv.index("-generation-provenance-dir")
+            if isinstance(trainer_argv, list)
+            and "-generation-provenance-dir" in trainer_argv
+            else None
+        )
+        if (
+            not isinstance(trainer_argv, list)
+            or provenance_index is None
+            or provenance_index + 1 >= len(trainer_argv)
+            or trainer_argv[provenance_index + 1] != provenance_root
+            or "-require-shuffle-provenance" not in trainer_argv
+        ):
+            raise HostCommandError(
+                "automatic trainer spec requires strict generation provenance"
+            )
     completed = subprocess.run(
         ["git", "-C", str(repository), "rev-parse", "HEAD"],
         check=False,
@@ -147,6 +293,13 @@ def build_live_runtime(
     policy_path = repository / "python" / "risk_score" / "promotion_policy_v3.json"
     powered = repository / "cpp" / "configs" / "risk_score" / "promotion_powered_match.cfg"
     standard = repository / "cpp" / "configs" / "risk_score" / "promotion_standard_match.cfg"
+    analysis_config = (
+        repository
+        / "cpp"
+        / "configs"
+        / "risk_score"
+        / "promotion_curation_analysis.cfg"
+    )
     selfplay = (
         repository
         / "cpp"
@@ -181,6 +334,7 @@ def build_live_runtime(
         (policy_path, "promotion policy"),
         (powered, "powered config"),
         (standard, "standard config"),
+        (analysis_config, "analysis config"),
         (selfplay, "self-play config"),
         (manifest, "suite manifest"),
         *((path, name) for name, path in schedules.items()),
@@ -254,33 +408,212 @@ def build_live_runtime(
     }
     promotion_path = output / "promotion-runtime.json"
     atomic_write_json(promotion_path, promotion)
+    supervisor_argv = [
+        str(python),
+        "-m",
+        "risk_score.promotion_host",
+        "supervise",
+        "--runtime-config",
+        str(promotion_path),
+        "--state-root",
+        str(promotion_root / "supervisor"),
+        "--katago",
+        str(katago),
+        "--config",
+        str(selfplay),
+        "--trainer-spec",
+        str(trainer_spec_path),
+        "--trainer-checkpoint",
+        str(checkpoint),
+        "--consumer-policy",
+        str(consumer_spec_path),
+        "--consumer-state",
+        str(promotion_root / "supervisor" / "consumers.json"),
+        "--interval",
+        "5",
+    ]
+    controller_argv = [
+        str(python),
+        "-m",
+        "risk_score.promotion_controller",
+        "--runtime-config",
+        str(promotion_path),
+        "--mode",
+        "watch" if mutation_enabled else "reconcile",
+        "--automatic" if mutation_enabled else "--recommend-only",
+    ]
+    if mutation_enabled:
+        controller_argv.extend(["--status-output", str(promotion_root / "status.json")])
+    auditor_argv = [
+        str(python),
+        "-m",
+        "risk_score.promotion_auditor",
+        "--runtime-config",
+        str(promotion_path),
+        "--katago",
+        str(katago),
+        "--mode",
+        "watch",
+        "--interval",
+        "5",
+    ]
+    feedback_argv = [
+        str(python),
+        "-m",
+        "risk_score.promotion_feedback",
+        "--runtime-config",
+        str(promotion_path),
+        "--run-root",
+        str(root),
+        "--mode",
+        "watch",
+        "--interval",
+        "15",
+    ]
+    if mutation_enabled:
+        feedback_argv.append("--strict")
+    model_probe_argv = [
+        str(python),
+        "-m",
+        "risk_score.model_probe",
+        "--katago",
+        str(katago),
+        "--config",
+        str(analysis_config),
+        "--model",
+        "{model_file}",
+        "--gpu-index",
+        "7",
+    ]
+    shuffler_environment = {
+        "KATAGO_DATA_WATERMARK": str(
+            promotion_root / "watermarks" / "data.json"
+        ),
+        "KATAGO_STRICT_SHUFFLE_PROVENANCE": (
+            "1" if mutation_enabled else "0"
+        ),
+    }
+    exporter_environment = {
+        "KATAGO_HARDENED_EXPORTER": str(
+            repository / "python" / "risk_score" / "hardened_exporter.py"
+        ),
+        "KATAGO_MODEL_PROBE_COMMAND_JSON": json.dumps(
+            model_probe_argv,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        "KATAGO_PROMOTION_BACKPRESSURE_FILE": str(
+            promotion_root / "operations" / "backpressure.json"
+        ),
+        "KATAGO_PROMOTION_POLICY_HASH": promotion["hashes"]["policy"],
+        "KATAGO_PROMOTION_BACKPRESSURE_MAX_AGE_SECONDS": "120",
+    }
+    services: Dict[str, Mapping[str, Any]] = {
+        "supervisor": {
+            "argv": supervisor_argv,
+            "description": "KataGo risk-training host supervisor",
+            "environment": {},
+        },
+        "controller": {
+            "argv": controller_argv,
+            "description": "KataGo risk-training promotion controller",
+            "environment": {},
+        },
+        "auditor": {
+            "argv": auditor_argv,
+            "description": "KataGo risk-training rollout and deep-audit worker",
+            "environment": {},
+        },
+        "feedback": {
+            "argv": feedback_argv,
+            "description": "KataGo risk-training provenance feedback watcher",
+            "environment": {},
+        },
+    }
+    for name, command, description, environment in (
+        (
+            "shuffler",
+            shuffler_argv,
+            "KataGo risk-training gated shuffler",
+            shuffler_environment,
+        ),
+        (
+            "exporter",
+            exporter_argv,
+            "KataGo risk-training hardened exporter",
+            exporter_environment,
+        ),
+    ):
+        if command:
+            services[name] = {
+                "argv": command,
+                "description": description,
+                "environment": environment,
+            }
+
+    systemd_units: Dict[str, Mapping[str, str]] = {}
+    if service_user is not None:
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", service_user) is None:
+            raise HostCommandError("systemd service user is invalid")
+        units_dir = output / "systemd"
+        unit_names = {
+            "supervisor": "katago-risk-promotion-host.service",
+            "controller": "katago-risk-promotion-controller.service",
+            "auditor": "katago-risk-promotion-auditor.service",
+            "feedback": "katago-risk-promotion-feedback.service",
+            "shuffler": "katago-risk-shuffler.service",
+            "exporter": "katago-risk-exporter.service",
+        }
+        for name, spec in services.items():
+            dependencies = (
+                ("katago-risk-promotion-host.service",)
+                if name in {"controller", "auditor", "feedback"}
+                else ()
+            )
+            unit_path = units_dir / unit_names[name]
+            _write_text_file(
+                unit_path,
+                _systemd_service(
+                    description=str(spec["description"]),
+                    argv=spec["argv"],
+                    service_user=service_user,
+                    working_directory=repository / "python",
+                    run_root=root,
+                    environment=spec.get("environment", {}),
+                    after=dependencies,
+                    requires=dependencies,
+                ),
+            )
+            systemd_units[name] = {
+                "path": str(unit_path),
+                "sha256": file_sha256(unit_path),
+            }
+        target_path = units_dir / "katago-risk-training.target"
+        _write_text_file(
+            target_path,
+            "\n".join(
+                [
+                    "[Unit]",
+                    "Description=KataGo risk-training closed-loop services",
+                    "",
+                    "[Install]",
+                    "WantedBy=multi-user.target",
+                    "",
+                ]
+            ),
+        )
+        systemd_units["target"] = {
+            "path": str(target_path),
+            "sha256": file_sha256(target_path),
+        }
     service_spec = {
-        "schema_version": 1,
-        "contract": "risk-score-host-services-v1",
-        "supervisor_argv": [
-            str(python),
-            "-m",
-            "risk_score.promotion_host",
-            "supervise",
-            "--runtime-config",
-            str(promotion_path),
-            "--state-root",
-            str(promotion_root / "supervisor"),
-            "--katago",
-            str(katago),
-            "--config",
-            str(selfplay),
-            "--trainer-spec",
-            str(trainer_spec_path),
-            "--trainer-checkpoint",
-            str(checkpoint),
-            "--consumer-policy",
-            str(consumer_spec_path),
-            "--consumer-state",
-            str(promotion_root / "supervisor" / "consumers.json"),
-            "--interval",
-            "5",
-        ],
+        "schema_version": 2,
+        "contract": "risk-score-host-services-v2",
+        "service_user": service_user,
+        "services": services,
+        "systemd_units": systemd_units,
+        "supervisor_argv": supervisor_argv,
+        "controller_argv": controller_argv,
     }
     service_path = output / "promotion-services.json"
     atomic_write_json(service_path, service_spec)
@@ -338,6 +671,8 @@ def build_live_runtime(
         "gpu_lease_runtime": gpu_path,
         "service_spec": service_path,
     }
+    for name, unit in systemd_units.items():
+        deployment_files[f"systemd:{name}"] = Path(unit["path"])
     for module_path in sorted(
         (repository / "python" / "risk_score").glob("*.py")
     ):
@@ -364,6 +699,7 @@ def build_live_runtime(
         "deployment_manifest_sha256": file_sha256(deployment_path),
         "service_spec": str(service_path),
         "service_spec_sha256": file_sha256(service_path),
+        "systemd_units": systemd_units,
         "mutation_enabled": mutation_enabled,
     }
 
@@ -415,12 +751,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--source-revision", required=True)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--mutation-enabled", action="store_true")
+    parser.add_argument("--service-user")
+    parser.add_argument("--shuffler-command-json")
+    parser.add_argument("--exporter-command-json")
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     try:
+        shuffler_command = _parse_command_json(args.shuffler_command_json, "shuffler")
+        exporter_command = _parse_command_json(args.exporter_command_json, "exporter")
         result = build_live_runtime(
             repo=args.repo,
             run_root=args.run_root,
@@ -436,6 +777,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             source_revision=args.source_revision,
             output_dir=args.output_dir,
             mutation_enabled=args.mutation_enabled,
+            service_user=args.service_user,
+            shuffler_command=shuffler_command,
+            exporter_command=exporter_command,
         )
     except (HostCommandError, OSError, TypeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)

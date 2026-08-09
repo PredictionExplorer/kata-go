@@ -178,6 +178,16 @@ curation must shard each role.
   hash-pinned runtime/deployment manifest generation.
 - [x] Require a live supervisor heartbeat and revalidate deployment hashes on
   every automatic controller iteration.
+- [x] Implement restartable eight-role consensus scheduling with canonical
+  progress, bounded per-GPU concurrency, and shard-level crash resume.
+- [x] Implement production canary/intermediate and deep-audit report
+  generation from closed worker trees and manifest-bound game evidence,
+  including automatic quarantine/rollback routing for derived failures.
+- [x] Bind admitted self-play through strict shuffle manifests and cumulative
+  trainer consumption/checkpoint/export receipts, with generation-indexed
+  rollback watermarks and feedback milestones.
+- [x] Materialize hash-bound systemd services and an atomic controller/training
+  status view for unattended operation.
 - [x] Cover host command, Stage 0, preflight, and runtime materialization
   contracts with automated tests.
 

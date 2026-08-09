@@ -14,7 +14,16 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
+
+from risk_score.promotion_feedback import (
+    SHUFFLE_MANIFEST_FILENAME,
+    PromotionFeedbackError,
+    build_shuffle_manifest,
+    file_sha256,
+    load_shuffle_manifest,
+    publish_shuffle_manifest,
+)
 
 
 STATE_SCHEMA_VERSION = 1
@@ -91,9 +100,18 @@ def _is_temporary_npz_name(name: str) -> bool:
     return "_" in name
 
 
-def _inventory_once(input_root: Path) -> Sequence[Mapping[str, Any]]:
+def _inventory_once(
+    input_root: Path,
+    known_inventory: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> Sequence[Mapping[str, Any]]:
     records = []
     root = input_root.resolve()
+    known_by_path = {
+        item["path"]: item
+        for item in (known_inventory or ())
+        if isinstance(item, Mapping) and isinstance(item.get("path"), str)
+    }
+
     def raise_walk_error(error):
         raise error
 
@@ -114,32 +132,64 @@ def _inventory_once(input_root: Path) -> Sequence[Mapping[str, Any]]:
             if not filename.endswith(".npz") or _is_temporary_npz_name(filename):
                 continue
             path = directory_path / filename
-            metadata = path.lstat()
-            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            before = path.lstat()
+            if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
                 raise ValueError(f"self-play NPZ is not a regular file: {path}")
+            relative = path.relative_to(root).as_posix()
+            known = known_by_path.get(relative)
+            metadata_identity = {
+                "size": before.st_size,
+                "mtime_ns": before.st_mtime_ns,
+                "ctime_ns": before.st_ctime_ns,
+                "device": before.st_dev,
+                "inode": before.st_ino,
+            }
+            reusable = (
+                known is not None
+                and all(
+                    known.get(key) == value
+                    for key, value in metadata_identity.items()
+                )
+                and isinstance(known.get("sha256"), str)
+                and len(known["sha256"]) == 64
+                and all(
+                    character in "0123456789abcdef"
+                    for character in known["sha256"]
+                )
+            )
+            digest = known["sha256"] if reusable else file_sha256(path)
+            metadata = path.lstat()
+            if (
+                before.st_dev != metadata.st_dev
+                or before.st_ino != metadata.st_ino
+                or before.st_size != metadata.st_size
+                or before.st_mtime_ns != metadata.st_mtime_ns
+                or before.st_ctime_ns != metadata.st_ctime_ns
+            ):
+                raise RuntimeError(f"self-play NPZ changed while hashing: {path}")
             records.append(
                 {
-                    "path": path.relative_to(root).as_posix(),
-                    "size": metadata.st_size,
-                    "mtime_ns": metadata.st_mtime_ns,
-                    "ctime_ns": metadata.st_ctime_ns,
-                    "device": metadata.st_dev,
-                    "inode": metadata.st_ino,
+                    "path": relative,
+                    "sha256": digest,
+                    **metadata_identity,
                 }
             )
     records.sort(key=lambda item: item["path"])
     return records
 
 
-def input_inventory(input_root: Path) -> Sequence[Mapping[str, Any]]:
+def input_inventory(
+    input_root: Path,
+    known_inventory: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> Sequence[Mapping[str, Any]]:
     root = Path(input_root)
     if not root.is_absolute() or root.is_symlink() or not root.is_dir():
         raise ValueError("shuffle input root must be an absolute non-symlink directory")
     last_error: Optional[BaseException] = None
     for attempt in range(MAX_INVENTORY_ATTEMPTS):
         try:
-            return _inventory_once(root)
-        except (FileNotFoundError, OSError) as exc:
+            return _inventory_once(root, known_inventory)
+        except (FileNotFoundError, OSError, RuntimeError) as exc:
             last_error = exc
             if attempt + 1 < MAX_INVENTORY_ATTEMPTS:
                 time.sleep(0.1)
@@ -185,11 +235,13 @@ def _command_dependency_inventory(
 
 
 def build_fingerprint(
-    input_root: Path, command: Sequence[str]
+    input_root: Path,
+    command: Sequence[str],
+    known_inventory: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> Mapping[str, Any]:
     if not command or any(not isinstance(part, str) or not part for part in command):
         raise ValueError("shuffle command must be a nonempty argv array")
-    inventory = input_inventory(input_root)
+    inventory = input_inventory(input_root, known_inventory)
     inventory_digest = _sha256_json(inventory)
     dependencies = _command_dependency_inventory(command)
     dependency_digest = _sha256_json(dependencies)
@@ -212,6 +264,7 @@ def build_fingerprint(
         "total_bytes": sum(int(item["size"]) for item in inventory),
         "command": command_identity,
         "dependencies": dependencies,
+        "inventory": inventory,
     }
 
 
@@ -229,6 +282,22 @@ def _latest_output_name(output_root: Optional[Path]) -> Optional[str]:
             continue
         candidates.append((entry.stat().st_mtime_ns, entry.name))
     return max(candidates, default=(0, None))[1]
+
+
+def _output_names(output_root: Optional[Path]) -> Sequence[str]:
+    if output_root is None:
+        return ()
+    root = Path(output_root)
+    if not root.exists():
+        return ()
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("shuffle output root must be a non-symlink directory")
+    names = []
+    for entry in root.iterdir():
+        if entry.name.endswith(".tmp") or entry.is_symlink() or not entry.is_dir():
+            continue
+        names.append(entry.name)
+    return tuple(sorted(names))
 
 
 def _open_lock(path: Path):
@@ -254,19 +323,48 @@ def run_if_changed(
     force_after_seconds: float,
     command: Sequence[str],
     environment: Optional[Mapping[str, str]] = None,
+    data_watermark: Optional[Path] = None,
+    strict_provenance: bool = False,
+    manifest_filename: str = SHUFFLE_MANIFEST_FILENAME,
+    command_runner: Callable[..., Any] = subprocess.run,
 ) -> Mapping[str, Any]:
     if not Path(state_file).is_absolute() or not Path(lock_file).is_absolute():
         raise ValueError("shuffle gate state and lock paths must be absolute")
     if force_after_seconds < 0:
         raise ValueError("force-after-seconds must be nonnegative")
+    if strict_provenance:
+        if output_root is None:
+            raise ValueError("strict provenance requires --output-root")
+        if data_watermark is None:
+            raise ValueError("strict provenance requires --data-watermark")
+    if data_watermark is not None and not Path(data_watermark).is_absolute():
+        raise ValueError("data watermark path must be absolute")
+    if data_watermark is not None and (
+        Path(data_watermark).is_symlink()
+        or not Path(data_watermark).is_file()
+    ):
+        raise ValueError("data watermark must be a regular non-symlink file")
+    if (
+        not isinstance(manifest_filename, str)
+        or not manifest_filename
+        or Path(manifest_filename).name != manifest_filename
+    ):
+        raise ValueError("manifest filename must be one path component")
     with _open_lock(lock_file) as lock:
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return {"status": "SKIPPED_CONCURRENT"}
 
-        fingerprint = build_fingerprint(input_root, command)
         state = _load_state(state_file)
+        known_inventory = (
+            state.get("inventory")
+            if state is not None and isinstance(state.get("inventory"), list)
+            else None
+        )
+        fingerprint = build_fingerprint(
+            input_root, command, known_inventory=known_inventory
+        )
         unchanged = (
             state is not None
             and state.get("combined_sha256") == fingerprint["combined_sha256"]
@@ -279,6 +377,36 @@ def run_if_changed(
                 or time.time() - float(recorded_at) >= force_after_seconds
             )
         if unchanged and not forced:
+            provenance_manifest = state.get("provenance_manifest")
+            if provenance_manifest is not None:
+                manifest_path = Path(provenance_manifest)
+                manifest = load_shuffle_manifest(
+                    manifest_path,
+                    verify_output=True,
+                    manifest_filename=manifest_filename,
+                )
+                if (
+                    state.get("provenance_manifest_sha256")
+                    != file_sha256(manifest_path)
+                    or manifest.get("gate_fingerprint_sha256")
+                    != fingerprint["combined_sha256"]
+                    or (
+                        strict_provenance
+                        and manifest.get("strict") is not True
+                    )
+                    or (
+                        data_watermark is not None
+                        and manifest.get("data_watermark_file_sha256")
+                        != file_sha256(Path(data_watermark))
+                    )
+                ):
+                    raise ValueError(
+                        "recorded shuffle provenance contradicts gate state"
+                    )
+            elif strict_provenance:
+                raise ValueError(
+                    "strict provenance state has no shuffle manifest"
+                )
             return {
                 "status": "SKIPPED_UNCHANGED",
                 "combined_sha256": fingerprint["combined_sha256"],
@@ -288,7 +416,8 @@ def run_if_changed(
 
         child_environment = dict(os.environ if environment is None else environment)
         child_environment["KATAGO_SHUFFLE_GATE_BYPASS"] = "1"
-        completed = subprocess.run(
+        outputs_before = set(_output_names(output_root))
+        completed = command_runner(
             list(command),
             check=False,
             shell=False,
@@ -302,12 +431,64 @@ def run_if_changed(
                 "combined_sha256": fingerprint["combined_sha256"],
             }
 
+        post_fingerprint = build_fingerprint(
+            input_root,
+            command,
+            known_inventory=fingerprint["inventory"],
+        )
+        if post_fingerprint["combined_sha256"] != fingerprint["combined_sha256"]:
+            raise RuntimeError(
+                "shuffle input or dependencies changed while the shuffle ran"
+            )
+        outputs_after = set(_output_names(output_root))
+        created_outputs = sorted(outputs_after - outputs_before)
+        output_name: Optional[str]
+        provenance_output_name: Optional[str] = None
+        if len(created_outputs) == 1:
+            output_name = created_outputs[0]
+            provenance_output_name = output_name
+        elif strict_provenance:
+            raise RuntimeError(
+                "strict shuffle provenance requires exactly one new output "
+                f"directory, found {created_outputs}"
+            )
+        else:
+            output_name = _latest_output_name(output_root)
+        provenance_manifest: Optional[Path] = None
+        if provenance_output_name is not None and output_root is not None:
+            output_path = Path(output_root).resolve() / provenance_output_name
+            manifest = build_shuffle_manifest(
+                output_path=output_path,
+                input_root=Path(input_root),
+                source_inventory=fingerprint["inventory"],
+                gate_fingerprint_sha256=fingerprint["combined_sha256"],
+                command_sha256=fingerprint["command_sha256"],
+                data_watermark_path=data_watermark,
+                strict=strict_provenance,
+                manifest_filename=manifest_filename,
+            )
+            provenance_manifest = publish_shuffle_manifest(
+                output_path,
+                manifest,
+                manifest_filename=manifest_filename,
+            )
+
         now = time.time()
         state = {
             "schema_version": STATE_SCHEMA_VERSION,
             "contract": STATE_CONTRACT,
             **fingerprint,
-            "last_successful_output": _latest_output_name(output_root),
+            "last_successful_output": output_name,
+            "provenance_manifest": (
+                str(provenance_manifest)
+                if provenance_manifest is not None
+                else None
+            ),
+            "provenance_manifest_sha256": (
+                file_sha256(provenance_manifest)
+                if provenance_manifest is not None
+                else None
+            ),
             "recorded_at_unix": now,
             "recorded_at_utc": datetime.datetime.fromtimestamp(
                 now, datetime.timezone.utc
@@ -321,6 +502,7 @@ def run_if_changed(
             "file_count": fingerprint["file_count"],
             "total_bytes": fingerprint["total_bytes"],
             "last_successful_output": state["last_successful_output"],
+            "provenance_manifest": state["provenance_manifest"],
         }
 
 
@@ -331,6 +513,24 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--lock-file", required=True, type=Path)
     parser.add_argument("--output-root", type=Path)
     parser.add_argument("--force-after-seconds", type=float, default=0.0)
+    parser.add_argument(
+        "--data-watermark",
+        type=Path,
+        default=(
+            Path(os.environ["KATAGO_DATA_WATERMARK"])
+            if os.environ.get("KATAGO_DATA_WATERMARK")
+            else None
+        ),
+    )
+    parser.add_argument(
+        "--strict-provenance",
+        action="store_true",
+        default=os.environ.get("KATAGO_STRICT_SHUFFLE_PROVENANCE") == "1",
+    )
+    parser.add_argument(
+        "--manifest-filename",
+        default=SHUFFLE_MANIFEST_FILENAME,
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     if args.command and args.command[0] == "--":
@@ -350,8 +550,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             output_root=args.output_root,
             force_after_seconds=args.force_after_seconds,
             command=args.command,
+            data_watermark=args.data_watermark,
+            strict_provenance=args.strict_provenance,
+            manifest_filename=args.manifest_filename,
         )
-    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+    except (
+        OSError,
+        PromotionFeedbackError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as exc:
         print(f"error: {exc}", file=os.sys.stderr)
         return 2
     print(_canonical_json(result), flush=True)

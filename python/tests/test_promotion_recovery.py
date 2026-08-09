@@ -17,6 +17,7 @@ from risk_score.promotion_controller import (
     PromotionController,
     RuntimeConfig,
     SafetyHalt,
+    _write_controller_status,
     _validate_queue_contract,
     configured_gate_evaluator,
     inspect_candidate,
@@ -782,7 +783,18 @@ def promotion_controller_tree_manifest(path):
     return canonical_sha256({"schemaVersion": 1, "files": rows}), total
 
 
-def mark_health_pass(controller, runtime, artifact, generation_id, phase):
+def mark_health_pass(
+    controller,
+    runtime,
+    artifact,
+    generation_id,
+    phase,
+    *,
+    decision="PASS",
+    record=True,
+):
+    assert decision in {"PASS", "FAIL"}
+    safety_failures = 0 if decision == "PASS" else 1
     worker_count = 1 if phase == "canary" else 3
     rollout = runtime.frozen_policy["rollout"]
     fresh_audit_pair_ids = (
@@ -822,7 +834,7 @@ def mark_health_pass(controller, runtime, artifact, generation_id, phase):
             "schema_version": 1,
             "contract": "risk-score-canary-fresh-audit-statistics-v1",
             "finalized": True,
-            "decision": "PASS",
+            "decision": decision,
             "candidate_hash": artifact.model_hash,
             "reference_hash": intent["tested_champion_hash"],
             "policy_hash": runtime.controller.policy_hash,
@@ -831,7 +843,7 @@ def mark_health_pass(controller, runtime, artifact, generation_id, phase):
             "color_pairs": rollout["canary_fresh_audit_color_pairs"],
             "pair_ids": fresh_audit_pair_ids,
             "pair_ids_sha256": canonical_sha256(fresh_audit_pair_ids),
-            "safety_failures": 0,
+            "safety_failures": safety_failures,
         }
         statistics["manifest_sha256"] = canonical_sha256(statistics)
         atomic_write_json(statistics_path, statistics)
@@ -839,7 +851,7 @@ def mark_health_pass(controller, runtime, artifact, generation_id, phase):
             "schema_version": 1,
             "contract": "risk-score-canary-fresh-audit-v1",
             "finalized": True,
-            "decision": "PASS",
+            "decision": decision,
             "generation_id": generation_id,
             "candidate_hash": artifact.model_hash,
             "reference_hash": intent["tested_champion_hash"],
@@ -850,7 +862,7 @@ def mark_health_pass(controller, runtime, artifact, generation_id, phase):
             "pair_ids_sha256": canonical_sha256(fresh_audit_pair_ids),
             "statistics_artifact_path": str(statistics_path.resolve()),
             "statistics_artifact_sha256": sha256_file(statistics_path),
-            "safety_failures": 0,
+            "safety_failures": safety_failures,
         }
         audit_manifest["manifest_sha256"] = canonical_sha256(
             audit_manifest
@@ -859,7 +871,7 @@ def mark_health_pass(controller, runtime, artifact, generation_id, phase):
     report = {
         "schema_version": 1,
         "finalized": True,
-        "decision": "PASS",
+        "decision": decision,
         "phase": phase,
         "generation_id": generation_id,
         "candidate_hash": artifact.model_hash,
@@ -878,11 +890,19 @@ def mark_health_pass(controller, runtime, artifact, generation_id, phase):
         "output_schema_pass": True,
         "throughput_pass": True,
         "crash_error_pass": True,
-        "behavior_pass": True,
+        "behavior_pass": decision == "PASS",
         "tactical_pass": True,
         "exploitability_pass": True,
-        "catastrophe_pass": True,
+        "catastrophe_pass": decision == "PASS",
         "game_count": rollout["canary_games"] if phase == "canary" else 6000,
+        "minimum_game_count": (
+            rollout["canary_games"]
+            * (
+                1
+                if phase == "canary"
+                else controller.runtime.controller.intermediate_worker_count
+            )
+        ),
         "fresh_audit_pairs": (
             rollout["canary_fresh_audit_color_pairs"] if phase == "canary" else 0
         ),
@@ -905,6 +925,8 @@ def mark_health_pass(controller, runtime, artifact, generation_id, phase):
         "report_path": report_path,
         "report_hash": sha256_file(report_path),
     }
+    if not record:
+        return report_path
     if phase == "canary":
         controller.mark_canary_passed(
             generation_id, artifact.model_hash, **kwargs
@@ -913,6 +935,7 @@ def mark_health_pass(controller, runtime, artifact, generation_id, phase):
         controller.mark_intermediate_passed(
             generation_id, artifact.model_hash, **kwargs
         )
+    return report_path
 
 
 def acknowledge_canary(controller, runtime, artifact, generation_id):
@@ -1047,6 +1070,7 @@ def test_cli_defaults_to_recommendation_and_requires_explicit_automatic():
     assert not args.automatic
     assert not args.recommend_only
     assert args.mode == "once"
+    assert args.status_output is None
     with pytest.raises(SystemExit):
         parse_args(
             [
@@ -1055,6 +1079,29 @@ def test_cli_defaults_to_recommendation_and_requires_explicit_automatic():
                 "--automatic",
                 "--recommend-only",
             ]
+        )
+
+
+def test_controller_status_snapshot_is_canonical_and_contained(tmp_path):
+    runtime = prepare_runtime(tmp_path)
+    target = runtime.promotion_root / "status.json"
+    _write_controller_status(target, runtime, {"mode": "automatic", "warnings": []})
+    data = target.read_bytes()
+    value = json.loads(data)
+    assert data == canonical_json_bytes(value) + b"\n"
+    assert value["contract"] == "risk-score-controller-status-v1"
+    assert value["result"]["mode"] == "automatic"
+    _write_controller_status(
+        target,
+        runtime,
+        {"mode": "automatic", "warnings": ["queue"]},
+    )
+    assert json.loads(target.read_text())["result"]["warnings"] == ["queue"]
+    with pytest.raises(ConfigurationError, match="promotion/status.json"):
+        _write_controller_status(
+            runtime.promotion_root / "nested" / "status.json",
+            runtime,
+            {},
         )
 
 
@@ -2816,6 +2863,49 @@ def test_partial_worker_ack_canary_admission_and_idempotent_promotion(tmp_path):
     assert active["status"] == retry["status"] == "ACTIVE"
     assert (runtime.admitted_selfplay / "generation-1" / "worker-000").exists()
     assert controller.registry.reconstruct().current_champion_hash == artifact.model_hash
+
+
+def test_failed_canary_report_is_ingested_and_quarantines_generation(tmp_path):
+    runtime, controller, artifact = bootstrap_and_claim(tmp_path)
+    _, report_path, report_hash = confirm_and_report(controller, artifact)
+    kwargs = promotion_kwargs(runtime, report_path, report_hash)
+    generation_id = "generation-failed-canary"
+    assert (
+        controller.promote(artifact.model_hash, generation_id, **kwargs)[
+            "status"
+        ]
+        == "WAITING_CANARY_ACK"
+    )
+    acknowledge_worker(controller, runtime, artifact, generation_id, 0)
+    failure_path = mark_health_pass(
+        controller,
+        runtime,
+        artifact,
+        generation_id,
+        "canary",
+        decision="FAIL",
+        record=False,
+    )
+
+    assert failure_path.is_file()
+    assert controller._ingest_rollout_ipc()
+    generation = controller.registry.reconstruct().generations[generation_id]
+    assert generation.state == GenerationState.QUARANTINED
+    assert (
+        runtime.promotion_root
+        / "transactions"
+        / generation_id
+        / "canary-failure.json"
+    ).is_file()
+    assert not controller._ingest_rollout_ipc()
+    outcomes = controller._advance_confirmed_promotions()
+    assert outcomes == (
+        {
+            "status": GenerationState.QUARANTINED.value,
+            "candidate_hash": artifact.model_hash,
+            "generation_id": generation_id,
+        },
+    )
 
 
 def test_rollout_launches_only_phase_deltas_and_admits_full_generation(tmp_path):

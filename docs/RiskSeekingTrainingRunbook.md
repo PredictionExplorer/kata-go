@@ -856,6 +856,9 @@ stopped reliably.
 export SHUFFLE_THREADS='SET_ME'
 export BATCH_SIZE='SET_ME'
 export KATAGO_SHUFFLE_FORCE_AFTER_SECONDS=3600
+export KATAGO_DATA_WATERMARK="$TRAIN_BASE/promotion/watermarks/data.json"
+export KATAGO_STRICT_SHUFFLE_PROVENANCE=1
+test -f "$KATAGO_DATA_WATERMARK"
 case "$SHUFFLE_THREADS" in
   ''|*[!0-9]*) echo "Set integer SHUFFLE_THREADS" >&2; exit 1 ;;
 esac
@@ -885,7 +888,10 @@ otherwise. `shuffle.sh` fingerprints complete self-play inputs and skips an
 unchanged shuffle. The force interval is a safety valve that provides a fresh
 random sample when a trainer still has bucket credit but no new self-play file
 has completed; tune it from measured trainer consumption time rather than
-returning to an unconditional tight loop.
+returning to an unconditional tight loop. Automatic promotion additionally
+requires the feedback watcher to initialize the data watermark first. Strict
+mode publishes `generation-provenance.json` beside every new shuffle and fails
+closed on unbound or changed self-play input.
 
 ### 3. Trainer on GPU 7
 
@@ -928,6 +934,8 @@ setsid bash -c '
       -epochs-per-export 5 \
       -export-min-sample-interval 500000 \
       -max-val-samples 12288 \
+      -generation-provenance-dir "$2/promotion/provenance/trainer" \
+      -require-shuffle-provenance \
       -no-repeat-files -stop-when-train-bucket-limited
     then
       exit 1
@@ -955,7 +963,9 @@ every epoch. The restart loop handles normal bucket-limited exits; once the
 promotion host supervisor is installed, use that single-owner supervisor
 instead of running both. If the source checkpoint's optimizer is not
 resumable, start a fresh optimizer explicitly and document the conservative
-schedule.
+schedule. The provenance options bind every consumed shuffle, checkpoint, and
+export to admitted generation hashes. They are mandatory in automatic mode;
+the runtime builder rejects an automatic trainer spec that omits them.
 
 ### 4. Exporter, staging only
 

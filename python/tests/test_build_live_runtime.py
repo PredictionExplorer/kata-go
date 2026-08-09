@@ -43,6 +43,9 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
                     "-c",
                     "pass",
                     "-stop-when-train-bucket-limited",
+                    "-generation-provenance-dir",
+                    str(run / "promotion" / "provenance" / "trainer"),
+                    "-require-shuffle-provenance",
                     "{checkpoint_path}",
                 ],
                 "env": {"CUDA_VISIBLE_DEVICES": "7"},
@@ -125,17 +128,117 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
         source_revision=revision,
         output_dir=output,
         require_clean_source=False,
+        service_user="ubuntu",
+        shuffler_command=[sys.executable, "-c", "print('shuffle')"],
+        exporter_command=[sys.executable, "-c", "print('export')"],
     )
     promotion_path = Path(result["promotion_runtime"])
     gpu_path = Path(result["gpu_lease_runtime"])
+    service_path = Path(result["service_spec"])
     promotion = json.loads(promotion_path.read_text(encoding="utf-8"))
     gpu = json.loads(gpu_path.read_text(encoding="utf-8"))
+    services = json.loads(service_path.read_text(encoding="utf-8"))
     assert promotion["mutationEnabled"] is False
     assert gpu["mutationEnabled"] is False
     assert promotion["hashes"]["gpuLeaseConfig"] == file_sha256(gpu_path)
     assert promotion["paths"]["candidateInbox"] == str(run / "modelstobetested")
     assert "risk_score.stage0_probe" in promotion["commands"]["stage0Probe"]
     assert "risk_score.promotion_host" in promotion["commands"]["selfplay"]
+    assert services["contract"] == "risk-score-host-services-v2"
+    assert services["services"]["controller"]["argv"][-1] == "--recommend-only"
+    auditor_argv = services["services"]["auditor"]["argv"]
+    assert auditor_argv[auditor_argv.index("--katago") + 1] == str(katago)
+    assert "--strict" not in services["services"]["feedback"]["argv"]
+    assert (
+        services["services"]["shuffler"]["environment"][
+            "KATAGO_STRICT_SHUFFLE_PROVENANCE"
+        ]
+        == "0"
+    )
+    probe = json.loads(
+        services["services"]["exporter"]["environment"][
+            "KATAGO_MODEL_PROBE_COMMAND_JSON"
+        ]
+    )
+    assert probe[probe.index("--katago") + 1] == str(katago)
+    assert set(services["services"]) == {
+        "auditor",
+        "controller",
+        "exporter",
+        "feedback",
+        "shuffler",
+        "supervisor",
+    }
+    assert set(services["systemd_units"]) == {
+        "auditor",
+        "controller",
+        "exporter",
+        "feedback",
+        "shuffler",
+        "supervisor",
+        "target",
+    }
+    for unit in services["systemd_units"].values():
+        assert file_sha256(Path(unit["path"])) == unit["sha256"]
+    controller_unit = Path(services["systemd_units"]["controller"]["path"]).read_text(
+        encoding="utf-8"
+    )
+    assert "User=ubuntu" in controller_unit
+    assert "Requires=katago-risk-promotion-host.service" in controller_unit
+    with pytest.raises(HostCommandError, match="automatic runtime requires"):
+        build_live_runtime(
+            repo=REPO,
+            run_root=run,
+            suite_dir=suites,
+            katago_binary=katago,
+            python_executable=Path(sys.executable),
+            trainer_spec=trainer_spec,
+            consumer_spec=consumer_spec,
+            original_model=original,
+            trainer_checkpoint=checkpoint,
+            gpu_uuid="GPU-test-production",
+            actor="controller-test",
+            source_revision=revision,
+            output_dir=run / "invalid-automatic-configs",
+            mutation_enabled=True,
+            require_clean_source=False,
+        )
+    automatic = build_live_runtime(
+        repo=REPO,
+        run_root=run,
+        suite_dir=suites,
+        katago_binary=katago,
+        python_executable=Path(sys.executable),
+        trainer_spec=trainer_spec,
+        consumer_spec=consumer_spec,
+        original_model=original,
+        trainer_checkpoint=checkpoint,
+        gpu_uuid="GPU-test-production",
+        actor="controller-test",
+        source_revision=revision,
+        output_dir=run / "automatic-configs",
+        mutation_enabled=True,
+        require_clean_source=False,
+        service_user="ubuntu",
+        shuffler_command=[sys.executable, "-c", "print('shuffle')"],
+        exporter_command=[sys.executable, "-c", "print('export')"],
+    )
+    automatic_services = json.loads(
+        Path(automatic["service_spec"]).read_text(encoding="utf-8")
+    )
+    controller_argv = automatic_services["services"]["controller"]["argv"]
+    assert "--automatic" in controller_argv
+    assert controller_argv[-2:] == [
+        "--status-output",
+        str(run / "promotion" / "status.json"),
+    ]
+    assert "--strict" in automatic_services["services"]["feedback"]["argv"]
+    assert (
+        automatic_services["services"]["shuffler"]["environment"][
+            "KATAGO_STRICT_SHUFFLE_PROVENANCE"
+        ]
+        == "1"
+    )
     deployment = verify_deployment_manifest(Path(result["deployment_manifest"]))
     assert deployment["source_revision"] == revision
     katago.write_bytes(b"changed")

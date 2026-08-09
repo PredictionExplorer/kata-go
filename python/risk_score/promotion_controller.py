@@ -6456,6 +6456,15 @@ class PromotionController:
             if path.name.startswith("."):
                 continue
             value = json.loads(path.read_text(encoding="utf-8"))
+            generation = self.registry.reconstruct().generations.get(
+                value.get("generation_id")
+            )
+            if generation is not None and generation.state in {
+                GenerationState.ROLLBACK_PENDING,
+                GenerationState.ROLLED_BACK,
+                GenerationState.QUARANTINED,
+            }:
+                continue
             self.record_worker_ack(
                 value["generation_id"],
                 value["worker_id"],
@@ -6468,28 +6477,84 @@ class PromotionController:
             if path.name.startswith("."):
                 continue
             value = json.loads(path.read_text(encoding="utf-8"))
+            generation = self.registry.reconstruct().generations.get(
+                value.get("generation_id")
+            )
+            if generation is not None and generation.state in {
+                GenerationState.ROLLBACK_PENDING,
+                GenerationState.ROLLED_BACK,
+                GenerationState.QUARANTINED,
+            }:
+                continue
             kwargs = {"report_path": path, "report_hash": sha256_file(path)}
-            if value.get("phase") == "canary":
+            phase = value.get("phase")
+            decision = value.get("decision")
+            if phase not in {"canary", "intermediate"}:
+                raise SafetyHalt(f"unknown rollout report phase: {phase!r}")
+            if decision == "FAIL":
+                self.mark_rollout_failed(
+                    value["generation_id"],
+                    value["candidate_hash"],
+                    phase,
+                    **kwargs,
+                )
+            elif decision == "PASS" and phase == "canary":
                 self.mark_canary_passed(
                     value["generation_id"], value["candidate_hash"], **kwargs
                 )
-            elif value.get("phase") == "intermediate":
+            elif decision == "PASS":
                 self.mark_intermediate_passed(
                     value["generation_id"], value["candidate_hash"], **kwargs
                 )
+            else:
+                raise SafetyHalt(
+                    f"unknown rollout report decision: {decision!r}"
+                )
             ingested = True
+        audit_outbox = self.runtime.promotion_root / "audits" / "outbox"
+        if audit_outbox.exists():
+            for path in sorted(audit_outbox.glob("*.json")):
+                if path.name.startswith("."):
+                    continue
+                value = json.loads(path.read_text(encoding="utf-8"))
+                self.record_deep_audit_report(
+                    value["generation_id"],
+                    report_path=path,
+                    report_hash=sha256_file(path),
+                )
+                ingested = True
         return ingested
 
     def _advance_confirmed_promotions(self) -> Tuple[Mapping[str, Any], ...]:
         if self.recommendation_only:
             return ()
         outcomes = []
+        self._ingest_rollout_ipc()
         state = self.registry.reconstruct()
         readiness_errors: Optional[Tuple[str, ...]] = None
         for candidate in sorted(
             state.candidates.values(), key=lambda item: item.candidate_hash
         ):
             if candidate.state != CandidateState.CONFIRMED:
+                continue
+            terminal_generations = [
+                generation
+                for generation in state.generations.values()
+                if generation.candidate_hash == candidate.candidate_hash
+                and generation.state
+                in {
+                    GenerationState.QUARANTINED,
+                    GenerationState.ROLLED_BACK,
+                }
+            ]
+            if terminal_generations:
+                outcomes.append(
+                    {
+                        "status": terminal_generations[0].state.value,
+                        "candidate_hash": candidate.candidate_hash,
+                        "generation_id": terminal_generations[0].generation_id,
+                    }
+                )
                 continue
             if readiness_errors is None:
                 readiness_errors = self._promotion_readiness_errors()
@@ -6596,6 +6661,7 @@ class PromotionController:
         self.validate_static_inputs()
         if self.recommendation_only:
             return self.reconcile(mutate=False)
+        self._ingest_rollout_ipc()
         with self._writer_lock():
             self.ensure_layout()
             self._require_disk()
@@ -7109,7 +7175,10 @@ class PromotionController:
         phase: str,
         report_path: Path,
         report_hash: str,
+        expected_decision: str = "PASS",
     ) -> Mapping[str, Any]:
+        if expected_decision not in {"PASS", "FAIL"}:
+            raise ValueError("rollout report decision must be PASS or FAIL")
         self._transaction_dir(generation_id)
         _hash(report_hash, f"{phase} report hash")
         report_path = Path(report_path)
@@ -7133,7 +7202,7 @@ class PromotionController:
         expected = {
             "schema_version": 1,
             "finalized": True,
-            "decision": "PASS",
+            "decision": expected_decision,
             "phase": phase,
             "generation_id": generation_id,
             "candidate_hash": candidate_hash,
@@ -7143,27 +7212,40 @@ class PromotionController:
             "audit_schedule_hash": self.runtime.controller.audit_schedule_hash,
             "topology": "7-workers-100-threads",
             "worker_count": required_workers,
-            "model_purity_pass": True,
-            "output_schema_pass": True,
-            "throughput_pass": True,
-            "crash_error_pass": True,
-            "behavior_pass": True,
-            "catastrophe_pass": True,
         }
+        check_names = [
+            "model_purity_pass",
+            "output_schema_pass",
+            "throughput_pass",
+            "crash_error_pass",
+            "behavior_pass",
+            "catastrophe_pass",
+        ]
         if (
             self.runtime.frozen_policy.get("policy_version")
             != PROMOTION_READY_POLICY_VERSION
         ):
-            expected.update(
-                {
-                    "tactical_pass": True,
-                    "exploitability_pass": True,
-                }
-            )
+            check_names.extend(["tactical_pass", "exploitability_pass"])
         if not isinstance(report, dict) or any(
             report.get(key) != value for key, value in expected.items()
         ):
             raise SafetyHalt(f"{phase} report does not satisfy frozen policy")
+        checks = {name: report.get(name) for name in check_names}
+        if any(type(value) is not bool for value in checks.values()):
+            raise SafetyHalt(f"{phase} report health checks must be booleans")
+        derived_decision = "PASS" if all(checks.values()) else "FAIL"
+        if derived_decision != expected_decision:
+            raise SafetyHalt(f"{phase} report decision contradicts health checks")
+        minimum_games = report.get("minimum_game_count")
+        game_count = report.get("game_count")
+        if (
+            type(minimum_games) is not int
+            or minimum_games <= 0
+            or type(game_count) is not int
+            or game_count < 0
+            or report["throughput_pass"] != (game_count >= minimum_games)
+        ):
+            raise SafetyHalt(f"{phase} report throughput decision is invalid")
         if phase == "canary":
             rollout = self.runtime.frozen_policy.get("rollout")
             if not isinstance(rollout, Mapping):
@@ -7175,8 +7257,7 @@ class PromotionController:
                 or required_games <= 0
                 or type(required_pairs) is not int
                 or required_pairs <= 0
-                or type(report.get("game_count")) is not int
-                or report["game_count"] < required_games
+                or minimum_games != required_games
                 or type(report.get("fresh_audit_pairs")) is not int
                 or report["fresh_audit_pairs"] < required_pairs
             ):
@@ -7295,11 +7376,17 @@ class PromotionController:
                     )
                 audit_payload = dict(audit_manifest)
                 audit_identity = audit_payload.pop("manifest_sha256", None)
+                audit_decision = (
+                    "PASS"
+                    if report["behavior_pass"] and report["catastrophe_pass"]
+                    else "FAIL"
+                )
+                audit_safety_failures = audit_manifest.get("safety_failures")
                 expected_audit = {
                     "schema_version": 1,
                     "contract": "risk-score-canary-fresh-audit-v1",
                     "finalized": True,
-                    "decision": "PASS",
+                    "decision": audit_decision,
                     "generation_id": generation_id,
                     "candidate_hash": candidate_hash,
                     "reference_hash": promotion_intent[
@@ -7312,7 +7399,6 @@ class PromotionController:
                         self.runtime.controller.audit_schedule_hash,
                     "color_pairs": required_pairs,
                     "pair_ids_sha256": pair_ids_hash,
-                    "safety_failures": 0,
                 }
                 statistics_hash = audit_manifest.get(
                     "statistics_artifact_sha256"
@@ -7326,6 +7412,10 @@ class PromotionController:
                         audit_manifest.get(key) != value
                         for key, value in expected_audit.items()
                     )
+                    or type(audit_safety_failures) is not int
+                    or audit_safety_failures < 0
+                    or (audit_decision == "PASS" and audit_safety_failures != 0)
+                    or (audit_decision == "FAIL" and audit_safety_failures == 0)
                     or not isinstance(statistics_hash, str)
                     or _SHA_RE.fullmatch(statistics_hash) is None
                     or not isinstance(statistics_path_value, str)
@@ -7371,11 +7461,14 @@ class PromotionController:
                 statistics_identity = statistics_payload.pop(
                     "manifest_sha256", None
                 )
+                statistics_safety_failures = statistics.get(
+                    "safety_failures"
+                )
                 expected_statistics = {
                     "schema_version": 1,
                     "contract": "risk-score-canary-fresh-audit-statistics-v1",
                     "finalized": True,
-                    "decision": "PASS",
+                    "decision": audit_decision,
                     "candidate_hash": candidate_hash,
                     "reference_hash": promotion_intent[
                         "tested_champion_hash"
@@ -7388,7 +7481,6 @@ class PromotionController:
                     "color_pairs": required_pairs,
                     "pair_ids": pair_ids,
                     "pair_ids_sha256": pair_ids_hash,
-                    "safety_failures": 0,
                 }
                 if (
                     statistics_identity
@@ -7397,6 +7489,7 @@ class PromotionController:
                         statistics.get(key) != value
                         for key, value in expected_statistics.items()
                     )
+                    or statistics_safety_failures != audit_safety_failures
                 ):
                     raise SafetyHalt(
                         "canary statistics artifact does not satisfy policy"
@@ -7466,6 +7559,70 @@ class PromotionController:
             path = self._transaction_dir(generation_id) / "intermediate-pass.json"
             _write_immutable_json(path, report)
             return path
+
+    def mark_rollout_failed(
+        self,
+        generation_id: str,
+        candidate_hash: str,
+        phase: str,
+        *,
+        report_path: Path,
+        report_hash: str,
+    ) -> Path:
+        """Quarantine a pre-activation generation from derived rollout failure."""
+
+        if not self.automatic:
+            raise SafetyHalt("rollout failure mutation is disabled")
+        if phase not in {"canary", "intermediate"}:
+            raise ValueError("rollout failure phase must be canary or intermediate")
+        with self._writer_lock():
+            report = self._validate_rollout_health_report(
+                generation_id,
+                candidate_hash,
+                phase,
+                report_path,
+                report_hash,
+                expected_decision="FAIL",
+            )
+            transaction = self._transaction_dir(generation_id)
+            marker = transaction / f"{phase}-failure.json"
+            _write_immutable_json(marker, report)
+            state = self.registry.reconstruct()
+            generation = state.generations.get(generation_id)
+            if generation is None or generation.candidate_hash != candidate_hash:
+                raise SafetyHalt("rollout failure names an unknown generation")
+            if generation.state == GenerationState.QUARANTINED:
+                return marker
+            expected_state = (
+                GenerationState.CANARY
+                if phase == "canary"
+                else GenerationState.ROLLOUT
+            )
+            if generation.state != expected_state:
+                raise SafetyHalt(
+                    f"{phase} failure contradicts generation state "
+                    f"{generation.state.value}"
+                )
+            intent = json.loads((transaction / "intent.json").read_text(encoding="utf-8"))
+            provenance = self._provenance(
+                intent["config_hash"],
+                intent["schedule_hash"],
+            )
+            self.registry.transition_generation(
+                generation_id,
+                candidate_hash,
+                generation.candidate_path,
+                GenerationState.QUARANTINED,
+                provenance=provenance,
+                tested_champion_hash=generation.previous_champion_hash,
+                reason=f"{phase} rollout evidence derived FAIL",
+                actor=self.runtime.controller.actor,
+                payload={
+                    "report_path": str(Path(report_path).resolve()),
+                    "report_hash": report_hash,
+                },
+            )
+            return marker
 
     def _admit_canary(self, generation_id: str, candidate_hash: str) -> bool:
         transaction = self._transaction_dir(generation_id)
@@ -7669,6 +7826,25 @@ class PromotionController:
             if isinstance(shuffle_watermark, dict)
             else []
         )
+        generation_shuffle_contract = (
+            shuffle_watermark.get("contract")
+            == "risk-score-generation-shuffle-watermark-v1"
+        )
+        if generation_shuffle_contract:
+            derived_by_generation = shuffle_watermark.get(
+                "derived_paths_by_generation"
+            )
+            consumed_by_generation = shuffle_watermark.get(
+                "trainer_consumed_by_generation"
+            )
+            if (
+                not isinstance(derived_by_generation, dict)
+                or not isinstance(consumed_by_generation, dict)
+            ):
+                raise SafetyHalt(
+                    "generation shuffle watermark lacks rollback lineage"
+                )
+            shuffle_paths = derived_by_generation.get(generation_id, [])
         if (
             not isinstance(shuffle_paths, list)
             or any(not isinstance(item, str) for item in shuffle_paths)
@@ -7778,6 +7954,9 @@ class PromotionController:
                 "shuffle_watermark_hash": shuffle_watermark_hash,
                 "data_watermark_path": str(self.runtime.data_watermark_path),
                 "shuffle_watermark_path": str(self.runtime.shuffle_watermark_path),
+                "shuffle_watermark_contract": shuffle_watermark.get(
+                    "contract"
+                ),
                 "derived_shuffle_paths": authoritative_shuffle_paths,
             }
             _write_immutable_json(transaction / "intent.json", intent)
@@ -8027,7 +8206,57 @@ class PromotionController:
             generation = state.generations.get(generation_id)
             if generation is None:
                 raise SafetyHalt(f"unknown generation: {generation_id}")
-            if derived_shuffle_paths:
+            lineage_paths = list(intent.get("derived_shuffle_paths", []))
+            effective_trainer_consumed = trainer_consumed
+            live_shuffle_watermark_hash = None
+            if (
+                intent.get("shuffle_watermark_contract")
+                == "risk-score-generation-shuffle-watermark-v1"
+            ):
+                if derived_shuffle_paths or trainer_consumed:
+                    raise SafetyHalt(
+                        "generation rollback lineage cannot be supplied by a caller"
+                    )
+                from risk_score.promotion_feedback import (
+                    load_shuffle_watermark,
+                )
+
+                live_watermark = load_shuffle_watermark(
+                    self.runtime.shuffle_watermark_path
+                )
+                live_shuffle_watermark_hash = sha256_file(
+                    self.runtime.shuffle_watermark_path
+                )
+                by_generation = live_watermark.get(
+                    "derived_paths_by_generation"
+                )
+                consumed_by_generation = live_watermark.get(
+                    "trainer_consumed_by_generation"
+                )
+                if (
+                    not isinstance(by_generation, dict)
+                    or not isinstance(consumed_by_generation, dict)
+                    or generation_id not in by_generation
+                    or generation_id not in consumed_by_generation
+                    or not isinstance(
+                        by_generation[generation_id], list
+                    )
+                    or any(
+                        not isinstance(path, str)
+                        for path in by_generation[generation_id]
+                    )
+                    or type(consumed_by_generation[generation_id]) is not bool
+                ):
+                    raise SafetyHalt(
+                        "live generation rollback watermark is malformed"
+                    )
+                lineage_paths = list(
+                    by_generation[generation_id]
+                )
+                effective_trainer_consumed = consumed_by_generation[
+                    generation_id
+                ]
+            elif derived_shuffle_paths:
                 raise SafetyHalt(
                     "rollback paths must come from the frozen promotion lineage"
                 )
@@ -8057,7 +8286,7 @@ class PromotionController:
                 ("staged-rollout", staged, quarantine / "staged-rollout"),
                 ("admitted-generation", admitted, quarantine / "admitted-generation"),
             ]
-            for index, item in enumerate(intent.get("derived_shuffle_paths", [])):
+            for index, item in enumerate(lineage_paths):
                 source = Path(item)
                 requested_moves.append(
                     (
@@ -8093,7 +8322,9 @@ class PromotionController:
                     "trainer_checkpoint_hash": intent["trainer_checkpoint_hash"],
                     "data_watermark_hash": intent["data_watermark_hash"],
                     "shuffle_watermark_hash": intent["shuffle_watermark_hash"],
-                    "trainer_consumed": trainer_consumed,
+                    "live_shuffle_watermark_hash":
+                        live_shuffle_watermark_hash,
+                    "trainer_consumed": effective_trainer_consumed,
                     "moves": move_intents,
                 }
                 _write_immutable_json(rollback_intent_path, rollback_intent)
@@ -8747,11 +8978,40 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     mode.add_argument("--recommend-only", action="store_true")
     mode.add_argument("--automatic", action="store_true")
     parser.add_argument("--interval", type=float)
+    parser.add_argument("--status-output", type=Path)
     parser.add_argument("--bootstrap-champion", action="store_true")
     parser.add_argument("--bootstrap-champion-hash")
     parser.add_argument("--bootstrap-generation-id")
     parser.add_argument("--bootstrap-confirmation")
     return parser.parse_args(argv)
+
+
+def _write_controller_status(
+    path: Path,
+    runtime: RuntimeConfig,
+    result: Mapping[str, Any],
+) -> None:
+    target = Path(path)
+    promotion_root = runtime.promotion_root.resolve()
+    if (
+        not target.is_absolute()
+        or (target.exists() and target.is_symlink())
+        or target.parent.resolve() != promotion_root
+        or target.name != "status.json"
+    ):
+        raise ConfigurationError(
+            "--status-output must be the non-symlink promotion/status.json path"
+        )
+    payload = {
+        "schema_version": 1,
+        "contract": "risk-score-controller-status-v1",
+        "observed_at_utc": utc_timestamp(datetime.now(timezone.utc)),
+        "controller_actor": runtime.controller.actor,
+        "source_revision_hash": runtime.controller.source_hash,
+        "policy_hash": runtime.controller.policy_hash,
+        "result": result,
+    }
+    atomic_write_bytes(target, canonical_json_bytes(payload) + b"\n")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -8776,6 +9036,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
         if args.interval is not None and args.interval <= 0:
             raise ConfigurationError("--interval must be positive")
+        if args.status_output is not None and not args.automatic:
+            raise ConfigurationError("--status-output requires --automatic")
         verify_live_dependencies: Optional[Callable[[], None]] = None
         if args.automatic:
             from risk_score.build_live_runtime import verify_deployment_manifest
@@ -8846,6 +9108,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             else:
                 result = controller.run_once()
             print(json.dumps(result, sort_keys=True))
+            if args.status_output is not None:
+                _write_controller_status(args.status_output, runtime, result)
             if args.mode != "watch":
                 break
             time.sleep(interval)
