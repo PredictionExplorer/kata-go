@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from risk_score.cluster_scheduler import ClusterScheduler, WorkKind
 from risk_score.promotion_state import atomic_write_json
 from risk_score.promotion_status import StatusError, collect_status
 
@@ -88,3 +89,45 @@ def test_status_requires_absolute_run_root(tmp_path, monkeypatch):
     Path("relative").mkdir()
     with pytest.raises(StatusError, match="absolute"):
         collect_status(Path("relative"))
+
+
+def test_status_reports_scheduler_owners_idle_work_and_pipeline_backlogs(tmp_path):
+    root = tmp_path.resolve()
+    promotion = root / "promotion"
+    promotion.mkdir()
+    scheduler = ClusterScheduler(
+        promotion / "scheduler", ("0", "1"), clock=lambda: 1000.0
+    )
+    scheduler.enqueue(
+        "full-consensus",
+        WorkKind.CURATION,
+        eligible_gpus=("0", "1"),
+        preemptible=True,
+    )
+    for directory, names in (
+        (root / "torchmodels_toexport", ("raw-1", "raw-2", ".partial")),
+        (root / "modelstobetested", ("candidate-1",)),
+        (root / "models", ("original",)),
+    ):
+        directory.mkdir()
+        for name in names:
+            (directory / name).mkdir()
+
+    waiting = collect_status(root, now=1000.0)
+    assert waiting["scheduler"]["active_claims"] == 0
+    assert waiting["scheduler"]["work_by_state"] == {"queued": 1}
+    assert waiting["pipeline"] == {
+        "raw_checkpoint_backlog": 2,
+        "candidate_inbox_depth": 1,
+        "accepted_model_count": 1,
+        "reviewed_position_bank_ready": False,
+        "v3_suite_ready": False,
+    }
+    assert "scheduler-runnable-work-unclaimed" in waiting["warnings"]
+
+    claim = scheduler.claim("0", "curation-worker")
+    running = collect_status(root, now=1000.0)
+    assert running["scheduler"]["active_claims"] == 1
+    assert running["scheduler"]["owners"] == {"0": "curation-worker"}
+    assert "scheduler-runnable-work-unclaimed" not in running["warnings"]
+    scheduler.release(claim)

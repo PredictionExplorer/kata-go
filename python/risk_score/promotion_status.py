@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
-from risk_score.position_samples import canonical_json
+from risk_score.position_samples import canonical_json, canonical_sha256
 from risk_score.promotion_state import canonical_json_bytes
 
 
@@ -62,6 +62,78 @@ def _latest_file(root: Path, pattern: str) -> Optional[Path]:
     return max(candidates, key=lambda path: path.stat().st_mtime, default=None)
 
 
+def _directory_count(root: Path) -> int:
+    if not root.is_dir():
+        return 0
+    return sum(
+        path.is_dir()
+        and not path.is_symlink()
+        and not path.name.startswith(".")
+        and not path.name.endswith((".tmp", ".partial", ".exported"))
+        for path in root.iterdir()
+    )
+
+
+def _scheduler_summary(value: Mapping[str, Any]) -> Mapping[str, Any]:
+    body = dict(value)
+    expected_hash = body.pop("state_sha256", None)
+    if (
+        value.get("schema_version") != 1
+        or not isinstance(expected_hash, str)
+        or canonical_sha256(body) != expected_hash
+    ):
+        raise StatusError("scheduler state hash or schema is invalid")
+    work = value.get("work")
+    claims = value.get("claims")
+    idle = value.get("idle")
+    idle_events = value.get("idle_events")
+    if (
+        not isinstance(work, Mapping)
+        or not isinstance(claims, Mapping)
+        or not isinstance(idle, Mapping)
+        or not isinstance(idle_events, list)
+    ):
+        raise StatusError("scheduler state is malformed")
+    state_counts = {}
+    kind_counts = {}
+    for raw in work.values():
+        if not isinstance(raw, Mapping) or not isinstance(raw.get("item"), Mapping):
+            raise StatusError("scheduler work record is malformed")
+        state = raw.get("state")
+        kind = raw["item"].get("kind")
+        if not isinstance(state, str) or not isinstance(kind, str):
+            raise StatusError("scheduler work state/kind is malformed")
+        state_counts[state] = state_counts.get(state, 0) + 1
+        kind_counts[kind] = kind_counts.get(kind, 0) + 1
+    events_by_id = {
+        event.get("event_id"): event
+        for event in idle_events
+        if isinstance(event, Mapping) and isinstance(event.get("event_id"), str)
+    }
+    idle_reasons = {}
+    for gpu, event_id in idle.items():
+        event = events_by_id.get(event_id)
+        if not isinstance(gpu, str) or not isinstance(event, Mapping):
+            raise StatusError("scheduler idle index is malformed")
+        idle_reasons[gpu] = event.get("reason")
+    return {
+        "revision": value.get("revision"),
+        "state_sha256": expected_hash,
+        "gpu_ids": value.get("gpu_ids"),
+        "active_claims": len(claims),
+        "owners": {
+            gpu: claim.get("owner_id")
+            for gpu, claim in claims.items()
+            if isinstance(claim, Mapping)
+        },
+        "work_by_state": dict(sorted(state_counts.items())),
+        "work_by_kind": dict(sorted(kind_counts.items())),
+        "idle_reasons": dict(sorted(idle_reasons.items())),
+        "safety_halt": value.get("safety_halt"),
+        "gpu_safety_halts": value.get("gpu_safety_halts"),
+    }
+
+
 def collect_status(run_root: Path, *, now: Optional[float] = None) -> Mapping[str, Any]:
     root = Path(run_root)
     if not root.is_absolute() or root.is_symlink() or not root.is_dir():
@@ -72,10 +144,12 @@ def collect_status(run_root: Path, *, now: Optional[float] = None) -> Mapping[st
     supervisor_path = promotion / "supervisor" / "service.json"
     backpressure_path = promotion / "operations" / "backpressure.json"
     champion_path = promotion / "champion.json"
+    scheduler_path = promotion / "scheduler" / "state.json"
     controller = _load_canonical(controller_path, "controller status")
     supervisor = _load_canonical(supervisor_path, "supervisor heartbeat")
     backpressure = _load_canonical(backpressure_path, "backpressure status")
     champion = _load_canonical(champion_path, "champion projection")
+    scheduler_value = _load_canonical(scheduler_path, "cluster scheduler state")
 
     controller_result = (
         controller.get("result")
@@ -88,6 +162,7 @@ def collect_status(run_root: Path, *, now: Optional[float] = None) -> Mapping[st
         "supervisor": _file_observation(supervisor_path, observed),
         "backpressure": _file_observation(backpressure_path, observed),
         "champion": _file_observation(champion_path, observed),
+        "scheduler": _file_observation(scheduler_path, observed),
         "selfplay": _file_observation(root / "selfplay.summary.json", observed),
         "shuffle": _file_observation(root / "shuffle-input-state.json", observed),
     }
@@ -139,6 +214,15 @@ def collect_status(run_root: Path, *, now: Optional[float] = None) -> Mapping[st
     ):
         warnings.add("shuffle-state-stale")
 
+    scheduler: Mapping[str, Any] = {}
+    if scheduler_value is not None:
+        scheduler = _scheduler_summary(scheduler_value)
+        queued = scheduler.get("work_by_state", {}).get("queued", 0)
+        if queued and scheduler.get("active_claims") == 0:
+            warnings.add("scheduler-runnable-work-unclaimed")
+        if scheduler.get("safety_halt") or scheduler.get("gpu_safety_halts"):
+            warnings.add("scheduler-safety-halt")
+
     curation: Mapping[str, Any] = {}
     if curation_status_path is not None:
         curation_status = _load_canonical(
@@ -187,8 +271,24 @@ def collect_status(run_root: Path, *, now: Optional[float] = None) -> Mapping[st
             "promotion_feedback": controller_result.get("promotionFeedback"),
         },
         "backpressure": backpressure,
+        "scheduler": scheduler,
         "curation": curation,
         "latest_improvement": improvement,
+        "pipeline": {
+            "raw_checkpoint_backlog": _directory_count(
+                root / "torchmodels_toexport"
+            ),
+            "candidate_inbox_depth": _directory_count(
+                root / "modelstobetested"
+            ),
+            "accepted_model_count": _directory_count(root / "models"),
+            "reviewed_position_bank_ready": (
+                root / "evaluation" / "source-positions.manifest.json"
+            ).is_file(),
+            "v3_suite_ready": (
+                root / "evaluation" / "promotion-suites-v3" / "manifest.json"
+            ).is_file(),
+        },
         "artifacts": observations,
         "warnings": sorted(warnings),
     }

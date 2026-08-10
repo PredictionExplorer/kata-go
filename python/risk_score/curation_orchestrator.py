@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (
@@ -1102,11 +1103,25 @@ class CurationOrchestrator:
         self._assert_frozen_inputs(prepared)
         initial = {job.key: self._inspect_job(job) for job in prepared.jobs}
         jobs = [job for job in prepared.jobs if initial[job.key]["state"] != "complete"]
-        assignments = {
-            job.key: self.gpus[index % len(self.gpus)] for index, job in enumerate(jobs)
-        }
-        running = set(assignments)
+        pending = deque(jobs)
+        assignments: Dict[Tuple[str, int], str] = {}
+        running = set()
         failures: Dict[Tuple[str, int], Mapping[str, Any]] = {}
+
+        # Reserve only genuinely available worker slots.  All other work stays
+        # unassigned in the global queue until a slot finishes its current job.
+        initial_claims: List[Tuple[ShardJob, str]] = []
+        for _ in range(self.per_gpu_parallelism):
+            for gpu in self.gpus:
+                if not pending:
+                    break
+                job = pending.popleft()
+                assignments[job.key] = gpu
+                running.add(job.key)
+                initial_claims.append((job, gpu))
+            if not pending:
+                break
+
         status = self._build_status(
             prepared,
             mode=mode,
@@ -1128,33 +1143,56 @@ class CurationOrchestrator:
         ] = {}
         interrupted = False
         try:
-            for job in jobs:
-                gpu = assignments[job.key]
+            for job, gpu in initial_claims:
                 future = executors[gpu].submit(self._execute_job, prepared, job, gpu)
                 futures[future] = (job, gpu)
-            for future in concurrent.futures.as_completed(futures):
-                job, gpu = futures[future]
-                try:
-                    result = future.result()
-                    self._history[job.key] = {
-                        "gpu": gpu,
-                        "duration_seconds": result.get("duration_seconds", 0.0),
-                    }
-                except Exception as exc:  # Individual failures do not hide siblings.
-                    failures[job.key] = {
-                        "type": type(exc).__name__,
-                        "message": str(exc),
-                    }
-                running.discard(job.key)
-                status = self._build_status(
-                    prepared,
-                    mode=mode,
-                    state="running",
-                    running=running,
-                    failures=failures,
-                    assignments=assignments,
+
+            job_order = {job.key: index for index, job in enumerate(jobs)}
+            while futures:
+                done, _ = concurrent.futures.wait(
+                    tuple(futures),
+                    return_when=concurrent.futures.FIRST_COMPLETED,
                 )
-                self._persist_status(prepared, status, event="shard-finished")
+                for future in sorted(
+                    done,
+                    key=lambda item: job_order[futures[item][0].key],
+                ):
+                    job, gpu = futures.pop(future)
+                    try:
+                        result = future.result()
+                        self._history[job.key] = {
+                            "gpu": gpu,
+                            "duration_seconds": result.get("duration_seconds", 0.0),
+                        }
+                    except Exception as exc:  # Individual failures do not hide siblings.
+                        failures[job.key] = {
+                            "type": type(exc).__name__,
+                            "message": str(exc),
+                        }
+                    running.discard(job.key)
+
+                    # The slot that just became available claims the next global
+                    # shard, so faster GPUs naturally consume more of the queue.
+                    if pending:
+                        next_job = pending.popleft()
+                        next_future = executors[gpu].submit(
+                            self._execute_job, prepared, next_job, gpu
+                        )
+                        futures[next_future] = (next_job, gpu)
+                        assignments[next_job.key] = gpu
+                        running.add(next_job.key)
+
+                    status = self._build_status(
+                        prepared,
+                        mode=mode,
+                        state="running",
+                        running=running,
+                        failures=failures,
+                        assignments=assignments,
+                    )
+                    self._persist_status(
+                        prepared, status, event="shard-finished"
+                    )
         except BaseException:
             interrupted = True
             for future in futures:

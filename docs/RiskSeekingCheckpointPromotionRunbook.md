@@ -148,6 +148,27 @@ include `-generation-provenance-dir
 $TRAIN_BASE/promotion/provenance/trainer` and
 `-require-shuffle-provenance`.
 
+Plan and verify the hash-bound unit installation before applying it. The apply
+step atomically installs only the exact generated KataGo units, reloads systemd,
+starts the aggregate target, and refuses to publish a receipt unless every
+configured service is active:
+
+```bash
+python3 -m risk_score.service_activation \
+  --spec "$RUN_DIR/configs/promotion-services.json"
+
+sudo -n "$DEPLOY_REPO/python/.venv/bin/python" \
+  -m risk_score.service_activation \
+  --spec "$RUN_DIR/configs/promotion-services.json" \
+  --receipt "$RUN_DIR/manifest/systemd-activation.json" \
+  --apply
+```
+
+Do not use `systemctl enable` as an unverified substitute. A target that is
+active while a required child service is absent does not establish supervision.
+Stop and reconcile if the activation receipt does not bind the exact generated
+unit hashes.
+
 Before strict shuffling or the automatic controller starts, initialize
 historical baselines and rollback watermarks once with the mutation-disabled
 runtime:
@@ -242,6 +263,31 @@ Resource warning: one non-symmetric square position requires up to 64 analyses
 (2 models × 2 modes × 2 visit counts × 8 symmetries). Keep
 `numAnalysisThreads=1` and shard each role; do not launch one monolithic query
 file.
+
+Before committing the full source pool to that cost, run a bounded consensus
+pilot and measure acceptance by label. If model, top-move, or specialized-signal
+disagreement rejects most pilot rows, use the advisory dual-model prefilter over
+2,000-visit standard and powered analyses:
+
+```bash
+python3 -m risk_score.consensus_prefilter \
+  "$NORMALIZED_SOURCE" \
+  --analysis original/standard-2000="$ORIGINAL_STANDARD_2000" \
+  --analysis original/powered-2000="$ORIGINAL_POWERED_2000" \
+  --analysis champion/standard-2000="$CHAMPION_STANDARD_2000" \
+  --analysis champion/powered-2000="$CHAMPION_POWERED_2000" \
+  --label lead-80 \
+  --output "$RUN_DIR/evaluation/curation/prefiltered-lead-80.jsonl" \
+  --manifest "$RUN_DIR/evaluation/curation/prefiltered-lead-80.manifest.json"
+```
+
+The prefilter requires one top move, one buffered score band, no specialized
+signal, and a bounded model/mode score spread. It deduplicates symmetry orbits
+and binds every input analysis manifest. Its output is **not reviewed evidence**
+and can never enter a suite directly; every selected row must still pass the
+complete eight-role, all-symmetry `queries-consensus` and `label-consensus`
+contract. Use it only to avoid spending 64 analyses on obviously unstable
+sources.
 
 Use the restartable orchestrator for production. It validates all eight roles,
 assigns bounded per-GPU work, resumes only missing shards, merges each role, and

@@ -91,9 +91,10 @@ def consensus_bundle(root, *, position_count=4):
 
 
 class FakeKataGo:
-    def __init__(self, *, fail=None, delay=0.0):
+    def __init__(self, *, fail=None, delay=0.0, before_response=None):
         self.fail = fail or (lambda call: False)
         self.delay = delay
+        self.before_response = before_response
         self.calls = []
         self.active = Counter()
         self.maximum_active = Counter()
@@ -115,6 +116,8 @@ class FakeKataGo:
                 self.active[call["gpu"]],
             )
         try:
+            if self.before_response is not None:
+                self.before_response(call)
             if self.delay:
                 time.sleep(self.delay)
             if self.fail(call):
@@ -212,7 +215,9 @@ def test_schedules_models_on_explicit_bounded_gpus_and_merges(tmp_path):
     assert status["progress"]["completed_shards"] == 16
     assert len(status["analysis_outputs"]) == 8
     assert len(runner.calls) == 16
-    assert Counter(call["gpu"] for call in runner.calls) == {"2": 8, "5": 8}
+    gpu_counts = Counter(call["gpu"] for call in runner.calls)
+    assert sum(gpu_counts.values()) == 16
+    assert set(gpu_counts) == {"2", "5"}
     assert runner.maximum_active == {"2": 1, "5": 1}
     assert all(call["shell"] is False for call in runner.calls)
     assert all(call["argv"][1] == "analysis" for call in runner.calls)
@@ -235,6 +240,72 @@ def test_schedules_models_on_explicit_bounded_gpus_and_merges(tmp_path):
     } <= events[-1].keys()
 
 
+def test_fast_gpu_steals_from_global_pending_queue(tmp_path):
+    fixture = consensus_bundle(tmp_path / "bundle")
+    work = tmp_path / "work"
+    release_slow_gpu = threading.Event()
+    coordination_lock = threading.Lock()
+    initial_status = {}
+    fast_started = 0
+    total_shards = 16
+
+    def coordinate(call):
+        nonlocal fast_started
+        with coordination_lock:
+            if not initial_status:
+                initial_status.update(
+                    json.loads((work / "status.json").read_text(encoding="utf-8"))
+                )
+            initially_assigned = sum(
+                shard["gpu"] is not None
+                for role in initial_status["roles"].values()
+                for shard in role["shards"]
+            )
+            dynamic_scheduler = initially_assigned == 2
+            if call["gpu"] == "2":
+                fast_started += 1
+                if fast_started == total_shards - 1:
+                    release_slow_gpu.set()
+        if call["gpu"] == "5" and dynamic_scheduler:
+            assert release_slow_gpu.wait(timeout=10), "fast GPU stopped claiming work"
+
+    runner = FakeKataGo(before_response=coordinate)
+    status = orchestrator(fixture, work, runner).once()
+
+    assert status["state"] == "complete"
+    assert Counter(call["gpu"] for call in runner.calls) == {"2": 15, "5": 1}
+    query_executions = Counter(call["query_path"] for call in runner.calls)
+    assert len(query_executions) == total_shards
+    assert set(query_executions.values()) == {1}
+    assert runner.maximum_active == {"2": 1, "5": 1}
+
+    initial_shards = [
+        shard
+        for role in initial_status["roles"].values()
+        for shard in role["shards"]
+    ]
+    assert Counter(shard["state"] for shard in initial_shards) == {
+        "running": 2,
+        "pending": 14,
+    }
+    initial_assignments = {
+        shard["query_path"]: shard["gpu"]
+        for shard in initial_shards
+        if shard["gpu"] is not None
+    }
+    assert Counter(initial_assignments.values()) == {"2": 1, "5": 1}
+
+    actual_assignments = {
+        call["query_path"]: call["gpu"] for call in runner.calls
+    }
+    assert set(initial_assignments.items()) <= set(actual_assignments.items())
+    assert all(
+        shard["gpu"] == actual_assignments[shard["query_path"]]
+        for role in status["roles"].values()
+        for shard in role["shards"]
+    )
+
+
 def test_failure_then_resume_runs_only_missing_shards(tmp_path):
     fixture = consensus_bundle(tmp_path / "bundle")
     first_runner = FakeKataGo(
@@ -246,13 +317,20 @@ def test_failure_then_resume_runs_only_missing_shards(tmp_path):
     assert first["state"] == "failed"
     assert first["progress"]["completed_shards"] == 8
     assert first["progress"]["failed_shards"] == 8
+    assert len(first_runner.calls) == 16
+    assert set(
+        Counter(call["query_path"] for call in first_runner.calls).values()
+    ) == {1}
     completed_before = {
         path: (path.read_bytes(), path.stat().st_mtime_ns)
         for path in analysis_outputs(work)
     }
     assert len(completed_before) == 8
 
-    resumed_runner = FakeKataGo()
+    resume_barrier = threading.Barrier(2)
+    resumed_runner = FakeKataGo(
+        before_response=lambda call: resume_barrier.wait(timeout=5)
+    )
     resumed = orchestrator(
         fixture,
         work,
@@ -265,6 +343,10 @@ def test_failure_then_resume_runs_only_missing_shards(tmp_path):
     assert resumed["mode"] == "resume"
     assert len(resumed_runner.calls) == 8
     assert {call["gpu"] for call in resumed_runner.calls} == {"7"}
+    assert set(
+        Counter(call["query_path"] for call in resumed_runner.calls).values()
+    ) == {1}
+    assert resumed_runner.maximum_active == {"7": 2}
     for path, (data, modified) in completed_before.items():
         assert path.read_bytes() == data
         assert path.stat().st_mtime_ns == modified

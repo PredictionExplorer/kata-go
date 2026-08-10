@@ -9,6 +9,7 @@ controller plan, and only in-repo evidence derivation code decides PASS/FAIL.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import re
 import subprocess
@@ -764,7 +765,58 @@ def _derive_and_publish_discovery(
     return output, file_sha256(output)
 
 
-def _validate_limits(args: argparse.Namespace) -> None:
+def _parse_gpu_indices(value: Any) -> Tuple[int, ...]:
+    indices = []
+
+    def append(item: Any) -> None:
+        if type(item) is int:
+            index = item
+        elif isinstance(item, str):
+            if any(character in item for character in ("\x00", "\n", "\r")):
+                raise PromotionEvaluatorError(
+                    "GPU pool must contain nonnegative integer indices"
+                )
+            tokens = item.split(",")
+            if any(not token.strip() for token in tokens):
+                raise PromotionEvaluatorError(
+                    "GPU pool must contain nonnegative integer indices"
+                )
+            for token in tokens:
+                try:
+                    append(int(token.strip(), 10))
+                except ValueError as exc:
+                    raise PromotionEvaluatorError(
+                        "GPU pool must contain nonnegative integer indices"
+                    ) from exc
+            return
+        elif isinstance(item, Sequence) and not isinstance(
+            item, (bytes, bytearray)
+        ):
+            for nested in item:
+                append(nested)
+            return
+        else:
+            raise PromotionEvaluatorError(
+                "GPU pool must contain nonnegative integer indices"
+            )
+        if index < 0:
+            raise PromotionEvaluatorError(
+                "GPU pool must contain nonnegative integer indices"
+            )
+        indices.append(index)
+
+    append(value)
+    if not indices:
+        raise PromotionEvaluatorError("GPU pool must not be empty")
+    if len(set(indices)) != len(indices):
+        raise PromotionEvaluatorError("GPU pool indices must be unique")
+    return tuple(indices)
+
+
+def _validate_limits(
+    args: argparse.Namespace,
+    gpu_indices: Optional[Sequence[int]] = None,
+) -> Tuple[int, ...]:
     for value, role, maximum in (
         (args.shards, "shards", _MAX_SHARDS),
         (args.max_parallel, "max parallelism", _MAX_PARALLEL),
@@ -778,16 +830,24 @@ def _validate_limits(args: argparse.Namespace) -> None:
         raise PromotionEvaluatorError("max parallelism may not exceed shard count")
     if type(args.gpu_index) is not int or args.gpu_index < 0:
         raise PromotionEvaluatorError("GPU index must be a nonnegative integer")
+    configured = getattr(args, "gpu_indices", None)
+    if gpu_indices is not None and configured is not None:
+        raise PromotionEvaluatorError(
+            "GPU pool was supplied through both CLI arguments and the API"
+        )
+    pool = gpu_indices if gpu_indices is not None else configured
+    return (args.gpu_index,) if pool is None else _parse_gpu_indices(pool)
 
 
 def evaluate(
     args: argparse.Namespace,
     *,
     subprocess_runner: Callable[..., Any] = subprocess.run,
+    gpu_indices: Optional[Sequence[int]] = None,
 ) -> Mapping[str, Any]:
     """Run every plan cell and publish its derived controller evidence."""
 
-    _validate_limits(args)
+    gpu_pool = _validate_limits(args, gpu_indices)
     inputs = _validate_plan(args)
     katago = _regular_file(args.katago, "KataGo binary")
     katago_hash = file_sha256(katago)
@@ -815,8 +875,7 @@ def evaluate(
 
     probe_path, probe_hash, request_path, request_hash = _load_stage0(args, inputs)
 
-    manifest_map: Dict[str, str] = {}
-    for cell in inputs.cells:
+    def execute_cell(cell: CellExecution, gpu_index: int) -> Tuple[str, Path]:
         runner = EvaluationRunner(
             katago_binary=katago,
             config_path=cell.config_path,
@@ -825,7 +884,7 @@ def evaluate(
             max_parallel=args.max_parallel,
             max_attempts=args.max_attempts,
             include_move_traces=True,
-            env={"CUDA_VISIBLE_DEVICES": str(args.gpu_index)},
+            env={"CUDA_VISIBLE_DEVICES": str(gpu_index)},
             subprocess_runner=subprocess_runner,
         )
         result = runner.run(
@@ -843,7 +902,50 @@ def evaluate(
             raise PromotionEvaluatorError(
                 "KataGo binary changed during matrix execution"
             )
-        manifest_map[cell.name] = str(result.manifest_path)
+        return cell.name, result.manifest_path
+
+    completed: Dict[str, Path] = {}
+    if len(gpu_pool) == 1 or len(inputs.cells) <= 1:
+        completed.update(execute_cell(cell, gpu_pool[0]) for cell in inputs.cells)
+    elif inputs.cells:
+        # A fixed serial lane per GPU prevents distinct cells from sharing a GPU.
+        # EvaluationRunner.max_parallel remains the explicit per-cell shard limit.
+        lanes = tuple(
+            (
+                gpu_index,
+                inputs.cells[offset::len(gpu_pool)],
+            )
+            for offset, gpu_index in enumerate(gpu_pool)
+            if offset < len(inputs.cells)
+        )
+
+        def execute_lane(
+            gpu_index: int,
+            cells: Sequence[CellExecution],
+        ) -> Tuple[Tuple[str, Path], ...]:
+            return tuple(execute_cell(cell, gpu_index) for cell in cells)
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(lanes)
+        ) as executor:
+            futures = tuple(
+                executor.submit(execute_lane, gpu_index, cells)
+                for gpu_index, cells in lanes
+            )
+            lane_results = tuple(future.result() for future in futures)
+        completed.update(
+            result for lane_result in lane_results for result in lane_result
+        )
+
+    expected_names = {cell.name for cell in inputs.cells}
+    if set(completed) != expected_names:
+        raise PromotionEvaluatorError(
+            "evaluation matrix did not produce every required cell"
+        )
+    manifest_map = {
+        cell.name: str(completed[cell.name])
+        for cell in inputs.cells
+    }
 
     # Close the verify/use window before publishing a matrix-level artifact.
     revalidated = _validate_plan(args)
@@ -993,6 +1095,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--max-parallel", type=int, default=1)
     parser.add_argument("--max-attempts", type=int, default=2)
     parser.add_argument("--gpu-index", type=int, default=7)
+    parser.add_argument(
+        "--gpu-pool",
+        "--gpu-indices",
+        dest="gpu_indices",
+        action="append",
+        nargs="+",
+        default=None,
+        metavar="INDEX[,INDEX...]",
+        help=(
+            "ordered GPU indices for concurrent cells; may be repeated or "
+            "comma-separated and overrides --gpu-index"
+        ),
+    )
     parser.add_argument("--bootstrap-replications", type=int)
     parser.add_argument("--bootstrap-seed", type=int)
     parser.add_argument("-o", "--output", required=True, type=Path)
@@ -1003,6 +1118,7 @@ def main(
     argv: Optional[Sequence[str]] = None,
     *,
     subprocess_runner: Optional[Callable[..., Any]] = None,
+    gpu_indices: Optional[Sequence[int]] = None,
 ) -> int:
     args = parse_args(argv)
     try:
@@ -1011,6 +1127,7 @@ def main(
             subprocess_runner=(
                 subprocess.run if subprocess_runner is None else subprocess_runner
             ),
+            gpu_indices=gpu_indices,
         )
     except (
         OSError,

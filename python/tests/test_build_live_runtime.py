@@ -15,6 +15,49 @@ from risk_score.position_samples import file_sha256
 
 REPO = Path(__file__).resolve().parents[2]
 
+SYSTEMD_SERVICE_UNITS = {
+    "supervisor": "katago-risk-promotion-host.service",
+    "controller": "katago-risk-promotion-controller.service",
+    "auditor": "katago-risk-promotion-auditor.service",
+    "feedback": "katago-risk-promotion-feedback.service",
+    "shuffler": "katago-risk-shuffler.service",
+    "exporter": "katago-risk-exporter.service",
+}
+
+
+def _assert_durable_systemd_runtime(result, services):
+    expected_services = set(services["services"])
+    expected_units = {
+        SYSTEMD_SERVICE_UNITS[name] for name in expected_services
+    }
+    target_unit = Path(services["systemd_units"]["target"]["path"]).read_text(
+        encoding="utf-8"
+    )
+    target_lines = target_unit.splitlines()
+    wants = next(line for line in target_lines if line.startswith("Wants="))
+    after = next(line for line in target_lines if line.startswith("After="))
+    assert set(wants.removeprefix("Wants=").split()) == expected_units
+    assert set(after.removeprefix("After=").split()) == expected_units
+
+    deployment = json.loads(
+        Path(result["deployment_manifest"]).read_text(encoding="utf-8")
+    )
+    for service_name in expected_services:
+        assert services["services"][service_name]["restart"] == "always"
+        unit = services["systemd_units"][service_name]
+        unit_path = Path(unit["path"])
+        unit_lines = unit_path.read_text(encoding="utf-8").splitlines()
+        assert unit_lines.count("Restart=always") == 1
+        assert "KillSignal=SIGINT" in unit_lines
+        assert "KillMode=control-group" in unit_lines
+        assert "TimeoutStopSec=300" in unit_lines
+        assert file_sha256(unit_path) == unit["sha256"]
+        assert deployment["files"][f"systemd:{service_name}"] == unit
+
+    target = services["systemd_units"]["target"]
+    assert file_sha256(Path(target["path"])) == target["sha256"]
+    assert deployment["files"]["systemd:target"] == target
+
 
 def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_path):
     run = tmp_path / "run"
@@ -145,9 +188,9 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
     assert "risk_score.stage0_probe" in promotion["commands"]["stage0Probe"]
     assert "risk_score.promotion_host" in promotion["commands"]["selfplay"]
     assert services["contract"] == "risk-score-host-services-v2"
-    assert services["services"]["controller"]["argv"][-1] == "--recommend-only"
-    auditor_argv = services["services"]["auditor"]["argv"]
-    assert auditor_argv[auditor_argv.index("--katago") + 1] == str(katago)
+    shadow_controller = services["services"]["controller"]["argv"]
+    assert shadow_controller[-1] == "--recommend-only"
+    assert shadow_controller[shadow_controller.index("--mode") + 1] == "watch"
     assert "--strict" not in services["services"]["feedback"]["argv"]
     assert (
         services["services"]["shuffler"]["environment"][
@@ -162,7 +205,6 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
     )
     assert probe[probe.index("--katago") + 1] == str(katago)
     assert set(services["services"]) == {
-        "auditor",
         "controller",
         "exporter",
         "feedback",
@@ -170,7 +212,6 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
         "supervisor",
     }
     assert set(services["systemd_units"]) == {
-        "auditor",
         "controller",
         "exporter",
         "feedback",
@@ -178,8 +219,7 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
         "supervisor",
         "target",
     }
-    for unit in services["systemd_units"].values():
-        assert file_sha256(Path(unit["path"])) == unit["sha256"]
+    _assert_durable_systemd_runtime(result, services)
     controller_unit = Path(services["systemd_units"]["controller"]["path"]).read_text(
         encoding="utf-8"
     )
@@ -226,6 +266,11 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
     automatic_services = json.loads(
         Path(automatic["service_spec"]).read_text(encoding="utf-8")
     )
+    assert set(automatic_services["services"]) == set(
+        SYSTEMD_SERVICE_UNITS
+    )
+    auditor_argv = automatic_services["services"]["auditor"]["argv"]
+    assert auditor_argv[auditor_argv.index("--katago") + 1] == str(katago)
     controller_argv = automatic_services["services"]["controller"]["argv"]
     assert "--automatic" in controller_argv
     assert controller_argv[-2:] == [
@@ -239,6 +284,7 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
         ]
         == "1"
     )
+    _assert_durable_systemd_runtime(automatic, automatic_services)
     deployment = verify_deployment_manifest(Path(result["deployment_manifest"]))
     assert deployment["source_revision"] == revision
     katago.write_bytes(b"changed")

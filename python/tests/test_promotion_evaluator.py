@@ -1,5 +1,7 @@
 import copy
 import json
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -47,14 +49,26 @@ SCHEDULE_OPTIONS = {
 
 
 class CountingMatch(FakeMatch):
-    def __init__(self, *, fail_suite=None):
+    def __init__(
+        self,
+        *,
+        fail_suite=None,
+        delay=0.0,
+        delay_by_schedule=None,
+    ):
         self.calls = 0
         self.fail_suite = fail_suite
         self.gpus = []
+        self.assignments = {}
+        self.delay = delay
+        self.delay_by_schedule = dict(delay_by_schedule or {})
+        self.max_active_cells = 0
+        self.shared_gpu_cells = False
+        self._active_cells = {}
+        self._active_gpu_cells = {}
+        self._lock = threading.Lock()
 
     def __call__(self, argv, **kwargs):
-        self.calls += 1
-        self.gpus.append(kwargs["env"]["CUDA_VISIBLE_DEVICES"])
         override = argv[argv.index("-override-config") + 1]
         values = {
             item.split("=", 1)[0]: item.split("=", 1)[1]
@@ -65,9 +79,47 @@ class CountingMatch(FakeMatch):
             json.loads(line)
             for line in schedule_path.read_text(encoding="utf-8").splitlines()
         ]
-        if self.fail_suite is not None and rows[0]["suite"] == self.fail_suite:
-            return SimpleNamespace(returncode=17, stdout="", stderr="injected failure")
-        return super().__call__(argv, **kwargs)
+        schedule_id = rows[0]["scheduleId"]
+        cell_key = (
+            schedule_id,
+            argv[argv.index("-config") + 1],
+            values["nnModelFile1"],
+        )
+        gpu = kwargs["env"]["CUDA_VISIBLE_DEVICES"]
+        with self._lock:
+            self.calls += 1
+            self.gpus.append(gpu)
+            self.assignments.setdefault(cell_key, set()).add(gpu)
+            self._active_cells[cell_key] = self._active_cells.get(cell_key, 0) + 1
+            gpu_cells = self._active_gpu_cells.setdefault(gpu, {})
+            if any(active_id != cell_key for active_id in gpu_cells):
+                self.shared_gpu_cells = True
+            gpu_cells[cell_key] = gpu_cells.get(cell_key, 0) + 1
+            self.max_active_cells = max(
+                self.max_active_cells, len(self._active_cells)
+            )
+        try:
+            delay = self.delay_by_schedule.get(schedule_id, self.delay)
+            if delay:
+                time.sleep(delay)
+            if self.fail_suite is not None and rows[0]["suite"] == self.fail_suite:
+                return SimpleNamespace(
+                    returncode=17,
+                    stdout="",
+                    stderr="injected failure",
+                )
+            return super().__call__(argv, **kwargs)
+        finally:
+            with self._lock:
+                self._active_cells[cell_key] -= 1
+                if self._active_cells[cell_key] == 0:
+                    del self._active_cells[cell_key]
+                gpu_cells = self._active_gpu_cells[gpu]
+                gpu_cells[cell_key] -= 1
+                if gpu_cells[cell_key] == 0:
+                    del gpu_cells[cell_key]
+                if not gpu_cells:
+                    del self._active_gpu_cells[gpu]
 
 
 def make_nonconfirmation_plan(fixture, *, stage, look):
@@ -398,6 +450,119 @@ def test_cli_executes_confirmation_matrix_and_reuses_finalized_cells(tmp_path):
 
     assert main(argv, subprocess_runner=fake) == 0
     assert fake.calls == first_call_count
+
+
+def test_single_gpu_index_remains_backward_compatible(tmp_path):
+    fixture = build_fixture(tmp_path / "fixture")
+    argv, runner_map_path, evidence_path = evaluator_argv(
+        fixture, tmp_path / "single-gpu"
+    )
+    argv.extend(["--gpu-index", "3"])
+    fake = CountingMatch(delay=0.02)
+
+    assert main(argv, subprocess_runner=fake) == 0
+    assert runner_map_path.is_file()
+    assert evidence_path.is_file()
+    assert set(fake.gpus) == {"3"}
+    assert fake.max_active_cells == 1
+    assert fake.shared_gpu_cells is False
+
+
+def test_gpu_pool_assignment_is_deterministic(tmp_path):
+    fixture = build_fixture(tmp_path / "fixture")
+    argv, _, _ = evaluator_argv(fixture, tmp_path / "gpu-pool")
+    argv.extend(["--gpu-pool", "3", "--gpu-pool", "1"])
+    fake = CountingMatch(delay=0.02)
+
+    assert main(argv, subprocess_runner=fake) == 0
+    expected = {
+        name: {"3" if index % 2 == 0 else "1"}
+        for index, name in enumerate(fixture["plan"]["cellOrder"])
+    }
+    observed = {
+        name: fake.assignments[
+            (
+                artifact["scheduleId"],
+                str(
+                    fixture["standard"]
+                    if name == "standard_candidate_vs_original"
+                    else fixture["powered"]
+                ),
+                str(
+                    fixture["original"]
+                    if "original" in name
+                    else fixture["champion"]
+                ),
+            )
+        ]
+        for name, artifact in fixture["plan"]["scheduleArtifacts"].items()
+    }
+    assert observed == expected
+    assert fake.shared_gpu_cells is False
+    calls_after_first_run = fake.calls
+    assert main(argv, subprocess_runner=fake) == 0
+    assert fake.calls == calls_after_first_run
+
+
+def test_gpu_pool_caps_cell_concurrency_to_gpu_count(tmp_path):
+    fixture = build_fixture(tmp_path / "fixture")
+    argv, _, _ = evaluator_argv(fixture, tmp_path / "concurrency-cap")
+    fake = CountingMatch(delay=0.05)
+
+    assert main(
+        argv,
+        subprocess_runner=fake,
+        gpu_indices=[4, 2],
+    ) == 0
+    assert fake.max_active_cells == 2
+    assert fake.shared_gpu_cells is False
+
+
+def test_multi_gpu_cell_failure_prevents_final_publication(tmp_path):
+    fixture = build_fixture(tmp_path / "fixture")
+    argv, runner_map_path, evidence_path = evaluator_argv(
+        fixture, tmp_path / "multi-gpu-failure"
+    )
+    fake = CountingMatch(fail_suite="lead-80", delay=0.02)
+
+    assert main(
+        argv,
+        subprocess_runner=fake,
+        gpu_indices=[0, 1],
+    ) == 2
+    assert not runner_map_path.exists()
+    assert not evidence_path.exists()
+    assert fake.shared_gpu_cells is False
+
+
+def test_multi_gpu_publication_order_is_canonical(tmp_path):
+    fixture = build_fixture(tmp_path / "fixture")
+    argv, runner_map_path, evidence_path = evaluator_argv(
+        fixture, tmp_path / "deterministic-order"
+    )
+    first_schedule_id = fixture["plan"]["scheduleArtifacts"][
+        fixture["plan"]["cellOrder"][0]
+    ]["scheduleId"]
+    fake = CountingMatch(
+        delay=0.005,
+        delay_by_schedule={first_schedule_id: 0.05},
+    )
+
+    assert main(
+        argv,
+        subprocess_runner=fake,
+        gpu_indices=[5, 6],
+    ) == 0
+    runner_map_text = runner_map_path.read_text(encoding="utf-8")
+    runner_map = json.loads(runner_map_text)
+    evidence_text = evidence_path.read_text(encoding="utf-8")
+    evidence = json.loads(evidence_text)
+    assert list(runner_map) == sorted(fixture["plan"]["cellOrder"])
+    assert list(evidence["promotion_evidence"]["confirmation_matrix"]) == sorted(
+        fixture["plan"]["cellOrder"]
+    )
+    assert runner_map_text == canonical_json(runner_map) + "\n"
+    assert evidence_text == canonical_json(evidence) + "\n"
 
 
 def test_nonconfirmation_stages_publish_real_statistics_and_discovery(tmp_path):

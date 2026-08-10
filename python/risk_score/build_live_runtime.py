@@ -75,7 +75,18 @@ def _systemd_service(
     environment: Optional[Mapping[str, str]] = None,
     after: Sequence[str] = (),
     requires: Sequence[str] = (),
+    restart: str = "on-failure",
 ) -> str:
+    if restart not in {
+        "no",
+        "on-success",
+        "on-failure",
+        "on-abnormal",
+        "on-watchdog",
+        "on-abort",
+        "always",
+    }:
+        raise HostCommandError("systemd restart policy is invalid")
     unit_after = ["network-online.target", *after]
     lines = [
         "[Unit]",
@@ -110,7 +121,7 @@ def _systemd_service(
     lines.extend(
         [
             "ExecStart=" + " ".join(_systemd_quote(value) for value in argv),
-            "Restart=on-failure",
+            f"Restart={restart}",
             "RestartSec=5",
             "KillSignal=SIGINT",
             "KillMode=control-group",
@@ -439,7 +450,7 @@ def build_live_runtime(
         "--runtime-config",
         str(promotion_path),
         "--mode",
-        "watch" if mutation_enabled else "reconcile",
+        "watch",
         "--automatic" if mutation_enabled else "--recommend-only",
     ]
     if mutation_enabled:
@@ -513,23 +524,28 @@ def build_live_runtime(
             "argv": supervisor_argv,
             "description": "KataGo risk-training host supervisor",
             "environment": {},
+            "restart": "always",
         },
         "controller": {
             "argv": controller_argv,
             "description": "KataGo risk-training promotion controller",
             "environment": {},
-        },
-        "auditor": {
-            "argv": auditor_argv,
-            "description": "KataGo risk-training rollout and deep-audit worker",
-            "environment": {},
+            "restart": "always",
         },
         "feedback": {
             "argv": feedback_argv,
             "description": "KataGo risk-training provenance feedback watcher",
             "environment": {},
+            "restart": "always",
         },
     }
+    if mutation_enabled:
+        services["auditor"] = {
+            "argv": auditor_argv,
+            "description": "KataGo risk-training rollout and deep-audit worker",
+            "environment": {},
+            "restart": "always",
+        }
     for name, command, description, environment in (
         (
             "shuffler",
@@ -549,6 +565,7 @@ def build_live_runtime(
                 "argv": command,
                 "description": description,
                 "environment": environment,
+                "restart": "always",
             }
 
     systemd_units: Dict[str, Mapping[str, str]] = {}
@@ -582,12 +599,14 @@ def build_live_runtime(
                     environment=spec.get("environment", {}),
                     after=dependencies,
                     requires=dependencies,
+                    restart=str(spec.get("restart", "on-failure")),
                 ),
             )
             systemd_units[name] = {
                 "path": str(unit_path),
                 "sha256": file_sha256(unit_path),
             }
+        generated_unit_names = tuple(unit_names[name] for name in services)
         target_path = units_dir / "katago-risk-training.target"
         _write_text_file(
             target_path,
@@ -595,6 +614,8 @@ def build_live_runtime(
                 [
                     "[Unit]",
                     "Description=KataGo risk-training closed-loop services",
+                    "Wants=" + " ".join(generated_unit_names),
+                    "After=" + " ".join(generated_unit_names),
                     "",
                     "[Install]",
                     "WantedBy=multi-user.target",
