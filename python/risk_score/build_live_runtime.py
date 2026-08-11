@@ -74,8 +74,12 @@ def _systemd_service(
     run_root: Path,
     environment: Optional[Mapping[str, str]] = None,
     after: Sequence[str] = (),
+    before: Sequence[str] = (),
     requires: Sequence[str] = (),
     restart: str = "on-failure",
+    service_type: str = "simple",
+    additional_argv: Sequence[Sequence[str]] = (),
+    remain_after_exit: bool = False,
 ) -> str:
     if restart not in {
         "no",
@@ -87,11 +91,31 @@ def _systemd_service(
         "always",
     }:
         raise HostCommandError("systemd restart policy is invalid")
+    if service_type not in {"simple", "oneshot"}:
+        raise HostCommandError("systemd service type is invalid")
+    if additional_argv and service_type != "oneshot":
+        raise HostCommandError("multiple ExecStart commands require a oneshot service")
+    if remain_after_exit and service_type != "oneshot":
+        raise HostCommandError("RemainAfterExit requires a oneshot service")
+    commands = (tuple(argv), *(tuple(command) for command in additional_argv))
+    if any(
+        not command
+        or any(
+            not isinstance(argument, str)
+            or not argument
+            or "\n" in argument
+            or "\r" in argument
+            for argument in command
+        )
+        for command in commands
+    ):
+        raise HostCommandError("systemd service command is invalid")
     unit_after = ["network-online.target", *after]
     lines = [
         "[Unit]",
         f"Description={description}",
         "Wants=network-online.target",
+        "PartOf=katago-risk-training.target",
         "After=" + " ".join(unit_after),
         "RequiresMountsFor=" + _systemd_quote(str(run_root)),
         "StartLimitIntervalSec=300",
@@ -99,11 +123,13 @@ def _systemd_service(
     ]
     if requires:
         lines.append("Requires=" + " ".join(requires))
+    if before:
+        lines.append("Before=" + " ".join(before))
     lines.extend(
         [
             "",
             "[Service]",
-            "Type=simple",
+            f"Type={service_type}",
             f"User={service_user}",
             "WorkingDirectory=" + _systemd_quote(str(working_directory)),
             "Environment=" + _systemd_quote(f"PYTHONPATH={working_directory}"),
@@ -118,9 +144,14 @@ def _systemd_service(
         ):
             raise HostCommandError("systemd service environment is invalid")
         lines.append("Environment=" + _systemd_quote(f"{key}={value}"))
+    for command in commands:
+        lines.append(
+            "ExecStart=" + " ".join(_systemd_quote(value) for value in command)
+        )
+    if remain_after_exit:
+        lines.append("RemainAfterExit=yes")
     lines.extend(
         [
-            "ExecStart=" + " ".join(_systemd_quote(value) for value in argv),
             f"Restart={restart}",
             "RestartSec=5",
             "KillSignal=SIGINT",
@@ -177,6 +208,7 @@ def build_live_runtime(
     service_user: Optional[str] = None,
     shuffler_command: Optional[Sequence[str]] = None,
     exporter_command: Optional[Sequence[str]] = None,
+    evaluator_command: Optional[Sequence[str]] = None,
 ) -> Mapping[str, Any]:
     repository = Path(repo).resolve()
     root = Path(run_root).resolve()
@@ -192,11 +224,20 @@ def build_live_runtime(
         raise HostCommandError("actor and verified GPU UUID are required")
     shuffler_argv = _service_argv(shuffler_command, "shuffler")
     exporter_argv = _service_argv(exporter_command, "exporter")
+    evaluator_argv = _service_argv(evaluator_command, "evaluator")
     if mutation_enabled and (
-        service_user is None or not shuffler_argv or not exporter_argv
+        service_user is None
+        or not shuffler_argv
+        or not exporter_argv
     ):
         raise HostCommandError(
             "automatic runtime requires service user, shuffler, and exporter commands"
+        )
+    if evaluator_argv and any(
+        "evaluator-unsupported" in argument for argument in evaluator_argv
+    ):
+        raise HostCommandError(
+            "automatic runtime evaluator command must not be evaluator-unsupported"
         )
     original = _required_file(original_model, "original model")
     checkpoint = _required_file(trainer_checkpoint, "trainer checkpoint")
@@ -291,7 +332,11 @@ def build_live_runtime(
     gpu["trainer"]["launchCommand"][
         gpu["trainer"]["launchCommand"].index("--spec") + 1
     ] = str(trainer_spec_path)
-    gpu["evaluator"]["launchCommand"] = [
+    # The controller uses GpuLeaseManager.exclusive_handoff and runs its
+    # manifest-bound evaluator adapter inside the yielded lease. This command
+    # belongs only to gpu_lease's legacy evaluator_lease launcher, so keep it
+    # fail-closed unless an audited external worker command is explicitly set.
+    gpu["evaluator"]["launchCommand"] = evaluator_argv or [
         str(python),
         "-m",
         "risk_score.promotion_host",
@@ -419,6 +464,7 @@ def build_live_runtime(
     }
     promotion_path = output / "promotion-runtime.json"
     atomic_write_json(promotion_path, promotion)
+    boot_ready_path = promotion_root / "supervisor" / "boot-ready.json"
     supervisor_argv = [
         str(python),
         "-m",
@@ -428,6 +474,8 @@ def build_live_runtime(
         str(promotion_path),
         "--state-root",
         str(promotion_root / "supervisor"),
+        "--boot-ready",
+        str(boot_ready_path),
         "--katago",
         str(katago),
         "--config",
@@ -468,7 +516,7 @@ def build_live_runtime(
         "--interval",
         "5",
     ]
-    feedback_argv = [
+    feedback_common_argv = [
         str(python),
         "-m",
         "risk_score.promotion_feedback",
@@ -476,6 +524,9 @@ def build_live_runtime(
         str(promotion_path),
         "--run-root",
         str(root),
+    ]
+    feedback_argv = [
+        *feedback_common_argv,
         "--mode",
         "watch",
         "--interval",
@@ -483,6 +534,43 @@ def build_live_runtime(
     ]
     if mutation_enabled:
         feedback_argv.append("--strict")
+    feedback_once_argv = [
+        *feedback_common_argv,
+        "--mode",
+        "once",
+        "--strict",
+    ]
+    gpu_reconcile_argv = [
+        str(python),
+        "-m",
+        "risk_score.gpu_lease",
+        "--config",
+        str(gpu_path),
+        "reconcile",
+        "--apply",
+    ]
+    controller_reconcile_argv = [
+        str(python),
+        "-m",
+        "risk_score.promotion_controller",
+        "--runtime-config",
+        str(promotion_path),
+        "--mode",
+        "reconcile",
+        "--automatic",
+        "--status-output",
+        str(promotion_root / "status.json"),
+    ]
+    boot_ready_argv = [
+        str(python),
+        "-m",
+        "risk_score.promotion_host",
+        "boot-ready",
+        "--runtime-config",
+        str(promotion_path),
+        "--output",
+        str(boot_ready_path),
+    ]
     model_probe_argv = [
         str(python),
         "-m",
@@ -546,6 +634,18 @@ def build_live_runtime(
             "environment": {},
             "restart": "always",
         }
+        services["reconcile"] = {
+            "commands": [
+                feedback_once_argv,
+                gpu_reconcile_argv,
+                controller_reconcile_argv,
+                boot_ready_argv,
+            ],
+            "description": "KataGo risk-training boot reconciliation",
+            "environment": {},
+            "restart": "no",
+            "type": "oneshot",
+        }
     for name, command, description, environment in (
         (
             "shuffler",
@@ -580,26 +680,51 @@ def build_live_runtime(
             "feedback": "katago-risk-promotion-feedback.service",
             "shuffler": "katago-risk-shuffler.service",
             "exporter": "katago-risk-exporter.service",
+            "reconcile": "katago-risk-boot-reconcile.service",
         }
         for name, spec in services.items():
-            dependencies = (
-                ("katago-risk-promotion-host.service",)
-                if name in {"controller", "auditor", "feedback"}
+            dependencies = []
+            if name in {"controller", "auditor", "feedback", "reconcile"}:
+                dependencies.append("katago-risk-promotion-host.service")
+            if mutation_enabled and name not in {"supervisor", "reconcile"}:
+                dependencies.append("katago-risk-boot-reconcile.service")
+            before = (
+                tuple(
+                    unit_names[service_name]
+                    for service_name in services
+                    if service_name not in {"supervisor", "reconcile"}
+                )
+                if name == "reconcile"
                 else ()
             )
             unit_path = units_dir / unit_names[name]
+            commands = spec.get("commands")
+            if name == "reconcile":
+                if not isinstance(commands, list) or not commands:
+                    raise HostCommandError(
+                        "boot reconciliation service commands are invalid"
+                    )
+                primary_argv = commands[0]
+                additional_argv = commands[1:]
+            else:
+                primary_argv = spec["argv"]
+                additional_argv = ()
             _write_text_file(
                 unit_path,
                 _systemd_service(
                     description=str(spec["description"]),
-                    argv=spec["argv"],
+                    argv=primary_argv,
                     service_user=service_user,
                     working_directory=repository / "python",
                     run_root=root,
                     environment=spec.get("environment", {}),
                     after=dependencies,
+                    before=before,
                     requires=dependencies,
                     restart=str(spec.get("restart", "on-failure")),
+                    service_type=str(spec.get("type", "simple")),
+                    additional_argv=additional_argv,
+                    remain_after_exit=name == "reconcile",
                 ),
             )
             systemd_units[name] = {
@@ -630,6 +755,7 @@ def build_live_runtime(
     service_spec = {
         "schema_version": 2,
         "contract": "risk-score-host-services-v2",
+        "mutation_enabled": mutation_enabled,
         "service_user": service_user,
         "services": services,
         "systemd_units": systemd_units,
@@ -775,6 +901,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--service-user")
     parser.add_argument("--shuffler-command-json")
     parser.add_argument("--exporter-command-json")
+    parser.add_argument("--evaluator-command-json")
     return parser.parse_args(argv)
 
 
@@ -783,6 +910,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         shuffler_command = _parse_command_json(args.shuffler_command_json, "shuffler")
         exporter_command = _parse_command_json(args.exporter_command_json, "exporter")
+        evaluator_command = _parse_command_json(
+            args.evaluator_command_json, "evaluator"
+        )
         result = build_live_runtime(
             repo=args.repo,
             run_root=args.run_root,
@@ -801,6 +931,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             service_user=args.service_user,
             shuffler_command=shuffler_command,
             exporter_command=exporter_command,
+            evaluator_command=evaluator_command,
         )
     except (HostCommandError, OSError, TypeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)

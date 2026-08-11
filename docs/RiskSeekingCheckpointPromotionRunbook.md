@@ -148,6 +148,13 @@ include `-generation-provenance-dir
 $TRAIN_BASE/promotion/provenance/trainer` and
 `-require-shuffle-provenance`.
 
+Mutation-enabled builds also generate a hash-bound boot-reconciliation
+oneshot. It refreshes feedback watermarks, applies GPU-lease reconciliation,
+and reconciles the automatic controller before dependent long-running
+services start. Every generated service is `PartOf=katago-risk-training.target`
+so applying a new verified service specification restarts the complete ordered
+unit set rather than leaving old processes on updated unit files.
+
 Plan and verify the hash-bound unit installation before applying it. The apply
 step atomically installs only the exact generated KataGo units, reloads systemd,
 starts the aggregate target, and refuses to publish a receipt unless every
@@ -302,6 +309,44 @@ python3 -m risk_score.curation_orchestrator watch \
   --per-gpu-parallelism 4 \
   --poll-interval 30
 ```
+
+For a new supplemental source pool, generate the canonical-orientation
+2,000-visit advisory query pair without hand-written query scripts:
+
+```bash
+python3 -m risk_score.consensus_prefilter generate-queries \
+  "$NORMALIZED_SOURCE" \
+  --output-dir "$RUN_DIR/evaluation/curation/prefilter-query-bundle" \
+  --katago "$REPO/cpp/build-cuda/katago" \
+  --config "$REPO/cpp/configs/risk_score/promotion_curation_analysis.cfg" \
+  --model "$CHAMPION_MODEL" \
+  --policy "$REPO/python/risk_score/promotion_policy_v3.json"
+```
+
+The query bundle is still advisory. Run both roles with both frozen models,
+then pass the four manifest-bound results to `risk_score.consensus_prefilter`.
+
+Once every label has enough prefiltered sources, use the restartable
+`risk_score.curation_pipeline` coordinator to chain query generation, the
+eight-role orchestrator, machine labeling, labeling merge, finalization, and
+v3 suite construction. Its canonical
+`risk-score-curation-pipeline-spec-v1` binds the deployment revision, policy,
+binary, config, original/champion models, every selected source and prefilter
+manifest, output paths, frozen label minima, and GPU topology:
+
+```bash
+python3 -m risk_score.curation_pipeline status \
+  --spec "$RUN_DIR/configs/curation-pipeline.json"
+python3 -m risk_score.curation_pipeline watch \
+  --spec "$RUN_DIR/configs/curation-pipeline.json" \
+  --poll-interval 30
+```
+
+`status` is read-only. `once` advances one non-GPU stage and deliberately
+stops before consensus. `watch` owns an exclusive lock and resumes the
+restartable GPU stage. If selected sources are below any frozen minimum, the
+coordinator publishes `blocked_insufficient_sources` before spending on full
+consensus.
 
 Benchmark per-GPU parallelism on a bounded pilot before using the example
 value. The manual commands below remain useful for diagnosis, but do not use
@@ -658,6 +703,13 @@ trainer receipts. Inspect the combined live view with:
 ```bash
 python3 -m risk_score.promotion_status --run-root "$TRAIN_BASE"
 ```
+
+The status view distinguishes a freshly rewritten summary from the newest real
+self-play `.npz`, reports trainer restart/backoff duration, backpressure age,
+GPU-lease safety/staleness, disk reserve, checkpoint age, and the newest nested
+curation status. A stale denial remains fail-closed but is still reported as
+unhealthy. With local-only monitoring, canonical status and journald are the
+authoritative failure surfaces.
 
 ## Enabling automatic promotion
 

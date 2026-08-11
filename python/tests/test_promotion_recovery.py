@@ -1430,8 +1430,25 @@ def test_lock_conflict_and_insufficient_disk_halt_before_intake(tmp_path):
         automatic=True,
         disk_usage=lambda _path: SimpleNamespace(free=0),
     )
+    backpressure = runtime.promotion_root / "operations" / "backpressure.json"
+    atomic_write_json(
+        backpressure,
+        {
+            "schema_version": 1,
+            "updated_at_utc": "2026-07-29T00:00:00Z",
+            "policy_hash": runtime.controller.policy_hash,
+            "allowExport": True,
+            "allowEvaluation": True,
+        },
+    )
     with pytest.raises(InsufficientDiskError):
         low_disk.run_once()
+    denial = json.loads(backpressure.read_text(encoding="utf-8"))
+    assert denial["allowExport"] is False
+    assert denial["allowEvaluation"] is False
+    assert denial["reasons"] == ["disk-reserve-hard-limit"]
+    assert denial["diskFreeBytes"] == 0
+    assert denial["requiredFreeBytes"] > 0
 
 
 def test_automatic_controller_can_hold_single_writer_lock_for_process_lifetime(
@@ -3212,6 +3229,39 @@ def test_trash_grace_reference_protection_and_backpressure_status(tmp_path):
     assert deleted[0]["status"] == "DELETED"
     assert not object_path.exists()
     assert controller.reconcile_trash(mutate=True)[0]["reused"] is True
+
+
+def test_backpressure_pauses_export_before_disk_reserve(tmp_path):
+    runtime = prepare_runtime(tmp_path, min_free=1_000_000)
+    bootstrap = PromotionController(runtime, automatic=True)
+    bootstrap.bootstrap(
+        digest("champion-0"),
+        "generation-0",
+        confirmation="BOOTSTRAP_INITIAL_CHAMPION",
+    )
+    minimum = runtime.controller.min_free_bytes
+    approaching = PromotionController(
+        runtime,
+        automatic=True,
+        disk_usage=lambda _path: SimpleNamespace(
+            free=minimum + minimum // 20
+        ),
+    )
+    status = approaching.reconcile(mutate=False)
+    assert status["backpressure"]["diskFreeBytes"] == minimum + minimum // 20
+    assert status["backpressure"]["minimumFreeBytes"] == minimum
+    assert status["backpressure"]["diskWarningBytes"] > minimum
+    assert status["backpressure"]["allowExport"] is False
+    assert "disk-reserve-approaching" in status["backpressure"]["reasons"]
+
+    healthy = PromotionController(
+        runtime,
+        automatic=True,
+        disk_usage=lambda _path: SimpleNamespace(
+            free=minimum + minimum // 5
+        ),
+    ).reconcile(mutate=False)
+    assert "disk-reserve-approaching" not in healthy["backpressure"]["reasons"]
 
 
 def test_reconcile_status_reports_worker_acks_and_feedback_timestamps(tmp_path):

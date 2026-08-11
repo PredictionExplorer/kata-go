@@ -22,6 +22,7 @@ SYSTEMD_SERVICE_UNITS = {
     "feedback": "katago-risk-promotion-feedback.service",
     "shuffler": "katago-risk-shuffler.service",
     "exporter": "katago-risk-exporter.service",
+    "reconcile": "katago-risk-boot-reconcile.service",
 }
 
 
@@ -43,14 +44,22 @@ def _assert_durable_systemd_runtime(result, services):
         Path(result["deployment_manifest"]).read_text(encoding="utf-8")
     )
     for service_name in expected_services:
-        assert services["services"][service_name]["restart"] == "always"
         unit = services["systemd_units"][service_name]
         unit_path = Path(unit["path"])
         unit_lines = unit_path.read_text(encoding="utf-8").splitlines()
-        assert unit_lines.count("Restart=always") == 1
-        assert "KillSignal=SIGINT" in unit_lines
-        assert "KillMode=control-group" in unit_lines
-        assert "TimeoutStopSec=300" in unit_lines
+        assert "PartOf=katago-risk-training.target" in unit_lines
+        if service_name == "reconcile":
+            assert services["services"][service_name]["restart"] == "no"
+            assert unit_lines.count("Restart=no") == 1
+            assert "Type=oneshot" in unit_lines
+            assert "RemainAfterExit=yes" in unit_lines
+        else:
+            assert services["services"][service_name]["restart"] == "always"
+            assert unit_lines.count("Restart=always") == 1
+            assert "Type=simple" in unit_lines
+            assert "KillSignal=SIGINT" in unit_lines
+            assert "KillMode=control-group" in unit_lines
+            assert "TimeoutStopSec=300" in unit_lines
         assert file_sha256(unit_path) == unit["sha256"]
         assert deployment["files"][f"systemd:{service_name}"] == unit
 
@@ -183,11 +192,17 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
     services = json.loads(service_path.read_text(encoding="utf-8"))
     assert promotion["mutationEnabled"] is False
     assert gpu["mutationEnabled"] is False
+    assert gpu["evaluator"]["launchCommand"][-1] == "evaluator-unsupported"
     assert promotion["hashes"]["gpuLeaseConfig"] == file_sha256(gpu_path)
     assert promotion["paths"]["candidateInbox"] == str(run / "modelstobetested")
     assert "risk_score.stage0_probe" in promotion["commands"]["stage0Probe"]
     assert "risk_score.promotion_host" in promotion["commands"]["selfplay"]
     assert services["contract"] == "risk-score-host-services-v2"
+    boot_ready_path = run / "promotion" / "supervisor" / "boot-ready.json"
+    supervisor_argv = services["services"]["supervisor"]["argv"]
+    assert supervisor_argv[supervisor_argv.index("--boot-ready") + 1] == str(
+        boot_ready_path
+    )
     shadow_controller = services["services"]["controller"]["argv"]
     assert shadow_controller[-1] == "--recommend-only"
     assert shadow_controller[shadow_controller.index("--mode") + 1] == "watch"
@@ -219,6 +234,8 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
         "supervisor",
         "target",
     }
+    assert services["mutation_enabled"] is False
+    assert "reconcile" not in services["services"]
     _assert_durable_systemd_runtime(result, services)
     controller_unit = Path(services["systemd_units"]["controller"]["path"]).read_text(
         encoding="utf-8"
@@ -243,6 +260,69 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
             mutation_enabled=True,
             require_clean_source=False,
         )
+    automatic_without_legacy_evaluator = build_live_runtime(
+        repo=REPO,
+        run_root=run,
+        suite_dir=suites,
+        katago_binary=katago,
+        python_executable=Path(sys.executable),
+        trainer_spec=trainer_spec,
+        consumer_spec=consumer_spec,
+        original_model=original,
+        trainer_checkpoint=checkpoint,
+        gpu_uuid="GPU-test-production",
+        actor="controller-test",
+        source_revision=revision,
+        output_dir=run / "missing-evaluator-configs",
+        mutation_enabled=True,
+        require_clean_source=False,
+        service_user="ubuntu",
+        shuffler_command=[sys.executable, "-c", "print('shuffle')"],
+        exporter_command=[sys.executable, "-c", "print('export')"],
+    )
+    automatic_without_legacy_gpu = json.loads(
+        Path(
+            automatic_without_legacy_evaluator["gpu_lease_runtime"]
+        ).read_text(encoding="utf-8")
+    )
+    assert (
+        automatic_without_legacy_gpu["evaluator"]["launchCommand"][-1]
+        == "evaluator-unsupported"
+    )
+    with pytest.raises(HostCommandError, match="must not be evaluator-unsupported"):
+        build_live_runtime(
+            repo=REPO,
+            run_root=run,
+            suite_dir=suites,
+            katago_binary=katago,
+            python_executable=Path(sys.executable),
+            trainer_spec=trainer_spec,
+            consumer_spec=consumer_spec,
+            original_model=original,
+            trainer_checkpoint=checkpoint,
+            gpu_uuid="GPU-test-production",
+            actor="controller-test",
+            source_revision=revision,
+            output_dir=run / "unsupported-evaluator-configs",
+            mutation_enabled=True,
+            require_clean_source=False,
+            service_user="ubuntu",
+            shuffler_command=[sys.executable, "-c", "print('shuffle')"],
+            exporter_command=[sys.executable, "-c", "print('export')"],
+            evaluator_command=[
+                sys.executable,
+                "-m",
+                "risk_score.promotion_host",
+                "evaluator-unsupported",
+            ],
+        )
+    evaluator_command = [
+        sys.executable,
+        "-c",
+        "print('evaluate')",
+        "{lease_id}",
+        "{worker_index}",
+    ]
     automatic = build_live_runtime(
         repo=REPO,
         run_root=run,
@@ -262,13 +342,20 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
         service_user="ubuntu",
         shuffler_command=[sys.executable, "-c", "print('shuffle')"],
         exporter_command=[sys.executable, "-c", "print('export')"],
+        evaluator_command=evaluator_command,
     )
     automatic_services = json.loads(
         Path(automatic["service_spec"]).read_text(encoding="utf-8")
     )
+    automatic_gpu = json.loads(
+        Path(automatic["gpu_lease_runtime"]).read_text(encoding="utf-8")
+    )
+    assert automatic_services["mutation_enabled"] is True
     assert set(automatic_services["services"]) == set(
         SYSTEMD_SERVICE_UNITS
     )
+    assert automatic_gpu["evaluator"]["launchCommand"] == evaluator_command
+    assert "evaluator-unsupported" not in automatic_gpu["evaluator"]["launchCommand"]
     auditor_argv = automatic_services["services"]["auditor"]["argv"]
     assert auditor_argv[auditor_argv.index("--katago") + 1] == str(katago)
     controller_argv = automatic_services["services"]["controller"]["argv"]
@@ -284,6 +371,66 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
         ]
         == "1"
     )
+    reconcile = automatic_services["services"]["reconcile"]
+    commands = reconcile["commands"]
+    assert [command[2] for command in commands] == [
+        "risk_score.promotion_feedback",
+        "risk_score.gpu_lease",
+        "risk_score.promotion_controller",
+        "risk_score.promotion_host",
+    ]
+    assert commands[0][commands[0].index("--mode") + 1] == "once"
+    assert "--strict" in commands[0]
+    assert commands[1][-2:] == ["reconcile", "--apply"]
+    assert commands[2][commands[2].index("--mode") + 1] == "reconcile"
+    assert "--automatic" in commands[2]
+    assert commands[2][-2:] == [
+        "--status-output",
+        str(run / "promotion" / "status.json"),
+    ]
+    assert commands[3][3] == "boot-ready"
+    assert commands[3][-4:] == [
+        "--runtime-config",
+        str(automatic["promotion_runtime"]),
+        "--output",
+        str(boot_ready_path),
+    ]
+    reconcile_unit = Path(
+        automatic_services["systemd_units"]["reconcile"]["path"]
+    ).read_text(encoding="utf-8")
+    reconcile_lines = reconcile_unit.splitlines()
+    assert reconcile_lines.count("Type=oneshot") == 1
+    assert reconcile_lines.count("RemainAfterExit=yes") == 1
+    assert reconcile_lines.count("Restart=no") == 1
+    assert len(
+        [line for line in reconcile_lines if line.startswith("ExecStart=")]
+    ) == 4
+    assert "Requires=katago-risk-promotion-host.service" in reconcile_lines
+    before = next(
+        line for line in reconcile_lines if line.startswith("Before=")
+    )
+    assert set(before.removeprefix("Before=").split()) == {
+        unit_name
+        for name, unit_name in SYSTEMD_SERVICE_UNITS.items()
+        if name not in {"supervisor", "reconcile"}
+    }
+    for name in set(automatic_services["services"]) - {
+        "supervisor",
+        "reconcile",
+    }:
+        unit_lines = Path(
+            automatic_services["systemd_units"][name]["path"]
+        ).read_text(encoding="utf-8").splitlines()
+        requires = next(
+            line for line in unit_lines if line.startswith("Requires=")
+        )
+        assert "katago-risk-boot-reconcile.service" in (
+            requires.removeprefix("Requires=").split()
+        )
+    supervisor_unit = Path(
+        automatic_services["systemd_units"]["supervisor"]["path"]
+    ).read_text(encoding="utf-8")
+    assert "katago-risk-boot-reconcile.service" not in supervisor_unit
     _assert_durable_systemd_runtime(automatic, automatic_services)
     deployment = verify_deployment_manifest(Path(result["deployment_manifest"]))
     assert deployment["source_revision"] == revision

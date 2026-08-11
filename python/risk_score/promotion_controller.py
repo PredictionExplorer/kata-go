@@ -1890,9 +1890,60 @@ class PromotionController:
         usage = self.disk_usage(self.runtime.promotion_root)
         required = self.runtime.controller.min_free_bytes + max(0, additional_bytes)
         if usage.free < required:
+            self._publish_disk_backpressure_denial(
+                free_bytes=int(usage.free),
+                required_bytes=int(required),
+            )
             raise InsufficientDiskError(
                 f"free bytes {usage.free} below required reserve {required}"
             )
+
+    def _publish_disk_backpressure_denial(
+        self, *, free_bytes: int, required_bytes: int
+    ) -> None:
+        """Fail export closed before a disk-reserve exception stops the controller."""
+
+        if not self.automatic:
+            return
+        target = (
+            self.runtime.promotion_root
+            / "operations"
+            / "backpressure.json"
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        value = {
+            "schema_version": 1,
+            "updated_at_utc": utc_timestamp(self.now()),
+            "controller_hash": self.runtime.controller.controller_hash,
+            "policy_hash": self.runtime.controller.policy_hash,
+            "allowExport": False,
+            "allowEvaluation": False,
+            "exportPaused": True,
+            "evaluationPaused": True,
+            "exportBacklogDepth": 0,
+            "evaluationBacklogDepth": 0,
+            "maximumActiveEvaluatorEntries":
+                self.runtime.controller.max_active_queue,
+            "importantQueueWarningDepth": _policy_get(
+                self.runtime.frozen_policy,
+                "queue",
+                "important_queue_warning_depth",
+                default=self.runtime.controller.max_active_queue + 1,
+            ),
+            "diskFreeBytes": free_bytes,
+            "minimumFreeBytes": self.runtime.controller.min_free_bytes,
+            "requiredFreeBytes": required_bytes,
+            "reasons": ["disk-reserve-hard-limit"],
+        }
+        try:
+            atomic_write_bytes(
+                target, canonical_json_bytes(value) + b"\n"
+            )
+        except OSError:
+            # A missing gate also fails the hardened exporter closed. Never
+            # leave a fresh allowance visible after the reserve check failed.
+            target.unlink(missing_ok=True)
+            fsync_directory(target.parent)
 
     def build_evaluation_plan(
         self,
@@ -4731,9 +4782,17 @@ class PromotionController:
             raise SafetyHalt("policy queue warning depth is invalid")
         export_depth = len(candidates) + len(ignored)
         evaluation_depth = len(active)
+        disk_free_bytes = int(self.disk_usage(self.runtime.promotion_root).free)
+        minimum_free_bytes = self.runtime.controller.min_free_bytes
+        disk_warning_bytes = max(
+            minimum_free_bytes,
+            math.ceil(minimum_free_bytes * 1.1),
+        )
+        disk_pressure = disk_free_bytes < disk_warning_bytes
         export_paused = (
             evaluation_depth >= evaluator_limit
             or export_depth >= warning_depth
+            or disk_pressure
         )
         evaluation_paused = evaluation_depth >= evaluator_limit
         reasons = []
@@ -4741,11 +4800,16 @@ class PromotionController:
             reasons.append("active-evaluator-limit")
         if export_depth >= warning_depth:
             reasons.append("export-backlog-warning-depth")
+        if disk_pressure:
+            reasons.append("disk-reserve-approaching")
         return {
             "exportBacklogDepth": export_depth,
             "evaluationBacklogDepth": evaluation_depth,
             "maximumActiveEvaluatorEntries": evaluator_limit,
             "importantQueueWarningDepth": warning_depth,
+            "diskFreeBytes": disk_free_bytes,
+            "minimumFreeBytes": minimum_free_bytes,
+            "diskWarningBytes": disk_warning_bytes,
             "exportPaused": export_paused,
             "evaluationPaused": evaluation_paused,
             "allowExport": not export_paused,
