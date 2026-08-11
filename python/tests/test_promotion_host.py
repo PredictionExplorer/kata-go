@@ -312,7 +312,7 @@ def test_trainer_start_persists_launch_before_identity_capture(
 def test_process_identity_rejects_pid_reuse_coordinates():
     process = subprocess.Popen(["sleep", "2"], start_new_session=True)
     try:
-        identity = capture_process_identity(process.pid)
+        identity = promotion_host.capture_spawned_process(process)
         assert same_process(identity)
         changed = dict(identity, command_sha256="0" * 64)
         assert not same_process(changed)
