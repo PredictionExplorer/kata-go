@@ -818,6 +818,26 @@ def build_live_runtime(
         "gpu_lease_runtime": gpu_path,
         "service_spec": service_path,
     }
+    command_bindings = {
+        "trainer": tuple(trainer_spec_value.get("argv", ())),
+        "shuffler": shuffler_argv,
+        "exporter": exporter_argv,
+        "legacy_evaluator": evaluator_argv,
+    }
+    for command_name, command in command_bindings.items():
+        for index, argument in enumerate(command):
+            candidate = Path(argument)
+            if not candidate.is_absolute() or not candidate.is_file():
+                continue
+            resolved = candidate.resolve()
+            try:
+                resolved.relative_to(repository)
+            except ValueError:
+                try:
+                    resolved.relative_to(root)
+                except ValueError:
+                    continue
+            deployment_files[f"command:{command_name}:{index}"] = resolved
     for name, unit in systemd_units.items():
         deployment_files[f"systemd:{name}"] = Path(unit["path"])
     for module_path in sorted(

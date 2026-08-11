@@ -323,6 +323,12 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
         "{lease_id}",
         "{worker_index}",
     ]
+    shuffler_service = run / "configs" / "shuffler-loop"
+    exporter_service = run / "configs" / "exporter-loop"
+    shuffler_service.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    exporter_service.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    shuffler_service.chmod(0o755)
+    exporter_service.chmod(0o755)
     automatic = build_live_runtime(
         repo=REPO,
         run_root=run,
@@ -340,8 +346,8 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
         mutation_enabled=True,
         require_clean_source=False,
         service_user="ubuntu",
-        shuffler_command=[sys.executable, "-c", "print('shuffle')"],
-        exporter_command=[sys.executable, "-c", "print('export')"],
+        shuffler_command=[str(shuffler_service)],
+        exporter_command=[str(exporter_service)],
         evaluator_command=evaluator_command,
     )
     automatic_services = json.loads(
@@ -350,12 +356,23 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
     automatic_gpu = json.loads(
         Path(automatic["gpu_lease_runtime"]).read_text(encoding="utf-8")
     )
+    automatic_deployment = json.loads(
+        Path(automatic["deployment_manifest"]).read_text(encoding="utf-8")
+    )
     assert automatic_services["mutation_enabled"] is True
     assert set(automatic_services["services"]) == set(
         SYSTEMD_SERVICE_UNITS
     )
     assert automatic_gpu["evaluator"]["launchCommand"] == evaluator_command
     assert "evaluator-unsupported" not in automatic_gpu["evaluator"]["launchCommand"]
+    assert automatic_deployment["files"]["command:shuffler:0"] == {
+        "path": str(shuffler_service.resolve()),
+        "sha256": file_sha256(shuffler_service),
+    }
+    assert automatic_deployment["files"]["command:exporter:0"] == {
+        "path": str(exporter_service.resolve()),
+        "sha256": file_sha256(exporter_service),
+    }
     auditor_argv = automatic_services["services"]["auditor"]["argv"]
     assert auditor_argv[auditor_argv.index("--katago") + 1] == str(katago)
     controller_argv = automatic_services["services"]["controller"]["argv"]
