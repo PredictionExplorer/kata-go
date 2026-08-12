@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -23,6 +24,15 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
+
+from risk_score.adaptive_training import (
+    AdaptiveTrainingError,
+    load_adaptive_observation,
+    load_adaptive_service_spec,
+    load_policy as load_adaptive_policy,
+    publish_adaptive_observation,
+)
+from risk_score.promotion_state import PromotionStateError, load_champion
 
 
 SCHEMA_VERSION = 1
@@ -35,6 +45,18 @@ DATA_WATERMARK_CONTRACT = "risk-score-generation-data-watermark-v1"
 SHUFFLE_WATERMARK_CONTRACT = "risk-score-generation-shuffle-watermark-v1"
 FEEDBACK_EVIDENCE_CONTRACT = "risk-score-promotion-feedback-evidence-v1"
 FEEDBACK_DELIVERY_CONTRACT = "risk-score-promotion-feedback-delivery-v1"
+AUTONOMY_SERVICE_SPEC_CONTRACT = "risk-score-host-services-v3"
+LEGACY_SERVICE_SPEC_CONTRACT = "risk-score-host-services-v2"
+ADAPTIVE_SERVICE_BINDING_CONTRACT = (
+    "risk-score-adaptive-observation-service-binding-v1"
+)
+ADAPTIVE_DATA_SNAPSHOT_CONTRACT = (
+    "risk-score-adaptive-admitted-data-snapshot-v1"
+)
+ADAPTIVE_BASELINE_CONTRACT = "risk-score-adaptive-champion-baseline-v1"
+ADAPTIVE_PRODUCER_STATUS_CONTRACT = (
+    "risk-score-adaptive-observation-producer-status-v1"
+)
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
 
@@ -279,6 +301,173 @@ def _stable_file_record(
         "sha256": digest,
         **metadata,
     }
+
+
+def _stable_file_binding(path: Path, role: str) -> Dict[str, Any]:
+    """Hash a regular file while rejecting path replacement or mutation."""
+
+    source = Path(path)
+    before = source.lstat()
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise PromotionFeedbackError(
+            f"{role} must be a regular non-symlink file: {source}"
+        )
+    digest = file_sha256(source)
+    after = source.lstat()
+    identity_before = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    identity_after = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if identity_before != identity_after:
+        raise PromotionFeedbackError(f"{role} changed while hashing: {source}")
+    return {
+        "path": str(source),
+        "sha256": digest,
+        "size": before.st_size,
+    }
+
+
+def _hash_descriptor(descriptor: int) -> str:
+    digest = hashlib.sha256()
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while True:
+        block = os.read(descriptor, 1024 * 1024)
+        if not block:
+            return digest.hexdigest()
+        digest.update(block)
+
+
+def _descriptor_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _immutable_checkpoint_snapshot(source_path: Path, root: Path) -> Path:
+    """Create or reuse a content-addressed copy of a mutable checkpoint."""
+
+    source = Path(source_path)
+    destination_root = _absolute_directory(
+        Path(root), "adaptive checkpoint snapshot root", create=True
+    )
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(str(source), flags)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise PromotionFeedbackError(
+                f"trainer checkpoint is not a regular file: {source}"
+            )
+        source_before = source.lstat()
+        if (
+            stat.S_ISLNK(source_before.st_mode)
+            or _descriptor_identity(source_before) != _descriptor_identity(before)
+        ):
+            raise PromotionFeedbackError(
+                f"trainer checkpoint path changed before snapshot: {source}"
+            )
+        digest_before = _hash_descriptor(descriptor)
+        destination = destination_root / f"{digest_before}.ckpt"
+        if destination.exists() or destination.is_symlink():
+            metadata = destination.lstat()
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_size != before.st_size
+                or metadata.st_mode & 0o222
+                or file_sha256(destination) != digest_before
+            ):
+                raise PromotionFeedbackError(
+                    f"immutable checkpoint snapshot conflicts: {destination}"
+                )
+        else:
+            temporary_descriptor, temporary_name = tempfile.mkstemp(
+                prefix=".checkpoint.",
+                suffix=".tmp",
+                dir=str(destination_root),
+            )
+            temporary = Path(temporary_name)
+            try:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                with os.fdopen(os.dup(descriptor), "rb") as source_handle:
+                    with os.fdopen(temporary_descriptor, "wb") as target_handle:
+                        shutil.copyfileobj(
+                            source_handle,
+                            target_handle,
+                            length=1024 * 1024,
+                        )
+                        target_handle.flush()
+                        os.fsync(target_handle.fileno())
+                os.chmod(temporary, 0o444)
+                temporary_metadata = temporary.lstat()
+                if (
+                    not stat.S_ISREG(temporary_metadata.st_mode)
+                    or temporary_metadata.st_size != before.st_size
+                    or file_sha256(temporary) != digest_before
+                ):
+                    raise PromotionFeedbackError(
+                        "checkpoint snapshot copy does not match its source"
+                    )
+                try:
+                    os.link(temporary, destination, follow_symlinks=False)
+                except FileExistsError:
+                    metadata = destination.lstat()
+                    if (
+                        stat.S_ISLNK(metadata.st_mode)
+                        or not stat.S_ISREG(metadata.st_mode)
+                        or metadata.st_size != before.st_size
+                        or metadata.st_mode & 0o222
+                        or file_sha256(destination) != digest_before
+                    ):
+                        raise PromotionFeedbackError(
+                            "concurrent immutable checkpoint snapshot conflicts: "
+                            f"{destination}"
+                        )
+                _fsync_directory(destination_root)
+            finally:
+                temporary.unlink(missing_ok=True)
+
+        digest_after = _hash_descriptor(descriptor)
+        after = os.fstat(descriptor)
+        source_after = source.lstat()
+        if (
+            digest_after != digest_before
+            or _descriptor_identity(after) != _descriptor_identity(before)
+            or stat.S_ISLNK(source_after.st_mode)
+            or _descriptor_identity(source_after) != _descriptor_identity(before)
+        ):
+            raise PromotionFeedbackError(
+                f"trainer checkpoint changed while snapshotting: {source}"
+            )
+        snapshot = _stable_file_binding(
+            destination, "immutable checkpoint snapshot"
+        )
+        if (
+            snapshot["sha256"] != digest_before
+            or snapshot["size"] != before.st_size
+        ):
+            raise PromotionFeedbackError(
+                "immutable checkpoint snapshot failed final verification"
+            )
+        return destination
+    finally:
+        os.close(descriptor)
 
 
 def tree_inventory(
@@ -2249,6 +2438,1375 @@ class PromotionFeedbackWatcher:
                 )
         return events
 
+    @property
+    def _adaptive_root(self) -> Path:
+        return self.promotion_root / "adaptive"
+
+    @property
+    def _adaptive_parents_root(self) -> Path:
+        return self._adaptive_root / "parents"
+
+    @property
+    def _adaptive_producer_status_path(self) -> Path:
+        return self._adaptive_root / "observation-producer-status.json"
+
+    def _now_unix(self) -> float:
+        current = self.now()
+        if current.tzinfo is None or current.utcoffset() is None:
+            raise PromotionFeedbackError(
+                "adaptive observation timestamp must be timezone-aware"
+            )
+        value = current.timestamp()
+        if value < 0:
+            raise PromotionFeedbackError(
+                "adaptive observation timestamp must be nonnegative"
+            )
+        return value
+
+    def _promotion_services_path(self) -> Path:
+        return self.promotion_root.parent / "configs" / "promotion-services.json"
+
+    def _write_adaptive_producer_status(
+        self,
+        *,
+        state: str,
+        observed_at_unix: float,
+        service_spec: Optional[Mapping[str, Any]],
+        observation: Optional[Mapping[str, Any]],
+        blocked_reason: Optional[str] = None,
+        error_code: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        root = _absolute_directory(
+            self._adaptive_root,
+            "adaptive observation producer root",
+            create=True,
+        )
+        if root != self._adaptive_root:
+            raise PromotionFeedbackError(
+                "adaptive observation producer root changed unexpectedly"
+            )
+        payload: Dict[str, Any] = {
+            "schema_version": SCHEMA_VERSION,
+            "contract": ADAPTIVE_PRODUCER_STATUS_CONTRACT,
+            "state": state,
+            "observed_at_unix": observed_at_unix,
+            "service_spec": (
+                None if service_spec is None else dict(service_spec)
+            ),
+            "observation": (
+                None if observation is None else dict(observation)
+            ),
+            "blocked_reason": blocked_reason,
+            "error_code": error_code,
+        }
+        value = dict(payload)
+        value["status_sha256"] = canonical_sha256(payload)
+        atomic_replace_json(self._adaptive_producer_status_path, value)
+        return value
+
+    def _retained_observation_summary(
+        self, observation_path: Optional[Path]
+    ) -> Optional[Dict[str, Any]]:
+        if observation_path is None:
+            return None
+        try:
+            binding_before = _stable_file_binding(
+                observation_path, "retained adaptive observation"
+            )
+            value = load_adaptive_observation(
+                observation_path, expected_path=observation_path
+            )
+            binding_after = _stable_file_binding(
+                observation_path, "retained adaptive observation"
+            )
+            if binding_before != binding_after:
+                return None
+        except (AdaptiveTrainingError, OSError, PromotionFeedbackError):
+            return None
+        return {
+            **binding_before,
+            "observation_sha256": value.get("observation_sha256"),
+            "admitted_samples": value.get("admitted_samples"),
+            "current_champion_model_sha256": value.get(
+                "current_champion_model_sha256"
+            ),
+        }
+
+    def _publish_blocked_adaptive_status(
+        self,
+        *,
+        observed_at_unix: float,
+        error: BaseException,
+        service_spec: Optional[Mapping[str, Any]] = None,
+        observation_path: Optional[Path] = None,
+    ) -> Dict[str, Any]:
+        status = self._write_adaptive_producer_status(
+            state="BLOCKED",
+            observed_at_unix=observed_at_unix,
+            service_spec=service_spec,
+            observation=self._retained_observation_summary(
+                observation_path
+            ),
+            blocked_reason=str(error),
+            error_code=str(
+                getattr(error, "code", type(error).__name__)
+            ),
+        )
+        return {
+            "status": "BLOCKED",
+            "status_path": str(self._adaptive_producer_status_path),
+            "blocked_reason": status["blocked_reason"],
+            "error_code": status["error_code"],
+            "observation_retained": status["observation"] is not None,
+        }
+
+    def _load_adaptive_service_binding(
+        self,
+        services_path: Path,
+        services: Mapping[str, Any],
+    ) -> tuple[Any, Dict[str, Any]]:
+        if (
+            services.get("schema_version") != 3
+            or services.get("contract") != AUTONOMY_SERVICE_SPEC_CONTRACT
+            or services.get("full_autonomy") is not True
+            or services.get("mutation_enabled") is not True
+        ):
+            raise PromotionFeedbackError(
+                "full-autonomy v3 promotion service specification is invalid"
+            )
+        raw_inputs = services.get("service_inputs")
+        expected_inputs = {
+            "autonomy_policy",
+            "executor_spec",
+            "adaptive_spec",
+            "suite_registry_spec",
+        }
+        if (
+            not isinstance(raw_inputs, Mapping)
+            or set(raw_inputs) != expected_inputs
+        ):
+            raise PromotionFeedbackError(
+                "full-autonomy service_inputs are incomplete"
+            )
+        raw_binding = raw_inputs.get("adaptive_spec")
+        if (
+            not isinstance(raw_binding, Mapping)
+            or set(raw_binding) != {"path", "sha256"}
+        ):
+            raise PromotionFeedbackError(
+                "adaptive service input binding is malformed"
+            )
+        expected_file_hash = _require_hash(
+            raw_binding.get("sha256"), "adaptive service input file hash"
+        )
+        raw_path = raw_binding.get("path")
+        if not isinstance(raw_path, str):
+            raise PromotionFeedbackError(
+                "adaptive service input path is malformed"
+            )
+        adaptive_path = Path(raw_path)
+        if (
+            not adaptive_path.is_absolute()
+            or adaptive_path != Path(os.path.abspath(str(adaptive_path)))
+        ):
+            raise PromotionFeedbackError(
+                "adaptive service input path must be normalized and absolute"
+            )
+        services_binding = _stable_file_binding(
+            services_path, "promotion services specification"
+        )
+        adaptive_binding = _stable_file_binding(
+            adaptive_path, "adaptive service specification"
+        )
+        if adaptive_binding["sha256"] != expected_file_hash:
+            raise PromotionFeedbackError(
+                "adaptive service specification changed from service_inputs hash"
+            )
+        spec = load_adaptive_service_spec(adaptive_path)
+        final_binding = _stable_file_binding(
+            adaptive_path, "adaptive service specification"
+        )
+        if (
+            spec.file_sha256 != expected_file_hash
+            or final_binding != adaptive_binding
+        ):
+            raise PromotionFeedbackError(
+                "adaptive service specification changed while loading"
+            )
+        binding_payload = {
+            "schema_version": SCHEMA_VERSION,
+            "contract": ADAPTIVE_SERVICE_BINDING_CONTRACT,
+            "promotion_services": services_binding,
+            "adaptive_service_spec": {
+                **adaptive_binding,
+                "spec_sha256": spec.spec_sha256,
+                "observation_path": str(spec.observation_path),
+            },
+        }
+        binding_receipt = _finalize_receipt(binding_payload)
+        _absolute_directory(
+            self._adaptive_root,
+            "adaptive observation producer root",
+            create=True,
+        )
+        _absolute_directory(
+            self._adaptive_parents_root,
+            "adaptive observation parent root",
+            create=True,
+        )
+        binding_path = self._adaptive_parents_root / "service-binding.json"
+        if binding_path.exists() or binding_path.is_symlink():
+            binding_metadata = binding_path.lstat()
+            if (
+                stat.S_ISLNK(binding_metadata.st_mode)
+                or not stat.S_ISREG(binding_metadata.st_mode)
+                or binding_metadata.st_mode & 0o222
+            ):
+                raise PromotionFeedbackError(
+                    "adaptive service binding receipt is not immutable"
+                )
+            existing_binding_before = _stable_file_binding(
+                binding_path, "adaptive service binding receipt"
+            )
+            existing = _validate_receipt(
+                load_canonical_json(
+                    binding_path, "adaptive service binding receipt"
+                ),
+                contract=ADAPTIVE_SERVICE_BINDING_CONTRACT,
+                role="adaptive service binding receipt",
+            )
+            existing_binding_after = _stable_file_binding(
+                binding_path, "adaptive service binding receipt"
+            )
+            if existing_binding_before != existing_binding_after:
+                raise PromotionFeedbackError(
+                    "adaptive service binding receipt changed while loading"
+                )
+            if existing != binding_receipt:
+                raise PromotionFeedbackError(
+                    "adaptive service specification binding changed"
+                )
+        else:
+            atomic_create_json(binding_path, binding_receipt)
+        summary = {
+            "promotion_services_path": str(services_path),
+            "promotion_services_sha256": services_binding["sha256"],
+            "adaptive_service_spec_path": str(adaptive_path),
+            "adaptive_service_spec_file_sha256": expected_file_hash,
+            "adaptive_service_spec_sha256": spec.spec_sha256,
+            "binding_receipt_path": str(binding_path),
+            "binding_receipt_sha256": binding_receipt["receipt_sha256"],
+            "observation_path": str(spec.observation_path),
+        }
+        return spec, summary
+
+    def _known_adaptive_observation_path(self) -> Optional[Path]:
+        candidates = []
+        status_path = self._adaptive_producer_status_path
+        if status_path.is_file() and not status_path.is_symlink():
+            try:
+                status = load_canonical_json(
+                    status_path, "adaptive observation producer status"
+                )
+                body = dict(status)
+                supplied_hash = body.pop("status_sha256", None)
+                if (
+                    status.get("schema_version") == SCHEMA_VERSION
+                    and status.get("contract")
+                    == ADAPTIVE_PRODUCER_STATUS_CONTRACT
+                    and supplied_hash == canonical_sha256(body)
+                ):
+                    service = status.get("service_spec")
+                    if isinstance(service, Mapping):
+                        candidates.append(service.get("observation_path"))
+            except (OSError, PromotionFeedbackError):
+                pass
+        binding_path = self._adaptive_parents_root / "service-binding.json"
+        if binding_path.is_file() and not binding_path.is_symlink():
+            try:
+                binding = _validate_receipt(
+                    load_canonical_json(
+                        binding_path, "adaptive service binding receipt"
+                    ),
+                    contract=ADAPTIVE_SERVICE_BINDING_CONTRACT,
+                    role="adaptive service binding receipt",
+                )
+                adaptive = binding.get("adaptive_service_spec")
+                if isinstance(adaptive, Mapping):
+                    candidates.append(adaptive.get("observation_path"))
+            except (OSError, PromotionFeedbackError):
+                pass
+        for raw in candidates:
+            if not isinstance(raw, str):
+                continue
+            path = Path(raw)
+            if (
+                path.is_absolute()
+                and path == Path(os.path.abspath(str(path)))
+            ):
+                return path
+        return None
+
+    def _runtime_adaptive_paths(self) -> Dict[str, Path]:
+        if self.runtime_config is None:
+            raise PromotionFeedbackError(
+                "full-autonomy adaptive observation requires a runtime config"
+            )
+        runtime = load_canonical_json(
+            self.runtime_config, "promotion runtime config"
+        )
+        paths = runtime.get("paths")
+        if not isinstance(paths, Mapping):
+            raise PromotionFeedbackError(
+                "promotion runtime config has no paths object"
+            )
+
+        def runtime_path(name: str, role: str) -> Path:
+            raw = paths.get(name)
+            if not isinstance(raw, str):
+                raise PromotionFeedbackError(
+                    f"promotion runtime config has no {name} path"
+                )
+            path = Path(raw)
+            if (
+                not path.is_absolute()
+                or path != Path(os.path.abspath(str(path)))
+            ):
+                raise PromotionFeedbackError(
+                    f"{role} path must be normalized and absolute"
+                )
+            for component in (path, *path.parents):
+                if component.exists() and component.is_symlink():
+                    raise PromotionFeedbackError(
+                        f"{role} path contains a symlink: {component}"
+                    )
+            return path
+
+        champion = runtime_path("champion", "champion projection")
+        if champion != self.promotion_root / "champion.json":
+            raise PromotionFeedbackError(
+                "runtime champion path is not the canonical champion projection"
+            )
+        return {
+            "champion": champion,
+            "trainer_checkpoint": runtime_path(
+                "trainerCheckpoint", "trainer checkpoint"
+            ),
+            "candidate_inbox": runtime_path(
+                "candidateInbox", "candidate inbox"
+            ),
+        }
+
+    def _candidate_inbox_depth(self, inbox: Path) -> int:
+        root = _absolute_directory(Path(inbox), "candidate inbox")
+        count = 0
+        with os.scandir(root) as scan:
+            entries = sorted(scan, key=lambda item: item.name)
+        for entry in entries:
+            if entry.name.startswith(".") or entry.name.endswith(
+                (".tmp", ".partial", ".exported")
+            ):
+                continue
+            if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                raise PromotionFeedbackError(
+                    f"unexpected non-directory candidate inbox entry: {entry.path}"
+                )
+            count += 1
+        return count
+
+    def _trainer_receipt_rows(self) -> List[Dict[str, Any]]:
+        directory_kinds = {
+            "consumption": {"consumption"},
+            "checkpoints": {"checkpoint", "longterm-checkpoint"},
+            "exports": {"export"},
+        }
+        rows: List[Dict[str, Any]] = []
+        manifest_cache: Dict[str, tuple[Dict[str, Any], Dict[str, Any]]] = {}
+        for directory_name, expected_kinds in directory_kinds.items():
+            root = self.trainer_root / directory_name
+            if not root.exists():
+                continue
+            if root.is_symlink() or not root.is_dir():
+                raise PromotionFeedbackError(
+                    f"trainer receipt root is unsafe: {root}"
+                )
+            for path in sorted(root.glob("*.json")):
+                metadata = path.lstat()
+                if (
+                    stat.S_ISLNK(metadata.st_mode)
+                    or not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_mode & 0o222
+                ):
+                    raise PromotionFeedbackError(
+                        f"trainer receipt is not immutable: {path}"
+                    )
+                receipt_binding_before = _stable_file_binding(
+                    path, "trainer provenance receipt"
+                )
+                value = _validate_receipt(
+                    load_canonical_json(path, "trainer provenance receipt"),
+                    contract=TRAINER_RECEIPT_CONTRACT,
+                    role="trainer provenance receipt",
+                )
+                receipt_binding_after = _stable_file_binding(
+                    path, "trainer provenance receipt"
+                )
+                if receipt_binding_before != receipt_binding_after:
+                    raise PromotionFeedbackError(
+                        f"trainer receipt changed while loading: {path}"
+                    )
+                kind = value.get("kind")
+                if kind not in expected_kinds:
+                    raise PromotionFeedbackError(
+                        f"trainer receipt kind is misplaced: {path}"
+                    )
+                sample_count = (
+                    value.get("samples_after")
+                    if kind == "consumption"
+                    else value.get("sample_count")
+                )
+                if type(sample_count) is not int or sample_count < 0:
+                    raise PromotionFeedbackError(
+                        f"trainer receipt sample watermark is invalid: {path}"
+                    )
+                manifest_path = Path(
+                    value.get("shuffle_manifest_path", "")
+                )
+                if not manifest_path.is_absolute():
+                    raise PromotionFeedbackError(
+                        f"trainer receipt shuffle path is invalid: {path}"
+                    )
+                cache_key = str(manifest_path)
+                cached = manifest_cache.get(cache_key)
+                if cached is None:
+                    manifest_binding = _stable_file_binding(
+                        manifest_path, "trainer-bound shuffle manifest"
+                    )
+                    manifest = load_shuffle_manifest(
+                        manifest_path, verify_output=True
+                    )
+                    final_manifest_binding = _stable_file_binding(
+                        manifest_path, "trainer-bound shuffle manifest"
+                    )
+                    if manifest_binding != final_manifest_binding:
+                        raise PromotionFeedbackError(
+                            "trainer-bound shuffle manifest changed while loading"
+                        )
+                    cached = (manifest, manifest_binding)
+                    manifest_cache[cache_key] = cached
+                manifest, manifest_binding = cached
+                if (
+                    value.get("shuffle_manifest_file_sha256")
+                    != manifest_binding["sha256"]
+                    or value.get("shuffle_manifest_receipt_sha256")
+                    != manifest.get("receipt_sha256")
+                    or value.get("generation_ids")
+                    != manifest.get("generation_ids")
+                    or value.get("candidate_hashes")
+                    != manifest.get("candidate_hashes")
+                ):
+                    raise PromotionFeedbackError(
+                        f"trainer receipt shuffle binding is invalid: {path}"
+                    )
+                if kind == "consumption":
+                    before = value.get("samples_before")
+                    selected = value.get("selected_files")
+                    if (
+                        type(before) is not int
+                        or before < 0
+                        or before >= sample_count
+                        or not isinstance(selected, list)
+                        or not selected
+                        or value.get("selected_files_sha256")
+                        != canonical_sha256(selected)
+                    ):
+                        raise PromotionFeedbackError(
+                            f"trainer consumption receipt is invalid: {path}"
+                        )
+                    expected_output = {
+                        item["path"]: item
+                        for item in manifest["output_inventory"]
+                    }
+                    selected_paths = set()
+                    for item in selected:
+                        if not isinstance(item, dict):
+                            raise PromotionFeedbackError(
+                                f"trainer selected-file binding is invalid: {path}"
+                            )
+                        selected_path = item.get("path")
+                        if (
+                            not isinstance(selected_path, str)
+                            or selected_path in selected_paths
+                            or expected_output.get(selected_path) != item
+                        ):
+                            raise PromotionFeedbackError(
+                                f"trainer selected-file binding changed: {path}"
+                            )
+                        selected_paths.add(selected_path)
+                else:
+                    lineage = value.get("consumption_lineage")
+                    if (
+                        not isinstance(lineage, list)
+                        or value.get("consumption_lineage_sha256")
+                        != canonical_sha256(lineage)
+                    ):
+                        raise PromotionFeedbackError(
+                            f"trainer receipt consumption lineage is invalid: {path}"
+                        )
+                rows.append(
+                    {
+                        "path": path,
+                        "file_sha256": receipt_binding_before["sha256"],
+                        "value": value,
+                        "kind": kind,
+                        "sample_count": sample_count,
+                        "manifest": manifest,
+                        "manifest_binding": manifest_binding,
+                    }
+                )
+        by_path = {str(item["path"]): item for item in rows}
+        for row in rows:
+            if row["kind"] == "consumption":
+                continue
+            value = row["value"]
+            lineage = value["consumption_lineage"]
+            for binding in lineage:
+                if not isinstance(binding, Mapping):
+                    raise PromotionFeedbackError(
+                        f"trainer consumption lineage row is invalid: {row['path']}"
+                    )
+                consumption = by_path.get(str(binding.get("path")))
+                if (
+                    consumption is None
+                    or consumption["kind"] != "consumption"
+                    or consumption["value"].get("receipt_sha256")
+                    != binding.get("receipt_sha256")
+                    or consumption["value"].get("samples_before")
+                    != binding.get("samples_before")
+                    or consumption["value"].get("samples_after")
+                    != binding.get("samples_after")
+                    or consumption["value"].get(
+                        "shuffle_manifest_file_sha256"
+                    )
+                    != binding.get("shuffle_manifest_file_sha256")
+                ):
+                    raise PromotionFeedbackError(
+                        f"trainer consumption lineage binding changed: {row['path']}"
+                    )
+            receipt_path = value.get("consumption_receipt_path")
+            receipt_hash = value.get("consumption_receipt_sha256")
+            if (receipt_path is None) != (receipt_hash is None):
+                raise PromotionFeedbackError(
+                    f"trainer latest-consumption binding is incomplete: {row['path']}"
+                )
+            if receipt_path is not None:
+                consumption = by_path.get(str(receipt_path))
+                if (
+                    consumption is None
+                    or consumption["kind"] != "consumption"
+                    or consumption["value"].get("receipt_sha256")
+                    != receipt_hash
+                    or consumption["sample_count"] > row["sample_count"]
+                ):
+                    raise PromotionFeedbackError(
+                        f"trainer latest-consumption binding changed: {row['path']}"
+                    )
+        return rows
+
+    def _latest_trainer_receipt(
+        self, trainer_checkpoint: Path
+    ) -> Dict[str, Any]:
+        rows = self._trainer_receipt_rows()
+        if not rows:
+            raise PromotionFeedbackError(
+                "adaptive observation has no immutable trainer provenance receipt"
+            )
+        precedence = {
+            "consumption": 0,
+            "export": 1,
+            "longterm-checkpoint": 2,
+            "checkpoint": 3,
+        }
+        selected = max(
+            rows,
+            key=lambda item: (
+                item["sample_count"],
+                precedence[item["kind"]],
+                str(item["path"]),
+            ),
+        )
+        if selected["manifest"].get("strict") is not True:
+            raise PromotionFeedbackError(
+                "latest trainer receipt is not bound to strict shuffle provenance"
+            )
+        admitted_samples = selected["sample_count"]
+        checkpoint_binding = _stable_file_binding(
+            trainer_checkpoint, "current trainer checkpoint"
+        )
+        checkpoints = [
+            item
+            for item in rows
+            if item["kind"] in {"checkpoint", "longterm-checkpoint"}
+            and item["sample_count"] == admitted_samples
+        ]
+        if checkpoints:
+            identities = {
+                canonical_json(item["value"].get("artifact"))
+                for item in checkpoints
+            }
+            if len(identities) != 1:
+                raise PromotionFeedbackError(
+                    "trainer checkpoint receipts disagree at the admitted watermark"
+                )
+            artifact = checkpoints[-1]["value"].get("artifact")
+            if not isinstance(artifact, Mapping):
+                raise PromotionFeedbackError(
+                    "trainer checkpoint receipt artifact is malformed"
+                )
+            if (
+                artifact.get("path") != str(trainer_checkpoint)
+                or artifact.get("sha256") != checkpoint_binding["sha256"]
+                or artifact.get("size") != checkpoint_binding["size"]
+            ):
+                raise PromotionFeedbackError(
+                    "current trainer checkpoint contradicts its immutable receipt"
+                )
+        elif selected["kind"] == "checkpoint":
+            raise PromotionFeedbackError(
+                "latest trainer checkpoint receipt cannot be resolved"
+            )
+        if selected["kind"] == "export":
+            artifact = selected["value"].get("artifact")
+            if (
+                not isinstance(artifact, Mapping)
+                or not isinstance(artifact.get("inventory"), list)
+                or artifact.get("inventory_sha256")
+                != canonical_sha256(artifact["inventory"])
+            ):
+                raise PromotionFeedbackError(
+                    "latest trainer export receipt artifact is malformed"
+                )
+            export_path = Path(artifact.get("path", ""))
+            current = tree_inventory(
+                export_path, known_inventory=artifact["inventory"]
+            )
+            if current != artifact["inventory"]:
+                raise PromotionFeedbackError(
+                    "latest trainer export artifact changed"
+                )
+        return {
+            "admitted_samples": admitted_samples,
+            "path": str(selected["path"]),
+            "file_sha256": selected["file_sha256"],
+            "receipt_sha256": selected["value"]["receipt_sha256"],
+            "kind": selected["kind"],
+            "shuffle_manifest_file_sha256": selected["value"][
+                "shuffle_manifest_file_sha256"
+            ],
+            "checkpoint_sha256": checkpoint_binding["sha256"],
+            "checkpoint_size": checkpoint_binding["size"],
+        }
+
+    def _latest_strict_shuffle_manifest(
+        self, shuffle_watermark: Mapping[str, Any]
+    ) -> tuple[Path, Dict[str, Any], Dict[str, Any]]:
+        candidates = []
+        rows = shuffle_watermark.get("manifests")
+        if not isinstance(rows, list):
+            raise PromotionFeedbackError(
+                "shuffle watermark manifest inventory is malformed"
+            )
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise PromotionFeedbackError(
+                    "shuffle watermark manifest row is malformed"
+                )
+            path = Path(row.get("manifest_path", ""))
+            if not path.is_absolute():
+                raise PromotionFeedbackError(
+                    "shuffle watermark manifest path is invalid"
+                )
+            binding = _stable_file_binding(
+                path, "adaptive admitted-data shuffle manifest"
+            )
+            manifest = load_shuffle_manifest(
+                path, verify_output=True, verify_sources=True
+            )
+            final_binding = _stable_file_binding(
+                path, "adaptive admitted-data shuffle manifest"
+            )
+            if binding != final_binding:
+                raise PromotionFeedbackError(
+                    "adaptive admitted-data shuffle manifest changed while loading"
+                )
+            if (
+                row.get("manifest_file_sha256") != binding["sha256"]
+                or row.get("manifest_receipt_sha256")
+                != manifest.get("receipt_sha256")
+            ):
+                raise PromotionFeedbackError(
+                    "shuffle watermark contradicts its manifest binding"
+                )
+            if manifest.get("strict") is True:
+                candidates.append((path, manifest, binding))
+        if not candidates:
+            raise PromotionFeedbackError(
+                "adaptive observation has no strict shuffle provenance manifest"
+            )
+        selected = max(
+            candidates,
+            key=lambda item: (
+                str(item[1].get("created_at_utc", "")),
+                str(item[0]),
+            ),
+        )
+        if (
+            selected[1].get("unbound_source_count") != 0
+            or not selected[1].get("source_inventory")
+        ):
+            raise PromotionFeedbackError(
+                "latest strict shuffle has incomplete source provenance"
+            )
+        return selected
+
+    def _shuffle_source_provenance(
+        self, manifest: Mapping[str, Any]
+    ) -> List[Dict[str, Any]]:
+        source_root = Path(manifest.get("source_root", ""))
+        bindings: Dict[str, Dict[str, Any]] = {}
+        for row in manifest.get("source_inventory", []):
+            if not isinstance(row, Mapping):
+                raise PromotionFeedbackError(
+                    "strict shuffle source inventory row is malformed"
+                )
+            status = row.get("lineage_status")
+            if status == "historical-baseline":
+                if any(
+                    row.get(field) is not None
+                    for field in (
+                        "generation_id",
+                        "candidate_hash",
+                        "data_receipt_path",
+                        "data_receipt_sha256",
+                    )
+                ):
+                    raise PromotionFeedbackError(
+                        "historical shuffle source has ambiguous provenance"
+                    )
+                continue
+            if status != "admitted":
+                raise PromotionFeedbackError(
+                    "strict shuffle source provenance is incomplete"
+                )
+            receipt_path = Path(row.get("data_receipt_path", ""))
+            if not receipt_path.is_absolute():
+                raise PromotionFeedbackError(
+                    "shuffle source data receipt path is invalid"
+                )
+            receipt_metadata = receipt_path.lstat()
+            if (
+                stat.S_ISLNK(receipt_metadata.st_mode)
+                or not stat.S_ISREG(receipt_metadata.st_mode)
+                or receipt_metadata.st_mode & 0o222
+            ):
+                raise PromotionFeedbackError(
+                    f"shuffle source data receipt is not immutable: {receipt_path}"
+                )
+            file_binding_before = _stable_file_binding(
+                receipt_path, "shuffle source data receipt"
+            )
+            receipt = _validate_receipt(
+                load_canonical_json(
+                    receipt_path, "shuffle source data receipt"
+                ),
+                contract=DATA_RECEIPT_CONTRACT,
+                role="shuffle source data receipt",
+            )
+            file_binding_after = _stable_file_binding(
+                receipt_path, "shuffle source data receipt"
+            )
+            if file_binding_before != file_binding_after:
+                raise PromotionFeedbackError(
+                    "shuffle source data receipt changed while loading"
+                )
+            if (
+                receipt.get("receipt_sha256")
+                != row.get("data_receipt_sha256")
+                or receipt.get("generation_id") != row.get("generation_id")
+                or receipt.get("candidate_hash") != row.get("candidate_hash")
+            ):
+                raise PromotionFeedbackError(
+                    "shuffle source data receipt binding changed"
+                )
+            roots = receipt.get("roots")
+            if (
+                not isinstance(roots, list)
+                or receipt.get("source_inventory_sha256")
+                != canonical_sha256(roots)
+            ):
+                raise PromotionFeedbackError(
+                    "shuffle source data receipt inventory is malformed"
+                )
+            source_path = source_root / str(row.get("path", ""))
+            matched = False
+            for root in roots:
+                if not isinstance(root, Mapping):
+                    raise PromotionFeedbackError(
+                        "shuffle source data receipt root is malformed"
+                    )
+                inventory = root.get("inventory")
+                if (
+                    not isinstance(inventory, list)
+                    or root.get("inventory_sha256")
+                    != canonical_sha256(inventory)
+                ):
+                    raise PromotionFeedbackError(
+                        "shuffle source data receipt root hash is invalid"
+                    )
+                root_path = Path(root.get("path", ""))
+                for item in inventory:
+                    if (
+                        isinstance(item, Mapping)
+                        and root_path / str(item.get("path", ""))
+                        == source_path
+                        and item.get("sha256") == row.get("sha256")
+                        and item.get("size") == row.get("size")
+                    ):
+                        matched = True
+            if not matched:
+                raise PromotionFeedbackError(
+                    "shuffle source is absent from its data receipt"
+                )
+            binding = {
+                "path": str(receipt_path),
+                "file_sha256": file_binding_before["sha256"],
+                "receipt_sha256": receipt["receipt_sha256"],
+                "generation_id": receipt["generation_id"],
+                "candidate_hash": receipt["candidate_hash"],
+            }
+            prior = bindings.setdefault(str(receipt_path), binding)
+            if prior != binding:
+                raise PromotionFeedbackError(
+                    "shuffle source data receipt has conflicting bindings"
+                )
+        return [bindings[key] for key in sorted(bindings)]
+
+    def _admitted_data_snapshot(
+        self, shuffle_watermark: Mapping[str, Any]
+    ) -> tuple[Path, Dict[str, Any]]:
+        manifest_path, manifest, manifest_binding = (
+            self._latest_strict_shuffle_manifest(shuffle_watermark)
+        )
+        provenance = self._shuffle_source_provenance(manifest)
+        payload = {
+            "schema_version": SCHEMA_VERSION,
+            "contract": ADAPTIVE_DATA_SNAPSHOT_CONTRACT,
+            "shuffle_manifest": {
+                "path": str(manifest_path),
+                "file_sha256": manifest_binding["sha256"],
+                "receipt_sha256": manifest["receipt_sha256"],
+                "source_inventory_sha256": manifest[
+                    "source_inventory_sha256"
+                ],
+                "output_inventory_sha256": manifest[
+                    "output_inventory_sha256"
+                ],
+            },
+            "source_root": manifest["source_root"],
+            "source_inventory": manifest["source_inventory"],
+            "source_inventory_sha256": manifest[
+                "source_inventory_sha256"
+            ],
+            "generation_ids": manifest["generation_ids"],
+            "candidate_hashes": manifest["candidate_hashes"],
+            "provenance_receipts": provenance,
+            "provenance_receipts_sha256": canonical_sha256(provenance),
+        }
+        value = dict(payload)
+        value["snapshot_sha256"] = canonical_sha256(payload)
+        snapshot_root = _absolute_directory(
+            self._adaptive_parents_root / "admitted-data",
+            "adaptive admitted-data snapshot root",
+            create=True,
+        )
+        destination = (
+            snapshot_root / f"{value['snapshot_sha256']}.json"
+        )
+        atomic_create_json(destination, value)
+        destination_metadata = destination.lstat()
+        if (
+            stat.S_ISLNK(destination_metadata.st_mode)
+            or not stat.S_ISREG(destination_metadata.st_mode)
+            or destination_metadata.st_mode & 0o222
+        ):
+            raise PromotionFeedbackError(
+                "adaptive admitted-data snapshot is not immutable"
+            )
+        existing = load_canonical_json(
+            destination, "adaptive admitted-data snapshot"
+        )
+        if existing != value:
+            raise PromotionFeedbackError(
+                "adaptive admitted-data snapshot conflicts"
+            )
+        return destination, value
+
+    def _load_prior_adaptive_observation(
+        self, observation_path: Path
+    ) -> Optional[Dict[str, Any]]:
+        if not observation_path.exists() and not observation_path.is_symlink():
+            return None
+        binding_before = _stable_file_binding(
+            observation_path, "prior adaptive observation"
+        )
+        observation = load_adaptive_observation(
+            observation_path, expected_path=observation_path
+        )
+        binding_after = _stable_file_binding(
+            observation_path, "prior adaptive observation"
+        )
+        if binding_before != binding_after:
+            raise PromotionFeedbackError(
+                "prior adaptive observation changed while loading"
+            )
+        return observation
+
+    def _champion_baseline(
+        self,
+        *,
+        champion_path: Path,
+        admitted_samples: int,
+        trainer_receipt: Mapping[str, Any],
+        service_summary: Mapping[str, Any],
+        prior_observation: Optional[Mapping[str, Any]],
+    ) -> tuple[Any, Dict[str, Any], Path]:
+        champion_binding_before = _stable_file_binding(
+            champion_path, "canonical champion projection"
+        )
+        champion = load_champion(champion_path)
+        champion_binding_after = _stable_file_binding(
+            champion_path, "canonical champion projection"
+        )
+        if champion_binding_before != champion_binding_after:
+            raise PromotionFeedbackError(
+                "canonical champion projection changed while loading"
+            )
+        baseline_root = _absolute_directory(
+            self._adaptive_parents_root / "baselines",
+            "adaptive champion baseline root",
+            create=True,
+        )
+        destination = (
+            baseline_root / f"{champion.record_hash}.json"
+        )
+        if destination.exists() or destination.is_symlink():
+            baseline_metadata = destination.lstat()
+            if (
+                stat.S_ISLNK(baseline_metadata.st_mode)
+                or not stat.S_ISREG(baseline_metadata.st_mode)
+                or baseline_metadata.st_mode & 0o222
+            ):
+                raise PromotionFeedbackError(
+                    "adaptive champion baseline receipt is not immutable"
+                )
+            baseline_binding_before = _stable_file_binding(
+                destination, "adaptive champion baseline receipt"
+            )
+            baseline = _validate_receipt(
+                load_canonical_json(
+                    destination, "adaptive champion baseline receipt"
+                ),
+                contract=ADAPTIVE_BASELINE_CONTRACT,
+                role="adaptive champion baseline receipt",
+                hash_field="baseline_sha256",
+            )
+            baseline_binding_after = _stable_file_binding(
+                destination, "adaptive champion baseline receipt"
+            )
+            if baseline_binding_before != baseline_binding_after:
+                raise PromotionFeedbackError(
+                    "adaptive champion baseline changed while loading"
+                )
+            if (
+                baseline.get("champion_record_hash")
+                != champion.record_hash
+                or baseline.get("champion_model_sha256")
+                != champion.champion_hash
+                or baseline.get("generation_id") != champion.generation_id
+                or baseline.get("champion_projection_sha256")
+                != champion_binding_before["sha256"]
+            ):
+                raise PromotionFeedbackError(
+                    "adaptive champion baseline contradicts champion.json"
+                )
+            baseline_samples = baseline.get(
+                "last_promotion_admitted_samples"
+            )
+            if (
+                type(baseline_samples) is not int
+                or baseline_samples < 0
+                or baseline_samples > admitted_samples
+            ):
+                raise PromotionFeedbackError(
+                    "adaptive champion baseline would rewind admitted samples"
+                )
+            captured = baseline.get("captured_trainer_receipt")
+            if not isinstance(captured, Mapping):
+                raise PromotionFeedbackError(
+                    "adaptive champion baseline trainer binding is malformed"
+                )
+            captured_path = Path(captured.get("path", ""))
+            captured_metadata = captured_path.lstat()
+            if (
+                stat.S_ISLNK(captured_metadata.st_mode)
+                or not stat.S_ISREG(captured_metadata.st_mode)
+                or captured_metadata.st_mode & 0o222
+            ):
+                raise PromotionFeedbackError(
+                    "baseline-bound trainer receipt is not immutable"
+                )
+            captured_binding = _stable_file_binding(
+                captured_path, "baseline-bound trainer receipt"
+            )
+            captured_value = _validate_receipt(
+                load_canonical_json(
+                    captured_path, "baseline-bound trainer receipt"
+                ),
+                contract=TRAINER_RECEIPT_CONTRACT,
+                role="baseline-bound trainer receipt",
+            )
+            if (
+                captured_binding["sha256"]
+                != captured.get("file_sha256")
+                or captured_value.get("receipt_sha256")
+                != captured.get("receipt_sha256")
+            ):
+                raise PromotionFeedbackError(
+                    "adaptive champion baseline trainer binding changed"
+                )
+            return champion, baseline, destination
+
+        baseline_samples = admitted_samples
+        if (
+            prior_observation is not None
+            and prior_observation.get("current_champion_model_sha256")
+            == champion.champion_hash
+        ):
+            baseline_samples = prior_observation[
+                "last_promotion_admitted_samples"
+            ]
+        payload = {
+            "schema_version": SCHEMA_VERSION,
+            "contract": ADAPTIVE_BASELINE_CONTRACT,
+            "champion_projection_path": str(champion_path),
+            "champion_projection_sha256": champion_binding_before["sha256"],
+            "champion_record_hash": champion.record_hash,
+            "champion_model_sha256": champion.champion_hash,
+            "generation_id": champion.generation_id,
+            "previous_champion_model_sha256": (
+                champion.previous_champion_hash
+            ),
+            "champion_activated_at_utc": champion.activated_at_utc,
+            "last_promotion_admitted_samples": baseline_samples,
+            "captured_trainer_receipt": dict(trainer_receipt),
+            "adaptive_service_spec_sha256": service_summary[
+                "adaptive_service_spec_sha256"
+            ],
+            "adaptive_service_spec_file_sha256": service_summary[
+                "adaptive_service_spec_file_sha256"
+            ],
+        }
+        baseline = _finalize_receipt(
+            payload, hash_field="baseline_sha256"
+        )
+        atomic_create_json(destination, baseline)
+        return champion, baseline, destination
+
+    def _produce_adaptive_observation(
+        self,
+        *,
+        spec: Any,
+        service_summary: Mapping[str, Any],
+        shuffle_watermark: Mapping[str, Any],
+        observed_at_unix: float,
+    ) -> Dict[str, Any]:
+        runtime_paths = self._runtime_adaptive_paths()
+        prior = self._load_prior_adaptive_observation(
+            spec.observation_path
+        )
+        trainer = self._latest_trainer_receipt(
+            runtime_paths["trainer_checkpoint"]
+        )
+        admitted_samples = trainer["admitted_samples"]
+        if (
+            prior is not None
+            and prior["admitted_samples"] > admitted_samples
+        ):
+            raise PromotionFeedbackError(
+                "adaptive admitted-sample watermark would rewind"
+            )
+        admitted_snapshot_path, admitted_snapshot = (
+            self._admitted_data_snapshot(shuffle_watermark)
+        )
+        champion, baseline, baseline_path = self._champion_baseline(
+            champion_path=runtime_paths["champion"],
+            admitted_samples=admitted_samples,
+            trainer_receipt={
+                "path": trainer["path"],
+                "file_sha256": trainer["file_sha256"],
+                "receipt_sha256": trainer["receipt_sha256"],
+                "kind": trainer["kind"],
+                "sample_count": admitted_samples,
+            },
+            service_summary=service_summary,
+            prior_observation=prior,
+        )
+        last_promotion = baseline["last_promotion_admitted_samples"]
+        if (
+            prior is not None
+            and prior["current_champion_model_sha256"]
+            == champion.champion_hash
+            and prior["last_promotion_admitted_samples"]
+            != last_promotion
+        ):
+            raise PromotionFeedbackError(
+                "adaptive champion baseline changed without promotion"
+            )
+        queue_depth = self._candidate_inbox_depth(
+            runtime_paths["candidate_inbox"]
+        )
+        adaptive_status_path = spec.root / "status.json"
+        adaptive_status: Optional[Mapping[str, Any]] = None
+        if adaptive_status_path.is_file() and not adaptive_status_path.is_symlink():
+            candidate_status = load_canonical_json(
+                adaptive_status_path, "adaptive training status"
+            )
+            status_body = dict(candidate_status)
+            status_hash = status_body.pop("status_sha256", None)
+            if (
+                candidate_status.get("contract")
+                != "risk-score-adaptive-training-status-v1"
+                or status_hash != canonical_sha256(status_body)
+            ):
+                raise PromotionFeedbackError(
+                    "adaptive training status self-hash is invalid"
+                )
+            adaptive_status = candidate_status
+        last_epoch_samples = (
+            adaptive_status.get("last_epoch_admitted_samples")
+            if adaptive_status is not None
+            else None
+        )
+        if last_epoch_samples is not None and (
+            type(last_epoch_samples) is not int
+            or last_epoch_samples < 0
+            or last_epoch_samples > admitted_samples
+        ):
+            raise PromotionFeedbackError(
+                "adaptive trial sample watermark is invalid"
+            )
+        trigger_baseline = max(
+            last_promotion,
+            last_epoch_samples
+            if type(last_epoch_samples) is int
+            else last_promotion,
+        )
+        policy = load_adaptive_policy(spec.autonomy_policy_path)
+        required_samples = policy["trigger"][
+            "minimum_admitted_samples_without_promotion"
+        ]
+        maximum_queue = policy["queue"]["maximum_candidate_queue_depth"]
+        active_epoch = (
+            adaptive_status.get("active_epoch_id")
+            if adaptive_status is not None
+            else None
+        )
+        prior_matches_champion = bool(
+            prior is not None
+            and prior.get("current_champion_model_sha256")
+            == champion.champion_hash
+        )
+        prior_already_due = bool(
+            prior_matches_champion
+            and prior is not None
+            and prior.get("admitted_samples", 0) - trigger_baseline
+            >= required_samples
+            and prior.get("candidate_queue_depth", maximum_queue + 1)
+            <= maximum_queue
+        )
+        snapshot_due = (
+            active_epoch is None
+            and admitted_samples - trigger_baseline >= required_samples
+            and queue_depth <= maximum_queue
+            and not prior_already_due
+        )
+        checkpoint_snapshot: Optional[Path] = None
+        if prior_matches_champion and not snapshot_due:
+            prior_checkpoint = prior.get("champion_checkpoint")
+            if isinstance(prior_checkpoint, Mapping):
+                raw_path = prior_checkpoint.get("path")
+                raw_hash = prior_checkpoint.get("sha256")
+                if (
+                    isinstance(raw_path, str)
+                    and isinstance(raw_hash, str)
+                ):
+                    candidate_snapshot = Path(raw_path)
+                    binding = _stable_file_binding(
+                        candidate_snapshot,
+                        "retained adaptive checkpoint snapshot",
+                    )
+                    if (
+                        binding["sha256"] == raw_hash
+                    ):
+                        checkpoint_snapshot = candidate_snapshot
+        if checkpoint_snapshot is None:
+            checkpoint_snapshot = _immutable_checkpoint_snapshot(
+                runtime_paths["trainer_checkpoint"],
+                self._adaptive_parents_root / "checkpoints",
+            )
+            checkpoint_snapshot_binding = _stable_file_binding(
+                checkpoint_snapshot, "immutable checkpoint snapshot"
+            )
+            if (
+                checkpoint_snapshot_binding["sha256"]
+                != trainer["checkpoint_sha256"]
+                or checkpoint_snapshot_binding["size"]
+                != trainer["checkpoint_size"]
+            ):
+                raise PromotionFeedbackError(
+                    "trainer checkpoint changed between provenance validation "
+                    "and snapshot creation"
+                )
+        final_champion_binding = _stable_file_binding(
+            runtime_paths["champion"], "canonical champion projection"
+        )
+        if (
+            final_champion_binding["sha256"]
+            != baseline["champion_projection_sha256"]
+        ):
+            raise PromotionFeedbackError(
+                "canonical champion projection changed before observation publication"
+            )
+        for path_field, hash_field, role in (
+            (
+                "promotion_services_path",
+                "promotion_services_sha256",
+                "promotion services specification",
+            ),
+            (
+                "adaptive_service_spec_path",
+                "adaptive_service_spec_file_sha256",
+                "adaptive service specification",
+            ),
+        ):
+            final_service_binding = _stable_file_binding(
+                Path(service_summary[path_field]), role
+            )
+            if final_service_binding["sha256"] != service_summary[hash_field]:
+                raise PromotionFeedbackError(
+                    f"{role} changed before observation publication"
+                )
+        observation = publish_adaptive_observation(
+            spec.observation_path,
+            admitted_samples=admitted_samples,
+            last_promotion_admitted_samples=last_promotion,
+            candidate_queue_depth=queue_depth,
+            current_champion_model_sha256=champion.champion_hash,
+            champion_checkpoint_path=checkpoint_snapshot,
+            admitted_data_manifest_path=admitted_snapshot_path,
+            updated_at_unix=observed_at_unix,
+        )
+        status = self._write_adaptive_producer_status(
+            state="PUBLISHED",
+            observed_at_unix=observed_at_unix,
+            service_spec=service_summary,
+            observation={
+                "path": str(spec.observation_path),
+                "observation_sha256": observation[
+                    "observation_sha256"
+                ],
+                "admitted_samples": admitted_samples,
+                "last_promotion_admitted_samples": last_promotion,
+                "current_champion_model_sha256": champion.champion_hash,
+                "checkpoint_snapshot_path": str(checkpoint_snapshot),
+                "admitted_data_snapshot_path": str(
+                    admitted_snapshot_path
+                ),
+                "admitted_data_snapshot_sha256": admitted_snapshot[
+                    "snapshot_sha256"
+                ],
+                "baseline_path": str(baseline_path),
+                "baseline_sha256": baseline["baseline_sha256"],
+                "trainer_receipt_path": trainer["path"],
+                "trainer_receipt_sha256": trainer["receipt_sha256"],
+            },
+        )
+        return {
+            "status": "PUBLISHED",
+            "status_path": str(self._adaptive_producer_status_path),
+            "observation_path": str(spec.observation_path),
+            "observation_sha256": observation["observation_sha256"],
+            "admitted_samples": admitted_samples,
+            "last_promotion_admitted_samples": last_promotion,
+            "candidate_queue_depth": queue_depth,
+            "checkpoint_snapshot_path": str(checkpoint_snapshot),
+            "admitted_data_snapshot_path": str(admitted_snapshot_path),
+            "baseline_path": str(baseline_path),
+            "producer_status_sha256": status["status_sha256"],
+        }
+
+    def _reconcile_adaptive_observation(
+        self, shuffle_watermark: Mapping[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        services_path = self._promotion_services_path()
+        if not services_path.exists() and not services_path.is_symlink():
+            return None
+        try:
+            services = load_canonical_json(
+                services_path, "promotion services specification"
+            )
+        except (OSError, PromotionFeedbackError) as exc:
+            return self._publish_blocked_adaptive_status(
+                observed_at_unix=self._now_unix(),
+                error=exc,
+            )
+        if (
+            services.get("schema_version") == 2
+            and services.get("contract") == LEGACY_SERVICE_SPEC_CONTRACT
+        ):
+            return None
+        observed_at_unix = self._now_unix()
+        spec = None
+        service_summary = None
+        try:
+            spec, service_summary = self._load_adaptive_service_binding(
+                services_path, services
+            )
+            return self._produce_adaptive_observation(
+                spec=spec,
+                service_summary=service_summary,
+                shuffle_watermark=shuffle_watermark,
+                observed_at_unix=observed_at_unix,
+            )
+        except (
+            AdaptiveTrainingError,
+            OSError,
+            PromotionFeedbackError,
+            PromotionStateError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            return self._publish_blocked_adaptive_status(
+                observed_at_unix=observed_at_unix,
+                error=exc,
+                service_spec=service_summary,
+                observation_path=(
+                    spec.observation_path
+                    if spec is not None
+                    else self._known_adaptive_observation_path()
+                ),
+            )
+
     def scan_once(self) -> Dict[str, Any]:
         lock_path = self.state_root / "watcher.lock"
         flags = os.O_CREAT | os.O_RDWR
@@ -2274,7 +3832,8 @@ class PromotionFeedbackWatcher:
                 generations, frozen=frozen
             )
             milestones = self._milestones(generations, data, shuffle)
-            return {
+            adaptive = self._reconcile_adaptive_observation(shuffle)
+            result = {
                 "status": "OK",
                 "generation_count": len(generations),
                 "data_watermark_path": str(self.data_watermark_path),
@@ -2288,6 +3847,9 @@ class PromotionFeedbackWatcher:
                 "watermarks_frozen": frozen,
                 "milestones": milestones,
             }
+            if adaptive is not None:
+                result["adaptive_observation"] = adaptive
+            return result
         finally:
             os.close(descriptor)
 

@@ -18,6 +18,7 @@ from risk_score.promotion_host import HostCommandError
 
 
 SERVICE_SPEC_CONTRACT = "risk-score-host-services-v2"
+AUTONOMY_SERVICE_SPEC_CONTRACT = "risk-score-host-services-v3"
 TARGET_UNIT = "katago-risk-training.target"
 SERVICE_UNIT_NAMES = {
     "supervisor": "katago-risk-promotion-host.service",
@@ -28,13 +29,24 @@ SERVICE_UNIT_NAMES = {
     "exporter": "katago-risk-exporter.service",
     "reconcile": "katago-risk-boot-reconcile.service",
 }
+AUTONOMY_SERVICE_UNIT_NAMES = {
+    "executor": "katago-risk-cluster-executor.service",
+    "adaptive": "katago-risk-adaptive-training.service",
+    "suite_rotation": "katago-risk-suite-rotation.service",
+}
+FULL_SERVICE_UNIT_NAMES = {
+    **SERVICE_UNIT_NAMES,
+    **AUTONOMY_SERVICE_UNIT_NAMES,
+}
 EXPECTED_SERVICE_UNITS = frozenset(SERVICE_UNIT_NAMES.values())
+FULL_EXPECTED_SERVICE_UNITS = frozenset(FULL_SERVICE_UNIT_NAMES.values())
 REQUIRED_SERVICE_KEYS = frozenset({"supervisor", "controller", "feedback"})
 SHADOW_SERVICE_KEYS = frozenset(
     {"supervisor", "controller", "feedback", "shuffler", "exporter"}
 )
 AUTOMATIC_SERVICE_KEYS = frozenset(SERVICE_UNIT_NAMES)
-OWNED_SERVICE_UNITS = frozenset(SERVICE_UNIT_NAMES.values())
+FULL_AUTOMATIC_SERVICE_KEYS = frozenset(FULL_SERVICE_UNIT_NAMES)
+OWNED_SERVICE_UNITS = FULL_EXPECTED_SERVICE_UNITS
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 
 
@@ -57,8 +69,74 @@ def _load_canonical(path: Path, role: str) -> Mapping[str, Any]:
 
 def _validated_units(spec_path: Path) -> Dict[str, Mapping[str, Any]]:
     value = _load_canonical(spec_path, "service specification")
-    if value.get("contract") != SERVICE_SPEC_CONTRACT:
+    contract = value.get("contract")
+    if contract not in {
+        SERVICE_SPEC_CONTRACT,
+        AUTONOMY_SERVICE_SPEC_CONTRACT,
+    }:
         raise HostCommandError("service specification contract is unsupported")
+    schema_version = value.get("schema_version")
+    if (
+        contract == SERVICE_SPEC_CONTRACT
+        and schema_version != 2
+    ) or (
+        contract == AUTONOMY_SERVICE_SPEC_CONTRACT
+        and schema_version != 3
+    ):
+        raise HostCommandError("service specification schema is unsupported")
+    if (
+        contract == AUTONOMY_SERVICE_SPEC_CONTRACT
+        and value.get("full_autonomy") is not True
+    ):
+        raise HostCommandError("autonomy service specification is not fully enabled")
+    if (
+        contract == SERVICE_SPEC_CONTRACT
+        and value.get("full_autonomy") not in {None, False}
+    ):
+        raise HostCommandError("legacy service specification claims full autonomy")
+    service_inputs = value.get("service_inputs")
+    if contract == AUTONOMY_SERVICE_SPEC_CONTRACT:
+        expected_inputs = {
+            "autonomy_policy",
+            "executor_spec",
+            "adaptive_spec",
+            "suite_registry_spec",
+        }
+        if (
+            not isinstance(service_inputs, Mapping)
+            or set(service_inputs) != expected_inputs
+        ):
+            raise HostCommandError(
+                "autonomy service specification inputs are incomplete"
+            )
+        for role, record in service_inputs.items():
+            if not isinstance(record, Mapping) or set(record) != {
+                "path",
+                "sha256",
+            }:
+                raise HostCommandError(
+                    f"autonomy service input {role} is malformed"
+                )
+            if not isinstance(record["path"], str) or not isinstance(
+                record["sha256"], str
+            ):
+                raise HostCommandError(
+                    f"autonomy service input {role} is malformed"
+                )
+            path = Path(record["path"])
+            if (
+                not path.is_absolute()
+                or path.is_symlink()
+                or not path.is_file()
+                or file_sha256(path) != record["sha256"]
+            ):
+                raise HostCommandError(
+                    f"autonomy service input {role} changed or is unsafe"
+                )
+    elif service_inputs is not None:
+        raise HostCommandError(
+            "legacy service specification may not declare autonomy inputs"
+        )
     mutation_enabled = value.get("mutation_enabled")
     if not isinstance(mutation_enabled, bool):
         raise HostCommandError("service specification mutation mode is invalid")
@@ -69,13 +147,21 @@ def _validated_units(spec_path: Path) -> Dict[str, Mapping[str, Any]]:
     ):
         raise HostCommandError("service specification service inventory is invalid")
     service_keys = set(services)
-    if mutation_enabled:
+    if contract == AUTONOMY_SERVICE_SPEC_CONTRACT:
+        valid_inventory = (
+            mutation_enabled
+            and service_keys == FULL_AUTOMATIC_SERVICE_KEYS
+        )
+        unit_names = FULL_SERVICE_UNIT_NAMES
+    elif mutation_enabled:
         valid_inventory = service_keys == AUTOMATIC_SERVICE_KEYS
+        unit_names = SERVICE_UNIT_NAMES
     else:
         valid_inventory = service_keys.issubset(SHADOW_SERVICE_KEYS)
+        unit_names = SERVICE_UNIT_NAMES
     if not valid_inventory:
         raise HostCommandError("service specification service inventory is invalid")
-    expected_names = {SERVICE_UNIT_NAMES[name] for name in services} | {TARGET_UNIT}
+    expected_names = {unit_names[name] for name in services} | {TARGET_UNIT}
     raw_units = value.get("systemd_units")
     expected_unit_keys = service_keys | {"target"}
     if not isinstance(raw_units, Mapping):
@@ -100,7 +186,7 @@ def _validated_units(spec_path: Path) -> Dict[str, Mapping[str, Any]]:
             raise HostCommandError(f"systemd unit changed or is unsafe: {path}")
         name = path.name
         expected_name = (
-            TARGET_UNIT if key == "target" else SERVICE_UNIT_NAMES.get(key)
+            TARGET_UNIT if key == "target" else unit_names.get(key)
         )
         if name in units or name != expected_name or name not in expected_names:
             raise HostCommandError(f"unexpected or duplicate systemd unit: {name}")

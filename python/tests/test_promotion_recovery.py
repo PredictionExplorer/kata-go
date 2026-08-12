@@ -9,7 +9,14 @@ from types import SimpleNamespace
 import pytest
 
 from risk_score.generate_schedule import build_schedule
+from risk_score.build_evaluation_suites import (
+    MACHINE_GENERATOR_CONTRACT,
+    MACHINE_MANIFEST_CONTRACT,
+    MACHINE_REVIEW_MANIFEST_CONTRACT,
+)
 from risk_score.promotion_controller import (
+    ADAPTIVE_PROMOTION_FAILURE_STEPS,
+    ADAPTIVE_ROLLBACK_FAILURE_STEPS,
     ConfigurationError,
     IncompleteCandidate,
     InsufficientDiskError,
@@ -26,6 +33,14 @@ from risk_score.promotion_controller import (
     parse_candidate_counters,
     select_backlog,
 )
+from risk_score.adaptive_training import (
+    POLICY_HASH as ADAPTIVE_POLICY_HASH,
+    RECIPE_CONTRACT,
+    bootstrap_recipe_binding,
+    build_candidate_handoff,
+    load_policy as load_adaptive_policy,
+    load_recipe_binding,
+)
 from risk_score.promotion_state import (
     CandidateState,
     ControllerLock,
@@ -34,8 +49,16 @@ from risk_score.promotion_state import (
     atomic_write_json,
     canonical_json_bytes,
     canonical_sha256,
+    compare_and_swap_champion,
     sha256_bytes,
     sha256_file,
+)
+from risk_score.position_samples import semantic_position_sha256
+from risk_score.suite_rotation import (
+    SuiteRotationRegistry,
+    file_sha256 as suite_file_sha256,
+    publish_continuity_manifest,
+    publish_registry_spec,
 )
 
 
@@ -569,6 +592,356 @@ def prepare_runtime(tmp_path, *, mutation_enabled=True, min_free=0, max_queue=4)
     return RuntimeConfig.from_mapping(mapping)
 
 
+def write_v2_canonical(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(canonical_json_bytes(value) + b"\n")
+
+
+def tiny_v2_registry_policy(path):
+    source = Path(__file__).parents[1] / "risk_score" / "promotion_policy_v3.json"
+    policy = json.loads(source.read_text(encoding="utf-8"))
+    stages = policy["evaluation_stages"]
+    stages["stage_1_cheap_paired_screen"]["ordinary_color_pairs"] = 1
+    stages["stage_2_finalist_selection"].update(
+        {
+            "ordinary_color_pairs": 1,
+            "lead_40_color_pairs": 1,
+            "lead_80_color_pairs": 1,
+        }
+    )
+    for look in stages["stage_3_promotion_confirmation"]["looks"]:
+        look.update(
+            {
+                "powered_ordinary_color_pairs_per_matchup": 1,
+                "standard_ordinary_color_pairs": 1,
+                "lead_40_color_pairs": 1,
+                "lead_80_color_pairs": 1,
+                "minimum_independent_position_clusters": {
+                    "powered_candidate_vs_champion": 1,
+                    "powered_candidate_vs_original": 1,
+                    "standard_candidate_vs_original": 1,
+                    "lead_40": 1,
+                    "lead_80": 1,
+                },
+            }
+        )
+    stages["deep_audit"].update(
+        {
+            "ordinary_color_pairs": 1,
+            "lead_40_color_pairs": 1,
+            "lead_80_color_pairs": 1,
+        }
+    )
+    write_v2_canonical(path, policy)
+    return policy
+
+
+def make_v2_registry_suite(root, spec, champion_sha256, *, nonce):
+    root.mkdir()
+    expected = {
+        (holdout if label == "ordinary" else f"{label}-{holdout}"): (
+            label,
+            holdout,
+        )
+        for label in ("ordinary", "lead-40", "lead-80")
+        for holdout in ("discovery", "confirmation", "audit")
+    }
+    banks = []
+    bank_rows = {}
+    for index, (qualified, (label, holdout)) in enumerate(expected.items()):
+        position = {
+            "xSize": 5,
+            "ySize": 5,
+            "board": "X..../..O../...../...X./.....",
+            "nextPla": "B",
+            "moveLocs": [],
+            "movePlas": [],
+            "initialTurnNumber": nonce * 100 + index,
+            "hintLoc": "null",
+            "metadata": "promotion-recovery-v2",
+        }
+        semantic = semantic_position_sha256(position)
+        content = canonical_sha256(position)
+        positions_path = root / "position-banks" / f"{qualified}.jsonl"
+        positions_path.parent.mkdir(parents=True, exist_ok=True)
+        positions_path.write_bytes(canonical_json_bytes(position) + b"\n")
+        schedule_rows = [
+            {
+                "color": color,
+                "positionSemanticSha256": semantic,
+                "suiteQualifiedName": qualified,
+            }
+            for color in ("B", "W")
+        ]
+        schedule_path = root / "schedules" / f"{qualified}.jsonl"
+        schedule_path.parent.mkdir(parents=True, exist_ok=True)
+        schedule_path.write_bytes(
+            b"".join(
+                canonical_json_bytes(row) + b"\n"
+                for row in schedule_rows
+            )
+        )
+        bank = {
+            "name": qualified,
+            "qualifiedName": qualified,
+            "sourceLabel": label,
+            "holdout": holdout,
+            "kind": "ordinary" if label == "ordinary" else "specialized",
+            "contentSha256s": [content],
+            "semanticSha256s": [semantic],
+            "independentClusterIds": [semantic],
+            "independentClusterIdsSha256": canonical_sha256([semantic]),
+            "positionIds": [f"position-{nonce}-{index}"],
+            "positionIdsSha256": canonical_sha256(
+                [f"position-{nonce}-{index}"]
+            ),
+            "positions": {
+                "path": positions_path.relative_to(root).as_posix(),
+                "sha256": suite_file_sha256(positions_path),
+                "rowCount": 1,
+            },
+            "schedule": {
+                "path": schedule_path.relative_to(root).as_posix(),
+                "sha256": suite_file_sha256(schedule_path),
+                "rowCount": 2,
+                "pairCount": 1,
+                "scheduleId": f"schedule-{nonce}-{index}",
+                "baseSeed": f"seed-{nonce}-{index}",
+            },
+        }
+        banks.append(bank)
+        bank_rows[qualified] = bank
+    discovery = bank_rows["discovery"]
+    cell_body = {
+        "cell_name": "powered_candidate_vs_champion",
+        "stage": "stage-1",
+        "look": "automatic",
+        "comparison": "candidate-vs-champion-powered",
+        "suite": "discovery",
+        "search_mode": "powered",
+        "visits": 400,
+        "color_pairs": 1,
+        "minimum_independent_position_clusters": 1,
+        "independent_cluster_ids": discovery["semanticSha256s"],
+        "independent_cluster_ids_hash": canonical_sha256(
+            discovery["semanticSha256s"]
+        ),
+        "position_ids": discovery["positionIds"],
+        "position_ids_hash": canonical_sha256(discovery["positionIds"]),
+        "bank_name": "discovery",
+        "bank_path": discovery["positions"]["path"],
+        "bank_hash": discovery["positions"]["sha256"],
+        "schedule_path": discovery["schedule"]["path"],
+        "schedule_hash": discovery["schedule"]["sha256"],
+        "schedule_id": discovery["schedule"]["scheduleId"],
+        "schedule_row_count": 2,
+        "maximal_look_schedule": False,
+        "policy_hash": spec.policy_identity,
+        "policy_version": "risk-seeking-checkpoint-promotion-v3",
+        "source_revision": "a51c32967fdfb246923aebf12801812504cfbd40",
+    }
+    source_hash = digest(f"reviewed-source-{nonce}")
+    manifest = {
+        "schemaVersion": 3,
+        "manifestContract": MACHINE_MANIFEST_CONTRACT,
+        "generatorContract": MACHINE_GENERATOR_CONTRACT,
+        "scheduleGeneratorContract": "risk-score-paired-schedule-v1",
+        "canonicalJsonContract": "utf-8-sort-keys-compact-json-lines-v1",
+        "ordinaryAssignmentContract": (
+            "policy-exact-seeded-semantic-hash-disjoint-holdouts-v2"
+        ),
+        "semanticPositionContract": (
+            "canonical-xSize-ySize-board-nextPla-moveLocs-movePlas-"
+            "initialTurnNumber-v1"
+        ),
+        "seed": f"suite-{nonce}",
+        "policy_hash": spec.policy_identity,
+        "policy_version": "risk-seeking-checkpoint-promotion-v3",
+        "source_revision": "a51c32967fdfb246923aebf12801812504cfbd40",
+        "exactPolicyQuotas": True,
+        "policyHoldoutQuotas": {
+            label: dict(spec.holdout_quotas[label])
+            for label in ("ordinary", "lead-40", "lead-80")
+        },
+        "ordinaryWeights": {
+            "discovery": 1.0,
+            "confirmation": 1.0,
+            "audit": 1.0,
+        },
+        "pairsPerPosition": 1,
+        "botAIndex": 0,
+        "botBIndex": 1,
+        "acceptedLabels": ["lead-40", "lead-80", "ordinary"],
+        "sources": [
+            {
+                "name": f"source-{nonce}.jsonl",
+                "sha256": source_hash,
+                "rowCount": 9,
+                "blankLineCount": 0,
+            }
+        ],
+        "inputRowCount": 9,
+        "includedRowCount": 9,
+        "assignedRowCount": 9,
+        "unassigned": [],
+        "exclusions": [],
+        "banks": banks,
+        "cells": [
+            {
+                "cell_id": "suite-cell-" + canonical_sha256(cell_body),
+                **cell_body,
+            }
+        ],
+        "discovery_schedule_hash": discovery["schedule"]["sha256"],
+        "machineReviewOnly": True,
+        "curationSources": [
+            {
+                "source_name": f"source-{nonce}.jsonl",
+                "contract": MACHINE_REVIEW_MANIFEST_CONTRACT,
+                "review_mode": "machine-consensus",
+                "consensus_rules_version": 1,
+                "policy_hash": spec.policy_identity,
+                "allowed_labels": ["lead-40", "lead-80", "ordinary"],
+                "output_sha256": source_hash,
+                "manifest_sha256": digest(f"curation-file-{nonce}"),
+                "manifest_identity": digest(f"curation-id-{nonce}"),
+                "rejected_count": 0,
+                "rejected_sha256": digest(f"rejected-{nonce}"),
+                "models": {
+                    "original": {
+                        "role": "immutable_original",
+                        "sha256": spec.original.sha256,
+                    },
+                    "champion": {
+                        "role": "frozen_champion",
+                        "sha256": champion_sha256,
+                    },
+                },
+            }
+        ],
+    }
+    manifest["manifestPayloadSha256"] = canonical_sha256(manifest)
+    manifest_path = root / "manifest.json"
+    write_v2_canonical(manifest_path, manifest)
+    return manifest_path
+
+
+def prepare_runtime_v2(tmp_path):
+    root = Path(tmp_path).resolve()
+    prepare_runtime(root)
+    policy = tiny_v2_registry_policy(root / "policy.json")
+    champion = root / "models" / "champion-0.bin.gz"
+    champion.parent.mkdir(parents=True)
+    champion.write_bytes(b"suite-registry-champion-zero")
+    spec_path = root / "suite-registry-spec.json"
+    spec = publish_registry_spec(
+        spec_path,
+        registry_root=root / "suite-registry",
+        policy_path=root / "policy.json",
+        original_model_path=root / "original.bin.gz",
+        initial_champion_path=champion,
+        initial_generation_id="generation-0",
+        created_at_utc="2026-01-01T00:00:00.000000Z",
+    )
+    source_manifest = make_v2_registry_suite(
+        root / "suite-source-0",
+        spec,
+        suite_file_sha256(champion),
+        nonce=0,
+    )
+    registry = SuiteRotationRegistry(
+        spec_path,
+        clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    registry.bootstrap(
+        source_manifest,
+        previous_champion_sha256=digest("suite-previous-champion"),
+    )
+    suite_id = registry.reconstruct().active_suite_id
+    active_suite = registry.suites_dir / suite_id
+    active_pointer = registry.active_path
+    (root / "standard-confirmation.jsonl").write_bytes(
+        (active_suite / "schedules" / "confirmation.jsonl").read_bytes()
+    )
+    mapping = runtime_mapping(root)
+    mapping["schemaVersion"] = 2
+    mapping["limits"]["maxActiveQueue"] = 3
+    mapping["paths"].update(
+        {
+            "suites": str(active_suite),
+            "policy": str(root / "policy.json"),
+            "discoveryOrdinarySchedule": str(
+                active_suite / "schedules" / "discovery.jsonl"
+            ),
+            "confirmationOrdinarySchedule": str(
+                active_suite / "schedules" / "confirmation.jsonl"
+            ),
+            "auditSchedule": str(
+                active_suite / "schedules" / "audit.jsonl"
+            ),
+            "lead40Schedule": str(
+                active_suite / "schedules" / "lead-40-confirmation.jsonl"
+            ),
+            "lead80Schedule": str(
+                active_suite / "schedules" / "lead-80-confirmation.jsonl"
+            ),
+        }
+    )
+    mapping["hashes"].update(
+        {
+            "original": sha256_file(root / "original.bin.gz"),
+            "policy": canonical_sha256(policy),
+            "poweredConfig": sha256_file(root / "powered.cfg"),
+            "standardConfig": sha256_file(root / "standard.cfg"),
+            "discoveryOrdinarySchedule": sha256_file(
+                Path(mapping["paths"]["discoveryOrdinarySchedule"])
+            ),
+            "confirmationOrdinarySchedule": sha256_file(
+                Path(mapping["paths"]["confirmationOrdinarySchedule"])
+            ),
+            "auditSchedule": sha256_file(
+                Path(mapping["paths"]["auditSchedule"])
+            ),
+            "lead40Schedule": sha256_file(
+                Path(mapping["paths"]["lead40Schedule"])
+            ),
+            "lead80Schedule": sha256_file(
+                Path(mapping["paths"]["lead80Schedule"])
+            ),
+            "standardConfirmationSchedule": sha256_file(
+                root / "standard-confirmation.jsonl"
+            ),
+            "selfplayConfig": sha256_file(root / "selfplay.cfg"),
+            "gpuLeaseConfig": sha256_file(root / "gpu-lease.json"),
+            "suiteManifest": sha256_file(active_suite / "manifest.json"),
+        }
+    )
+    pointer = json.loads(active_pointer.read_text(encoding="utf-8"))
+    mapping["autonomy"] = {
+        "suiteRegistrySpec": {
+            "path": str(spec_path),
+            "sha256": sha256_file(spec_path),
+            "identity": spec.identity,
+        },
+        "activeSuitePointer": {
+            "path": str(active_pointer),
+            "sha256": sha256_file(active_pointer),
+            "recordSha256": pointer["record_sha256"],
+            "suiteId": suite_id,
+        },
+        "adaptive": {
+            "policySha256": ADAPTIVE_POLICY_HASH,
+            "root": str(root / "promotion" / "adaptive"),
+        },
+    }
+    return (
+        RuntimeConfig.from_mapping(mapping),
+        registry,
+        suite_file_sha256(champion),
+        mapping,
+    )
+
+
 def create_candidate(inbox, name="candidate-s500000-d1000000", model=b"candidate"):
     path = Path(inbox) / name
     path.mkdir(parents=True)
@@ -631,6 +1004,34 @@ def bootstrap_and_claim(tmp_path, *, max_queue=4):
     assert state.candidates[artifact.model_hash].state == CandidateState.CLAIMED
     return runtime, controller, inspect_candidate(
         Path(state.candidates[artifact.model_hash].candidate_path)
+    )
+
+
+def bootstrap_and_claim_v2(tmp_path):
+    runtime, suite_registry, champion_hash, mapping = prepare_runtime_v2(
+        tmp_path
+    )
+    controller = PromotionController(
+        runtime,
+        automatic=True,
+        command_executor=successful_command,
+    )
+    controller.bootstrap(
+        champion_hash,
+        "generation-0",
+        confirmation="BOOTSTRAP_INITIAL_CHAMPION",
+    )
+    artifact = create_candidate(runtime.candidate_inbox)
+    controller.run_once()
+    record = controller.registry.reconstruct().candidates[
+        artifact.model_hash
+    ]
+    return (
+        runtime,
+        controller,
+        inspect_candidate(Path(record.candidate_path)),
+        suite_registry,
+        mapping,
     )
 
 
@@ -719,6 +1120,210 @@ def promotion_kwargs(runtime, report_path, report_hash):
         "data_watermark_hash": sha256_file(runtime.data_watermark_path),
         "shuffle_watermark_hash": sha256_file(runtime.shuffle_watermark_path),
     }
+
+
+def adaptive_evidence(trial_id, source, value):
+    metric = (
+        "discovery_powered_terminal_utility"
+        if source == "discovery"
+        else "fixed_validation_loss"
+    )
+    return {
+        "artifact_sha256": digest(f"{trial_id}:{source}:{value}"),
+        "finalized": True,
+        "metrics": {metric: value},
+        "round_index": 0,
+        "sample_count": 100,
+        "schema_version": 1,
+        "source": source,
+        "trial_id": trial_id,
+    }
+
+
+def write_adaptive_recipe(root, name, choice):
+    policy = load_adaptive_policy()
+    recipe = {
+        key: values[choice % len(values)]
+        for key, values in sorted(policy["allowed_recipe_knobs"].items())
+    }
+    recipe_sha = canonical_sha256(recipe)
+    path = root / "adaptive" / "recipes" / f"{name}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(
+        path,
+        {
+            "contract": RECIPE_CONTRACT,
+            "policy_hash": canonical_sha256(policy),
+            "recipe": recipe,
+            "recipe_sha256": recipe_sha,
+            "schema_version": 1,
+        },
+    )
+    return path, recipe_sha
+
+
+def configure_adaptive_gpu_lease(runtime, *, safety_halt=False, evaluators=None):
+    lease_path = runtime.promotion_root / "gpu-lease-state.json"
+    atomic_write_json(
+        runtime.gpu_lease_config_path,
+        {
+            "gpu": {
+                "expectedUuid": runtime.controller.expected_gpu_uuid,
+            },
+            "paths": {"leaseState": str(lease_path)},
+        },
+    )
+    atomic_write_json(
+        lease_path,
+        {
+            "schemaVersion": 2,
+            "leaseId": "lease-trainer-only",
+            "ownerId": "test-gpu-lease-controller",
+            "phase": "trainer_running",
+            "expectedGpuUuid": runtime.controller.expected_gpu_uuid,
+            "trainer": {
+                "pid": 100,
+                "startTimeTicks": 200,
+                "commandSha256": digest("trainer-command"),
+            },
+            "evaluators": [] if evaluators is None else evaluators,
+            "safetyHalt": safety_halt,
+        },
+    )
+    return replace(
+        runtime,
+        controller=replace(
+            runtime.controller,
+            gpu_lease_config_hash=sha256_file(
+                runtime.gpu_lease_config_path
+            ),
+        ),
+    )
+
+
+def attach_adaptive_handoff(
+    runtime,
+    controller,
+    artifact,
+    *,
+    parent_model_hash=None,
+    handoff_candidate_path=None,
+):
+    adaptive_root = runtime.promotion_root / "adaptive"
+    parent_checkpoint = adaptive_root / "parents" / "champion.ckpt"
+    parent_checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    parent_checkpoint.write_bytes(runtime.trainer_checkpoint.read_bytes())
+    admitted_manifest = adaptive_root / "parents" / "admitted.json"
+    admitted_manifest.write_bytes(b'{"manifest":"admitted-parent"}\n')
+    resumable_checkpoint = adaptive_root / "trials" / "winner.ckpt"
+    resumable_checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    resumable_checkpoint.write_bytes(b"resumable-adaptive-checkpoint")
+    old_recipe_path, old_recipe_sha = write_adaptive_recipe(
+        runtime.promotion_root,
+        "baseline",
+        0,
+    )
+    recipe_path, recipe_sha = write_adaptive_recipe(
+        runtime.promotion_root,
+        "winner",
+        1,
+    )
+
+    state = controller.registry.reconstruct()
+    current_champion = state.current_champion_hash
+    assert current_champion is not None
+    handoff_parent = parent_model_hash or current_champion
+    trial_id = "trial-promotion-winner"
+    candidate_path = (
+        artifact.path / "model.bin.gz"
+        if handoff_candidate_path is None
+        else Path(handoff_candidate_path)
+    )
+    handoff = build_candidate_handoff(
+        trial_manifest={
+            "trial_id": trial_id,
+            "epoch_id": "epoch-promotion",
+            "recipe_sha256": recipe_sha,
+            "recipe_path": str(recipe_path),
+            "parent_champion_model_sha256": handoff_parent,
+            "champion_checkpoint": {
+                "path": str(parent_checkpoint),
+                "sha256": sha256_file(parent_checkpoint),
+            },
+            "admitted_data": {
+                "path": str(admitted_manifest),
+                "sha256": sha256_file(admitted_manifest),
+            },
+        },
+        candidate={
+            "path": str(candidate_path),
+            "sha256": sha256_file(candidate_path),
+        },
+        candidate_checkpoint={
+            "path": str(resumable_checkpoint),
+            "sha256": sha256_file(resumable_checkpoint),
+        },
+        evidence=[
+            adaptive_evidence(trial_id, "discovery", 1.0),
+            adaptive_evidence(trial_id, "fixed_validation", 0.1),
+        ],
+        round_index=0,
+    )
+    handoff_path = (
+        adaptive_root
+        / "handoffs"
+        / "by-candidate"
+        / f"{artifact.model_hash}.json"
+    )
+    handoff_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(handoff_path, handoff)
+    active_recipe_path = adaptive_root / "active-recipe.json"
+    active_recipe = bootstrap_recipe_binding(
+        active_recipe_path,
+        recipe_sha256=old_recipe_sha,
+        recipe_path=str(old_recipe_path),
+        champion_model_sha256=current_champion,
+        champion_checkpoint_sha256=sha256_file(parent_checkpoint),
+        admitted_data_manifest_sha256=sha256_file(admitted_manifest),
+        data_watermark_sha256s={
+            "data": sha256_file(runtime.data_watermark_path),
+            "shuffle": sha256_file(runtime.shuffle_watermark_path),
+        },
+        generation_id=state.current_generation_id,
+        activated_at_utc="2026-08-11T12:00:00.000000Z",
+    )
+    return {
+        "active_recipe": active_recipe,
+        "active_recipe_path": active_recipe_path,
+        "handoff": handoff,
+        "handoff_path": handoff_path,
+        "parent_checkpoint": parent_checkpoint,
+        "resumable_checkpoint": resumable_checkpoint,
+    }
+
+
+def prepare_adaptive_promotion(tmp_path, **handoff_kwargs):
+    runtime, _, artifact = bootstrap_and_claim(tmp_path)
+    runtime = configure_adaptive_gpu_lease(runtime)
+    controller = PromotionController(
+        runtime,
+        automatic=True,
+        command_executor=successful_command,
+    )
+    _, report_path, report_hash = confirm_and_report(controller, artifact)
+    adaptive = attach_adaptive_handoff(
+        runtime,
+        controller,
+        artifact,
+        **handoff_kwargs,
+    )
+    return (
+        runtime,
+        controller,
+        artifact,
+        adaptive,
+        promotion_kwargs(runtime, report_path, report_hash),
+    )
 
 
 def acknowledge_worker(controller, runtime, artifact, generation_id, worker_id):
@@ -1030,6 +1635,432 @@ def test_runtime_config_is_strict_absolute_and_safe_by_default(tmp_path):
     bad["paths"]["candidateInbox"] = str(symlink / "inbox")
     with pytest.raises(ConfigurationError, match="symlink ancestor"):
         RuntimeConfig.from_mapping(bad)
+
+
+def test_runtime_schema_v1_compatibility_and_v2_autonomy_binding(tmp_path):
+    legacy = prepare_runtime(tmp_path / "legacy")
+    assert legacy.schema_version == 1
+    assert legacy.autonomy is None
+    assert PromotionController(legacy).suite_registry is None
+
+    runtime, registry, _, mapping = prepare_runtime_v2(tmp_path / "v2")
+    assert runtime.schema_version == 2
+    assert runtime.autonomy.active_suite_id == registry.reconstruct().active_suite_id
+    assert (
+        runtime.autonomy.active_suite_pointer_path
+        == registry.active_path
+    )
+    assert PromotionController(runtime).suite_registry is not None
+
+    optional = json.loads(json.dumps(mapping))
+    del optional["autonomy"]
+    assert RuntimeConfig.from_mapping(optional).autonomy is None
+
+    bad = json.loads(json.dumps(mapping))
+    bad["autonomy"]["adaptive"]["unknown"] = True
+    with pytest.raises(ConfigurationError, match="keys differ"):
+        RuntimeConfig.from_mapping(bad)
+    bad = json.loads(json.dumps(mapping))
+    bad["autonomy"]["suiteRegistrySpec"]["sha256"] = digest("wrong-spec")
+    with pytest.raises(ConfigurationError, match="file hash mismatch"):
+        RuntimeConfig.from_mapping(bad)
+    bad = json.loads(json.dumps(mapping))
+    bad["autonomy"]["activeSuitePointer"]["recordSha256"] = digest(
+        "wrong-pointer-record"
+    )
+    with pytest.raises(ConfigurationError, match="identity is invalid"):
+        RuntimeConfig.from_mapping(bad)
+    bad = json.loads(json.dumps(mapping))
+    bad["paths"]["suites"] = str(Path(mapping["paths"]["suites"]).parent)
+    with pytest.raises(
+        ConfigurationError,
+        match="diverges from frozen runtime suite",
+    ):
+        RuntimeConfig.from_mapping(bad)
+
+
+def test_v2_revalidates_pointer_and_rejects_stale_registry_champion(tmp_path):
+    runtime, registry, champion_hash, _ = prepare_runtime_v2(tmp_path)
+    controller = PromotionController(runtime, automatic=True)
+    controller.bootstrap(
+        champion_hash,
+        "generation-0",
+        confirmation="BOOTSTRAP_INITIAL_CHAMPION",
+    )
+
+    pointer_bytes = registry.active_path.read_bytes()
+    registry.active_path.write_bytes(b"{}\n")
+    with pytest.raises(SafetyHalt, match="active-suite pointer"):
+        controller.run_once()
+    registry.active_path.write_bytes(pointer_bytes)
+
+    replacement = tmp_path / "models" / "foreign-champion.bin.gz"
+    replacement.write_bytes(b"foreign-suite-registry-champion")
+    registry.record_accepted_champion(
+        replacement,
+        generation_id="generation-foreign",
+        expected_previous_champion_sha256=champion_hash,
+    )
+    with pytest.raises(SafetyHalt, match="champion is stale"):
+        PromotionController(runtime, automatic=True)
+
+
+def test_v2_suite_pin_spans_stages_rollout_audit_and_terminal_release(
+    tmp_path,
+):
+    runtime, controller, artifact, suite_registry, _ = (
+        bootstrap_and_claim_v2(tmp_path / "active")
+    )
+    controller.evaluation_executor = lambda plan, candidate: {
+        "evaluation_key": plan.evaluation_key,
+        "candidate_hash": candidate.model_hash,
+    }
+    controller.gate_evaluator = lambda evidence: {
+        "decision": "PASS",
+        "gpu_handoff_hash": evidence["gpu_handoff_hash"],
+    }
+    controller.gpu_lease_factory = gpu_handoff_factory(runtime)
+    champion_hash = controller.registry.reconstruct().current_champion_hash
+    plan = controller.build_evaluation_plan(
+        artifact.model_hash,
+        champion_hash,
+        suite="integrity",
+        stage="integrity",
+        look="automatic",
+        topology="7-workers-100-threads",
+    )
+    controller.process_evaluation_stage(
+        artifact.model_hash,
+        stage="integrity",
+        suite="integrity",
+        look="automatic",
+        topology="7-workers-100-threads",
+    )
+    evaluation_id = controller._suite_evaluation_id(artifact.model_hash)
+    pin = suite_registry.reconstruct().pins[evaluation_id]
+    assert pin["suite_id"] == runtime.autonomy.active_suite_id
+    assert pin["champion_sha256"] == champion_hash
+    with controller._writer_lock():
+        blockers = controller._clean_boundary_blockers_locked()
+    assert "evaluating-candidates" in blockers
+    assert "suite-pins" in blockers
+
+    provenance = controller._provenance(
+        plan.config_hash,
+        plan.schedule_hash,
+    )
+    for target in (
+        CandidateState.EVALUATING_SCREEN,
+        CandidateState.EVALUATING_FINALIST,
+        CandidateState.EVALUATING_CONFIRMATION,
+        CandidateState.CONFIRMED,
+    ):
+        controller.registry.transition_candidate(
+            artifact.model_hash,
+            str(artifact.path),
+            target,
+            provenance=provenance,
+            champion_hash=champion_hash,
+            evaluation_key=plan.evaluation_key,
+            reason=f"v2 pin lifecycle {target.value}",
+            actor="test-controller",
+        )
+        assert evaluation_id in suite_registry.reconstruct().pins
+    with controller._writer_lock():
+        blockers = controller._clean_boundary_blockers_locked()
+    assert "confirmed-candidates" in blockers
+
+    handoff = {
+        "lease_id": "v2-pin-lifecycle",
+        "expected_gpu_uuid": runtime.controller.expected_gpu_uuid,
+        "handoff_checkpoint_hash": sha256_file(runtime.trainer_checkpoint),
+        "clean_observations": [
+            {
+                "gpu_uuid": runtime.controller.expected_gpu_uuid,
+                "processes": [],
+            },
+            {
+                "gpu_uuid": runtime.controller.expected_gpu_uuid,
+                "processes": [],
+            },
+        ],
+        "trainer_restored": True,
+        "restored_trainer_identity": {
+            "pid": 100,
+            "start_time_ticks": 200,
+            "command_sha256": digest("trainer-command"),
+        },
+    }
+    report_path, report_hash, _ = controller.finalize_gate_report(
+        plan,
+        candidate_hash=artifact.model_hash,
+        tested_champion_hash=champion_hash,
+        gate_result={
+            "decision": "PASS",
+            "finalized": True,
+            "candidate_hash": artifact.model_hash,
+            "tested_champion_hash": champion_hash,
+            "original_hash": runtime.controller.original_hash,
+            "evaluation_key": plan.evaluation_key,
+            "config_hash": plan.config_hash,
+            "schedule_hash": plan.schedule_hash,
+            "policy_hash": plan.policy_hash,
+            "selfplay_config_hash": plan.selfplay_config_hash,
+            "topology": plan.topology,
+            "gpu_handoff_hash": canonical_sha256(handoff),
+            "gpu_handoff": handoff,
+            "checks": [],
+        },
+    )
+    generation_id = "generation-v2-pin"
+    for target in (
+        GenerationState.PROMOTION_INTENT,
+        GenerationState.CANARY,
+        GenerationState.ROLLOUT,
+    ):
+        controller.registry.transition_generation(
+            generation_id,
+            artifact.model_hash,
+            str(artifact.path),
+            target,
+            provenance=provenance,
+            tested_champion_hash=champion_hash,
+            evaluation_key=(
+                plan.evaluation_key
+                if target == GenerationState.PROMOTION_INTENT
+                else None
+            ),
+            reason=f"v2 rollout {target.value}",
+            actor="test-controller",
+        )
+        assert evaluation_id in suite_registry.reconstruct().pins
+    with controller._writer_lock():
+        blockers = controller._clean_boundary_blockers_locked()
+    assert "incomplete-promotions-or-rollbacks" in blockers
+    controller._generation_leaf(
+        generation_id,
+        artifact.path,
+        artifact.model_hash,
+    )
+    transaction = controller._transaction_dir(generation_id)
+    transaction.mkdir(parents=True)
+    compare_and_swap_champion(
+        runtime.champion_path,
+        expected_champion_hash=champion_hash,
+        candidate_hash=artifact.model_hash,
+        generation_id=generation_id,
+        pass_report_path=report_path,
+        pass_report_hash=report_hash,
+        evaluation_key=plan.evaluation_key,
+        provenance=provenance,
+        actor="test-controller",
+    )
+    controller._mark(
+        transaction,
+        "champion-cas",
+        {"champion_hash": artifact.model_hash},
+    )
+    controller.registry.transition_generation(
+        generation_id,
+        artifact.model_hash,
+        str(artifact.path),
+        GenerationState.ACTIVE,
+        provenance=provenance,
+        tested_champion_hash=champion_hash,
+        reason="v2 rollout active",
+        actor="test-controller",
+    )
+    with controller._writer_lock():
+        first = controller._record_suite_accepted_champion_locked(
+            generation_id,
+            artifact.model_hash,
+            champion_hash,
+        )
+        replay = controller._record_suite_accepted_champion_locked(
+            generation_id,
+            artifact.model_hash,
+            champion_hash,
+        )
+    assert first.event_sha256 == replay.event_sha256
+    accepted = [
+        event
+        for event in suite_registry.reconstruct().events
+        if event.event_type == "champion.accepted"
+        and event.payload["generation_id"] == generation_id
+    ]
+    assert len(accepted) == 1
+    assert evaluation_id in suite_registry.reconstruct().pins
+
+    audit_queue = (
+        runtime.promotion_root
+        / "audits"
+        / "queue"
+        / f"{generation_id}.json"
+    )
+    write_v2_canonical(audit_queue, {"pending": True})
+    with controller._writer_lock():
+        controller._mark(
+            transaction,
+            "complete",
+            {"champion_hash": artifact.model_hash},
+        )
+        controller._reconcile_suite_pins_locked()
+    assert evaluation_id in suite_registry.reconstruct().pins
+    with controller._writer_lock():
+        blockers = controller._clean_boundary_blockers_locked()
+    assert "pending-deep-audits" in blockers
+    assert "suite-pins" in blockers
+    write_v2_canonical(
+        runtime.promotion_root
+        / "audits"
+        / "reports"
+        / f"{generation_id}.json",
+        {"decision": "PASS"},
+    )
+    with controller._writer_lock():
+        controller._reconcile_suite_pins_locked()
+    assert evaluation_id not in suite_registry.reconstruct().pins
+
+    (
+        terminal_runtime,
+        terminal_controller,
+        terminal_artifact,
+        terminal_suite_registry,
+        _,
+    ) = bootstrap_and_claim_v2(tmp_path / "terminal")
+    terminal_controller.evaluation_executor = lambda plan, candidate: {
+        "evaluation_key": plan.evaluation_key
+    }
+    terminal_controller.gate_evaluator = lambda evidence: {
+        "decision": "FAIL",
+        "gpu_handoff_hash": evidence["gpu_handoff_hash"],
+    }
+    terminal_controller.gpu_lease_factory = gpu_handoff_factory(
+        terminal_runtime
+    )
+    terminal_controller.process_evaluation_stage(
+        terminal_artifact.model_hash,
+        stage="integrity",
+        suite="integrity",
+        look="automatic",
+        topology="7-workers-100-threads",
+    )
+    assert (
+        terminal_controller.registry.reconstruct()
+        .candidates[terminal_artifact.model_hash]
+        .state
+        == CandidateState.REJECTED
+    )
+    assert (
+        terminal_controller._suite_evaluation_id(
+            terminal_artifact.model_hash
+        )
+        not in terminal_suite_registry.reconstruct().pins
+    )
+
+
+def test_v2_clean_boundary_blocks_then_publishes_without_activation(tmp_path):
+    runtime, registry, champion_hash, _ = prepare_runtime_v2(tmp_path)
+    runtime = configure_adaptive_gpu_lease(runtime)
+    controller = PromotionController(
+        runtime,
+        automatic=True,
+        command_executor=successful_command,
+    )
+    controller.bootstrap(
+        champion_hash,
+        "generation-0",
+        confirmation="BOOTSTRAP_INITIAL_CHAMPION",
+    )
+    registry.clock = lambda: datetime(
+        2026,
+        5,
+        1,
+        tzinfo=timezone.utc,
+    )
+    request_event = registry.request_rotation()
+    request_id = request_event.payload["request_id"]
+    proposed = make_v2_registry_suite(
+        tmp_path / "suite-source-1",
+        registry.spec,
+        champion_hash,
+        nonce=1,
+    )
+    registration = registry.register_suite(request_id, proposed)
+    proposed_suite_id = registration.payload["suite_id"]
+    current_evidence = tmp_path / "continuity-current.json"
+    previous_evidence = tmp_path / "continuity-previous.json"
+    write_v2_canonical(
+        current_evidence,
+        {"decision": "PASS", "role": "current"},
+    )
+    write_v2_canonical(
+        previous_evidence,
+        {"decision": "PASS", "role": "previous"},
+    )
+    continuity = tmp_path / "continuity.json"
+    publish_continuity_manifest(
+        continuity,
+        request_id=request_id,
+        candidate_suite_id=proposed_suite_id,
+        base_suite_id=runtime.autonomy.active_suite_id,
+        policy_hash=registry.spec.policy_identity,
+        current_champion_sha256=champion_hash,
+        previous_champion_sha256=digest("suite-previous-champion"),
+        current_evidence_path=current_evidence,
+        previous_evidence_path=previous_evidence,
+        completed_at_utc="2026-05-01T00:00:00.000000Z",
+    )
+    continuity_event = registry.record_continuity(
+        request_id,
+        proposed_suite_id,
+        continuity,
+    )
+    active_before = registry.reconstruct().active_suite_id
+    activation_calls = []
+
+    def forbidden_activation(*args, **kwargs):
+        activation_calls.append((args, kwargs))
+        raise AssertionError("promotion controller must not activate suites")
+
+    controller.suite_registry.activate_suite = forbidden_activation
+    registry.pin_evaluation("external-boundary-pin")
+    blocked_pin = controller.run_once()["suiteGenerationBoundary"]
+    assert blocked_pin["published"] is False
+    assert "suite-pins" in blocked_pin["blockers"]
+    registry.unpin_evaluation("external-boundary-pin")
+
+    pending_audit = (
+        runtime.promotion_root / "audits" / "queue" / "pending.json"
+    )
+    write_v2_canonical(pending_audit, {"pending": True})
+    blocked_audit = controller.run_once()["suiteGenerationBoundary"]
+    assert "pending-deep-audits" in blocked_audit["blockers"]
+    pending_audit.unlink()
+
+    lease_path = runtime.promotion_root / "gpu-lease-state.json"
+    lease = load_json(lease_path)
+    lease["evaluators"] = [{"evaluationId": "still-running"}]
+    atomic_write_json(lease_path, lease)
+    blocked_lease = controller.run_once()["suiteGenerationBoundary"]
+    assert "non-trainer-gpu-lease" in blocked_lease["blockers"]
+    lease["evaluators"] = []
+    atomic_write_json(lease_path, lease)
+
+    published = controller.run_once()["suiteGenerationBoundary"]
+    replay = controller.run_once()["suiteGenerationBoundary"]
+    state = registry.reconstruct()
+    boundary_events = [
+        event
+        for event in state.events
+        if event.event_type == "generation.boundary"
+    ]
+    assert published["published"] is True
+    assert replay["reused"] is True
+    assert len(boundary_events) == 1
+    assert boundary_events[0].sequence > continuity_event.sequence
+    assert state.active_suite_id == active_before
+    assert activation_calls == []
 
 
 def test_runtime_example_is_safe_and_uses_repository_evidence_cli():
@@ -3682,6 +4713,506 @@ def test_rollback_after_admission_and_consumption_restores_checkpoint(tmp_path):
     ).is_file()
     assert controller.registry.reconstruct().current_champion_hash == digest("champion-0")
     assert load_json(runtime.champion_path)["champion_hash"] == digest("champion-0")
+
+
+def test_normal_promotion_remains_free_of_adaptive_journal_bytes(tmp_path):
+    runtime, controller, artifact = bootstrap_and_claim(tmp_path)
+    _, report_path, report_hash = confirm_and_report(controller, artifact)
+    generation_id = "generation-normal-compatible"
+    kwargs = promotion_kwargs(runtime, report_path, report_hash)
+
+    controller.promote(artifact.model_hash, generation_id, **kwargs)
+
+    transaction = runtime.promotion_root / "transactions" / generation_id
+    intent = load_json(transaction / "intent.json")
+    assert "adaptive_training" not in intent
+    assert {
+        path.name
+        for path in transaction.glob("training-*.json")
+    } == set()
+    assert sha256_file(
+        runtime.rollback_quarantine / generation_id / "trainer-checkpoint"
+    ) == kwargs["trainer_checkpoint_hash"]
+
+
+def test_adaptive_handoff_mismatch_halts_before_promotion_intent(tmp_path):
+    other_candidate = tmp_path / "other-candidate.bin.gz"
+    other_candidate.write_bytes(b"different-adaptive-candidate")
+    runtime, controller, artifact, _, kwargs = prepare_adaptive_promotion(
+        tmp_path,
+        handoff_candidate_path=other_candidate,
+    )
+
+    with pytest.raises(SafetyHalt, match="adaptive candidate handoff"):
+        controller.promote(
+            artifact.model_hash,
+            "generation-adaptive-mismatch",
+            **kwargs,
+        )
+
+    assert not (
+        runtime.promotion_root
+        / "transactions"
+        / "generation-adaptive-mismatch"
+        / "intent.json"
+    ).exists()
+
+
+def test_adaptive_parent_champion_mismatch_and_missing_recipe_fail_closed(
+    tmp_path,
+):
+    runtime, controller, artifact, _, kwargs = prepare_adaptive_promotion(
+        tmp_path / "parent",
+        parent_model_hash=digest("foreign-parent"),
+    )
+    with pytest.raises(SafetyHalt, match="parent champion"):
+        controller.promote(
+            artifact.model_hash,
+            "generation-parent-mismatch",
+            **kwargs,
+        )
+    assert not (
+        runtime.promotion_root
+        / "transactions"
+        / "generation-parent-mismatch"
+        / "intent.json"
+    ).exists()
+
+    runtime, controller, artifact, adaptive, kwargs = (
+        prepare_adaptive_promotion(tmp_path / "recipe")
+    )
+    adaptive["active_recipe_path"].unlink()
+    with pytest.raises(SafetyHalt, match="active recipe"):
+        controller.promote(
+            artifact.model_hash,
+            "generation-missing-recipe",
+            **kwargs,
+        )
+    assert not (
+        runtime.promotion_root
+        / "transactions"
+        / "generation-missing-recipe"
+        / "intent.json"
+    ).exists()
+
+
+def test_adaptive_checkpoint_recipe_and_champion_commit_atomically_replay(
+    tmp_path,
+):
+    runtime, _, artifact, adaptive, kwargs = prepare_adaptive_promotion(
+        tmp_path
+    )
+    old_checkpoint = runtime.trainer_checkpoint.read_bytes()
+    old_champion = load_json(runtime.champion_path)
+    calls = []
+
+    def command(argv):
+        calls.append(tuple(argv))
+        return successful_command(argv)
+
+    controller = PromotionController(
+        runtime,
+        automatic=True,
+        command_executor=command,
+    )
+    generation_id = "generation-adaptive-active"
+    result = converge_promotion(
+        controller,
+        runtime,
+        artifact,
+        generation_id,
+        kwargs,
+    )
+
+    assert result["status"] == "ACTIVE"
+    assert old_checkpoint != runtime.trainer_checkpoint.read_bytes()
+    assert (
+        runtime.trainer_checkpoint.read_bytes()
+        == adaptive["resumable_checkpoint"].read_bytes()
+    )
+    recipe = load_recipe_binding(adaptive["active_recipe_path"])
+    assert recipe["recipe_sha256"] == adaptive["handoff"]["recipe_sha256"]
+    assert recipe["champion_model_sha256"] == artifact.model_hash
+    assert recipe["generation_id"] == generation_id
+    assert load_json(runtime.champion_path)["champion_hash"] == artifact.model_hash
+    assert set(load_json(runtime.champion_path)) == set(old_champion)
+
+    transaction = runtime.promotion_root / "transactions" / generation_id
+    assert {
+        "training-handoff-intent.json",
+        "training-quiesced.json",
+        "training-checkpoint-installed.json",
+        "training-recipe-cas.json",
+        "champion-cas.json",
+        "training-commit.json",
+    }.issubset({path.name for path in transaction.iterdir()})
+    intent = load_json(transaction / "intent.json")["adaptive_training"]
+    assert intent["handoff_file_sha256"] == sha256_file(
+        adaptive["handoff_path"]
+    )
+    assert intent["resume_checkpoint_sha256"] == sha256_file(
+        adaptive["resumable_checkpoint"]
+    )
+    assert intent["recipe_sha256"] == adaptive["handoff"]["recipe_sha256"]
+    stop_calls = [call for call in calls if "stop-all" in call]
+    assert stop_calls
+    assert all(
+        call[call.index("--generation") + 1] == "generation-0"
+        for call in stop_calls
+    )
+
+
+def test_adaptive_parent_snapshot_survives_later_production_training(
+    tmp_path,
+):
+    runtime, controller, artifact, adaptive, kwargs = (
+        prepare_adaptive_promotion(tmp_path)
+    )
+    runtime.trainer_checkpoint.write_bytes(
+        b"production-advanced-after-adaptive-fork"
+    )
+    kwargs = {
+        **kwargs,
+        "trainer_checkpoint_hash": sha256_file(
+            runtime.trainer_checkpoint
+        ),
+    }
+
+    result = converge_promotion(
+        controller,
+        runtime,
+        artifact,
+        "generation-adaptive-advanced-parent",
+        kwargs,
+    )
+
+    assert result["status"] == "ACTIVE"
+    assert (
+        runtime.trainer_checkpoint.read_bytes()
+        == adaptive["resumable_checkpoint"].read_bytes()
+    )
+
+
+@pytest.mark.parametrize(
+    "failure_step",
+    ADAPTIVE_PROMOTION_FAILURE_STEPS,
+)
+def test_every_adaptive_handoff_failure_boundary_replays(
+    tmp_path,
+    failure_step,
+):
+    runtime, base, artifact, adaptive, kwargs = prepare_adaptive_promotion(
+        tmp_path
+    )
+    generation_id = "generation-adaptive-boundary"
+    if failure_step != "promotion-training-handoff-intent":
+        assert (
+            base.promote(artifact.model_hash, generation_id, **kwargs)["status"]
+            == "WAITING_CANARY_ACK"
+        )
+        acknowledge_canary(base, runtime, artifact, generation_id)
+        base.promote(artifact.model_hash, generation_id, **kwargs)
+        acknowledge_remaining(base, artifact, generation_id)
+        base.promote(artifact.model_hash, generation_id, **kwargs)
+        acknowledge_full(base, artifact, generation_id)
+
+    fired = []
+
+    def fail(step):
+        if step == failure_step and not fired:
+            fired.append(step)
+            raise RuntimeError(f"adaptive crash at {step}")
+
+    crashing = PromotionController(
+        runtime,
+        automatic=True,
+        command_executor=successful_command,
+        failure_hook=fail,
+        process_identity_verifier=lambda identity: True,
+    )
+    with pytest.raises(RuntimeError, match="adaptive crash"):
+        crashing.promote(
+            artifact.model_hash,
+            generation_id,
+            **kwargs,
+        )
+    assert fired == [failure_step]
+
+    recovered = PromotionController(
+        runtime,
+        automatic=True,
+        command_executor=successful_command,
+        process_identity_verifier=lambda identity: True,
+    )
+    recovered.run_reconcile()
+    converge_promotion(
+        recovered,
+        runtime,
+        artifact,
+        generation_id,
+        kwargs,
+    )
+    assert (
+        recovered.registry.reconstruct().generations[generation_id].state
+        == GenerationState.ACTIVE
+    )
+    assert (
+        runtime.trainer_checkpoint.read_bytes()
+        == adaptive["resumable_checkpoint"].read_bytes()
+    )
+
+
+def test_adaptive_checkpoint_install_rejects_unsafe_gpu_lease(tmp_path):
+    runtime, base, artifact, _, kwargs = prepare_adaptive_promotion(tmp_path)
+    generation_id = "generation-adaptive-unsafe-lease"
+    base.promote(artifact.model_hash, generation_id, **kwargs)
+    acknowledge_canary(base, runtime, artifact, generation_id)
+    base.promote(artifact.model_hash, generation_id, **kwargs)
+    acknowledge_remaining(base, artifact, generation_id)
+    base.promote(artifact.model_hash, generation_id, **kwargs)
+    acknowledge_full(base, artifact, generation_id)
+    lease_path = runtime.promotion_root / "gpu-lease-state.json"
+    lease = load_json(lease_path)
+    lease["safetyHalt"] = True
+    atomic_write_json(lease_path, lease)
+    before = runtime.trainer_checkpoint.read_bytes()
+
+    with pytest.raises(SafetyHalt, match="trainer-only ownership"):
+        base.promote(artifact.model_hash, generation_id, **kwargs)
+
+    assert runtime.trainer_checkpoint.read_bytes() == before
+    assert not (
+        runtime.promotion_root
+        / "transactions"
+        / generation_id
+        / "training-checkpoint-installed.json"
+    ).exists()
+
+
+@pytest.mark.parametrize(
+    "failure_step",
+    [
+        "promotion-training-checkpoint-installed",
+        "promotion-training-recipe-cas",
+    ],
+)
+def test_partially_applied_adaptive_handoff_can_roll_back_before_activation(
+    tmp_path,
+    failure_step,
+):
+    runtime, base, artifact, adaptive, kwargs = prepare_adaptive_promotion(
+        tmp_path
+    )
+    generation_id = "generation-adaptive-partial-rollback"
+    old_checkpoint = runtime.trainer_checkpoint.read_bytes()
+    old_recipe = adaptive["active_recipe"]
+    old_champion = load_json(runtime.champion_path)["champion_hash"]
+    base.promote(artifact.model_hash, generation_id, **kwargs)
+    acknowledge_canary(base, runtime, artifact, generation_id)
+    base.promote(artifact.model_hash, generation_id, **kwargs)
+    acknowledge_remaining(base, artifact, generation_id)
+    base.promote(artifact.model_hash, generation_id, **kwargs)
+    acknowledge_full(base, artifact, generation_id)
+    fired = []
+
+    def crash(step):
+        if step == failure_step and not fired:
+            fired.append(step)
+            raise RuntimeError("partial adaptive application")
+
+    crashing = PromotionController(
+        runtime,
+        automatic=True,
+        command_executor=successful_command,
+        failure_hook=crash,
+    )
+    with pytest.raises(RuntimeError, match="partial adaptive"):
+        crashing.promote(artifact.model_hash, generation_id, **kwargs)
+    assert (
+        crashing.registry.reconstruct().generations[generation_id].state
+        == GenerationState.ROLLOUT
+    )
+
+    recovered = PromotionController(
+        runtime,
+        automatic=True,
+        command_executor=successful_command,
+    )
+    assert recovered.rollback(generation_id)["status"] == "ROLLED_BACK"
+    assert runtime.trainer_checkpoint.read_bytes() == old_checkpoint
+    assert (
+        load_recipe_binding(adaptive["active_recipe_path"])[
+            "recipe_sha256"
+        ]
+        == old_recipe["recipe_sha256"]
+    )
+    assert load_json(runtime.champion_path)["champion_hash"] == old_champion
+
+
+@pytest.mark.parametrize("trainer_consumed", [False, True])
+def test_adaptive_rollback_always_restores_checkpoint_recipe_and_champion(
+    tmp_path,
+    trainer_consumed,
+):
+    runtime, controller, artifact, adaptive, kwargs = (
+        prepare_adaptive_promotion(tmp_path)
+    )
+    generation_id = "generation-adaptive-rollback"
+    old_checkpoint = runtime.trainer_checkpoint.read_bytes()
+    old_recipe = adaptive["active_recipe"]
+    old_champion = load_json(runtime.champion_path)["champion_hash"]
+    converge_promotion(
+        controller,
+        runtime,
+        artifact,
+        generation_id,
+        kwargs,
+    )
+    runtime.trainer_checkpoint.write_bytes(b"post-commit-training-progress")
+    assert (
+        controller.promote(
+            artifact.model_hash,
+            generation_id,
+            **kwargs,
+        )["status"]
+        == "ACTIVE"
+    )
+    runtime.data_watermark_path.write_bytes(
+        b'{"watermark":"newer-data"}'
+    )
+    runtime.shuffle_watermark_path.write_bytes(
+        b'{"watermark":"newer-shuffle"}'
+    )
+    data_watermark = runtime.data_watermark_path.read_bytes()
+    shuffle_watermark = runtime.shuffle_watermark_path.read_bytes()
+
+    result = controller.rollback(
+        generation_id,
+        trainer_consumed=trainer_consumed,
+    )
+
+    assert result["status"] == "ROLLED_BACK"
+    assert runtime.trainer_checkpoint.read_bytes() == old_checkpoint
+    restored_recipe = load_recipe_binding(adaptive["active_recipe_path"])
+    assert restored_recipe["recipe_sha256"] == old_recipe["recipe_sha256"]
+    assert (
+        restored_recipe["champion_model_sha256"]
+        == old_recipe["champion_model_sha256"]
+    )
+    assert load_json(runtime.champion_path)["champion_hash"] == old_champion
+    assert runtime.data_watermark_path.read_bytes() == data_watermark
+    assert runtime.shuffle_watermark_path.read_bytes() == shuffle_watermark
+
+
+@pytest.mark.parametrize(
+    "failure_step",
+    ADAPTIVE_ROLLBACK_FAILURE_STEPS,
+)
+def test_adaptive_rollback_checkpoint_and_recipe_markers_replay(
+    tmp_path,
+    failure_step,
+):
+    runtime, controller, artifact, adaptive, kwargs = (
+        prepare_adaptive_promotion(tmp_path)
+    )
+    generation_id = "generation-adaptive-rollback-replay"
+    old_checkpoint = runtime.trainer_checkpoint.read_bytes()
+    old_recipe = adaptive["active_recipe"]
+    converge_promotion(
+        controller,
+        runtime,
+        artifact,
+        generation_id,
+        kwargs,
+    )
+    fired = []
+
+    def crash(step):
+        if step == failure_step and not fired:
+            fired.append(step)
+            raise RuntimeError(f"rollback crash at {step}")
+
+    crashing = PromotionController(
+        runtime,
+        automatic=True,
+        command_executor=successful_command,
+        failure_hook=crash,
+    )
+    with pytest.raises(RuntimeError, match="rollback crash"):
+        crashing.rollback(generation_id)
+    assert fired == [failure_step]
+
+    recovered = PromotionController(
+        runtime,
+        automatic=True,
+        command_executor=successful_command,
+    )
+    assert recovered.rollback(generation_id)["status"] == "ROLLED_BACK"
+    assert runtime.trainer_checkpoint.read_bytes() == old_checkpoint
+    restored = load_recipe_binding(adaptive["active_recipe_path"])
+    assert restored["recipe_sha256"] == old_recipe["recipe_sha256"]
+    assert (
+        recovered.registry.reconstruct().generations[generation_id].state
+        == GenerationState.ROLLED_BACK
+    )
+
+
+def test_adaptive_recipe_rollback_replays_crash_before_marker(
+    tmp_path,
+    monkeypatch,
+):
+    import risk_score.promotion_controller as promotion_controller_module
+
+    runtime, controller, artifact, adaptive, kwargs = (
+        prepare_adaptive_promotion(tmp_path)
+    )
+    generation_id = "generation-recipe-cas-window"
+    old_recipe = adaptive["active_recipe"]
+    converge_promotion(
+        controller,
+        runtime,
+        artifact,
+        generation_id,
+        kwargs,
+    )
+    real_rollback = promotion_controller_module.rollback_recipe_binding
+    fired = []
+
+    def rollback_then_crash(*args, **named):
+        result = real_rollback(*args, **named)
+        if not fired:
+            fired.append(True)
+            raise RuntimeError("recipe rollback marker window")
+        return result
+
+    monkeypatch.setattr(
+        promotion_controller_module,
+        "rollback_recipe_binding",
+        rollback_then_crash,
+    )
+    with pytest.raises(RuntimeError, match="marker window"):
+        controller.rollback(generation_id)
+    transaction = runtime.promotion_root / "transactions" / generation_id
+    assert not (transaction / "training-recipe-rolled-back.json").exists()
+    assert (
+        load_recipe_binding(adaptive["active_recipe_path"])[
+            "recipe_sha256"
+        ]
+        == old_recipe["recipe_sha256"]
+    )
+
+    monkeypatch.setattr(
+        promotion_controller_module,
+        "rollback_recipe_binding",
+        real_rollback,
+    )
+    recovered = PromotionController(
+        runtime,
+        automatic=True,
+        command_executor=successful_command,
+    )
+    assert recovered.rollback(generation_id)["status"] == "ROLLED_BACK"
+    assert (transaction / "training-recipe-rolled-back.json").is_file()
 
 
 def test_production_topology_and_schedule_banks_are_fail_closed(tmp_path):

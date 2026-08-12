@@ -7,7 +7,11 @@ import pytest
 from risk_score.position_samples import canonical_json, file_sha256
 from risk_score.promotion_host import HostCommandError
 from risk_score.service_activation import (
+    AUTONOMY_SERVICE_SPEC_CONTRACT,
+    AUTONOMY_SERVICE_UNIT_NAMES,
     EXPECTED_SERVICE_UNITS,
+    FULL_EXPECTED_SERVICE_UNITS,
+    FULL_SERVICE_UNIT_NAMES,
     SERVICE_UNIT_NAMES,
     TARGET_UNIT,
     apply_service_activation,
@@ -56,6 +60,57 @@ def shadow_service_spec(spec):
         value["services"].pop(name)
         value["systemd_units"].pop(name)
     spec.write_text(canonical_json(value) + "\n", encoding="utf-8")
+
+
+def full_autonomy_service_spec(tmp_path):
+    generated = tmp_path / "generated-full"
+    generated.mkdir()
+    unit_names = {**FULL_SERVICE_UNIT_NAMES, "target": TARGET_UNIT}
+    unit_records = {}
+    units = {}
+    for key, name in sorted(unit_names.items()):
+        path = generated / name
+        path.write_text(
+            f"[Unit]\nDescription={name}\n", encoding="utf-8"
+        )
+        record = {"path": str(path), "sha256": file_sha256(path)}
+        unit_records[key] = record
+        units[name] = record
+    service_inputs = {}
+    inputs = tmp_path / "autonomy-inputs"
+    inputs.mkdir()
+    for name in (
+        "autonomy_policy",
+        "executor_spec",
+        "adaptive_spec",
+        "suite_registry_spec",
+    ):
+        path = inputs / f"{name}.json"
+        path.write_text(canonical_json({"name": name}) + "\n", encoding="utf-8")
+        service_inputs[name] = {
+            "path": str(path.resolve()),
+            "sha256": file_sha256(path),
+        }
+    spec = tmp_path / "autonomy-services.json"
+    spec.write_text(
+        canonical_json(
+            {
+                "schema_version": 3,
+                "contract": AUTONOMY_SERVICE_SPEC_CONTRACT,
+                "mutation_enabled": True,
+                "full_autonomy": True,
+                "service_inputs": service_inputs,
+                "services": {
+                    name: {"argv": ["/bin/true"]}
+                    for name in FULL_SERVICE_UNIT_NAMES
+                },
+                "systemd_units": unit_records,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return spec, units
 
 
 def recording_runner(commands, *, inactive_units=()):
@@ -228,6 +283,70 @@ def test_activation_accepts_exact_shadow_inventory(tmp_path):
             "katago-risk-boot-reconcile.service",
         }
     )
+
+
+def test_activation_accepts_full_autonomy_inventory(tmp_path):
+    spec, units = full_autonomy_service_spec(tmp_path)
+    destination = tmp_path / "systemd"
+    destination.mkdir()
+
+    plan = plan_service_activation(
+        spec_path=spec, destination=destination
+    )
+
+    assert set(plan["unit_inventory"]) == FULL_EXPECTED_SERVICE_UNITS | {
+        TARGET_UNIT
+    }
+    assert {row["unit"] for row in plan["actions"]} == set(units)
+
+
+def test_activation_refuses_incomplete_full_autonomy_inventory(tmp_path):
+    spec, _ = full_autonomy_service_spec(tmp_path)
+    value = json.loads(spec.read_text())
+    key = next(iter(AUTONOMY_SERVICE_UNIT_NAMES))
+    value["services"].pop(key)
+    value["systemd_units"].pop(key)
+    spec.write_text(canonical_json(value) + "\n", encoding="utf-8")
+    destination = tmp_path / "systemd"
+    destination.mkdir()
+
+    with pytest.raises(HostCommandError, match="service inventory is invalid"):
+        plan_service_activation(spec_path=spec, destination=destination)
+
+
+def test_activation_refuses_changed_full_autonomy_input(tmp_path):
+    spec, _ = full_autonomy_service_spec(tmp_path)
+    value = json.loads(spec.read_text())
+    path = Path(value["service_inputs"]["adaptive_spec"]["path"])
+    path.write_text(canonical_json({"changed": True}) + "\n", encoding="utf-8")
+    destination = tmp_path / "systemd"
+    destination.mkdir()
+
+    with pytest.raises(HostCommandError, match="changed or is unsafe"):
+        plan_service_activation(spec_path=spec, destination=destination)
+
+
+def test_apply_full_autonomy_verifies_every_required_service(tmp_path):
+    spec, units = full_autonomy_service_spec(tmp_path)
+    destination = tmp_path / "systemd"
+    destination.mkdir()
+    receipt = tmp_path / "activation.json"
+    commands = []
+
+    result = apply_service_activation(
+        spec_path=spec,
+        destination=destination,
+        receipt_path=receipt,
+        command_runner=recording_runner(commands),
+    )
+
+    assert set(result["installed_units"]) == set(units)
+    checked = {
+        command[0][-1]
+        for command in commands
+        if command[0][:2] == ["systemctl", "is-active"]
+    }
+    assert checked == FULL_EXPECTED_SERVICE_UNITS | {TARGET_UNIT}
 
 
 def test_automatic_to_shadow_removes_only_omitted_owned_units(tmp_path):

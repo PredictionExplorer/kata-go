@@ -1,3 +1,4 @@
+import datetime
 import hashlib
 import sys
 from pathlib import Path
@@ -5,6 +6,11 @@ from pathlib import Path
 import pytest
 
 from katago.utils.shuffle_input_gate import run_if_changed
+from risk_score.adaptive_training import (
+    DEFAULT_POLICY_PATH,
+    load_adaptive_observation,
+    publish_adaptive_service_spec,
+)
 from risk_score.promotion_feedback import (
     DATA_WATERMARK_CONTRACT,
     SHUFFLE_MANIFEST_FILENAME,
@@ -14,6 +20,7 @@ from risk_score.promotion_feedback import (
     TrainerProvenanceRecorder,
     _resolve_cli_paths,
     atomic_create_json,
+    atomic_replace_json,
     canonical_sha256,
     file_sha256,
     load_canonical_json,
@@ -21,6 +28,11 @@ from risk_score.promotion_feedback import (
     load_shuffle_manifest,
     load_shuffle_watermark,
     parse_args,
+)
+from risk_score.promotion_state import (
+    ChampionRecord,
+    EventProvenance,
+    bootstrap_champion,
 )
 
 
@@ -124,6 +136,145 @@ def run_strict_gate(layout, command):
         data_watermark=layout["data_watermark"],
         strict_provenance=True,
     )
+
+
+FIXED_NOW = datetime.datetime(
+    2026, 8, 11, 12, 0, 0, tzinfo=datetime.timezone.utc
+)
+
+
+def adaptive_provenance():
+    return EventProvenance(
+        controller_hash=digest("adaptive-controller"),
+        source_hash=digest("adaptive-source"),
+        original_hash=digest("adaptive-original"),
+        config_hash=digest("adaptive-config"),
+        schedule_hash=digest("adaptive-schedule"),
+        policy_hash=digest("adaptive-promotion-policy"),
+    )
+
+
+def configure_adaptive_observation(layout, *, with_trainer_receipt=True):
+    generation = "generation-adaptive"
+    champion_hash = digest("adaptive-champion")
+    add_generation(layout, generation, champion_hash)
+    watcher(layout).scan_once()
+    gate = run_strict_gate(
+        layout,
+        output_command(layout["shuffles"], "20260811-120000"),
+    )
+    shuffle_path = layout["shuffles"] / gate["last_successful_output"]
+    checkpoint = (layout["trainer"] / "checkpoint.ckpt").resolve()
+    checkpoint.write_bytes(b"adaptive-checkpoint-v1")
+    recorder = TrainerProvenanceRecorder(layout["trainer"], strict=True)
+    recorder.bind_shuffle(shuffle_path)
+    if with_trainer_receipt:
+        recorder.record_consumption(
+            [shuffle_path / "train" / "data.npz"],
+            samples_before=0,
+            samples_after=8,
+        )
+        recorder.record_checkpoint(checkpoint, sample_count=8)
+
+    champion_path = layout["promotion"] / "champion.json"
+    champion = bootstrap_champion(
+        champion_path,
+        champion_hash=champion_hash,
+        generation_id=generation,
+        provenance=adaptive_provenance(),
+        actor="adaptive-feedback-test",
+        timestamp_utc="2026-08-11T11:00:00.000000Z",
+    )
+    candidate_inbox = layout["promotion"].parent / "modelstobetested"
+    candidate_inbox.mkdir()
+    scheduler = layout["promotion"] / "scheduler"
+    scheduler.mkdir()
+    adaptive_root = layout["promotion"] / "adaptive"
+    configs = layout["promotion"].parent / "configs"
+    configs.mkdir()
+    executor_spec_path = (configs / "cluster-executor.json").resolve()
+    suite_spec_path = (configs / "suite-registry.json").resolve()
+    canonical_write(executor_spec_path, {"name": "cluster-executor"})
+    canonical_write(suite_spec_path, {"name": "suite-registry"})
+    adaptive_spec_path = (configs / "adaptive-training.json").resolve()
+    adaptive_spec = publish_adaptive_service_spec(
+        adaptive_spec_path,
+        root=adaptive_root.resolve(),
+        autonomy_policy_path=DEFAULT_POLICY_PATH.resolve(),
+        scheduler_directory=scheduler.resolve(),
+        observation_path=(adaptive_root / "observation.json").resolve(),
+        trial_command_argv_template=[
+            "adaptive-trial",
+            "{trial_manifest_path}",
+            "{trial_result_path}",
+            "{work_id}",
+        ],
+        gpu_lease_guardian_argv_prefix=["gpu-lease-guardian"],
+        poll_interval_seconds=15.0,
+        actor="adaptive-feedback-test",
+    )
+    runtime_path = (configs / "promotion-runtime.json").resolve()
+    canonical_write(
+        runtime_path,
+        {
+            "paths": {
+                "promotionRoot": str(layout["promotion"]),
+                "admittedSelfplay": str(layout["admitted"]),
+                "dataWatermark": str(layout["data_watermark"]),
+                "shuffleWatermark": str(layout["shuffle_watermark"]),
+                "rolloutQuarantine": str(
+                    layout["promotion"] / "rollouts"
+                ),
+                "champion": str(champion_path),
+                "trainerCheckpoint": str(checkpoint),
+                "candidateInbox": str(candidate_inbox),
+            }
+        },
+    )
+    services_path = (configs / "promotion-services.json").resolve()
+    canonical_write(
+        services_path,
+        {
+            "schema_version": 3,
+            "contract": "risk-score-host-services-v3",
+            "mutation_enabled": True,
+            "full_autonomy": True,
+            "service_inputs": {
+                name: {
+                    "path": str(path),
+                    "sha256": file_sha256(path),
+                }
+                for name, path in {
+                    "autonomy_policy": DEFAULT_POLICY_PATH.resolve(),
+                    "executor_spec": executor_spec_path,
+                    "adaptive_spec": adaptive_spec_path,
+                    "suite_registry_spec": suite_spec_path,
+                }.items()
+            },
+        },
+    )
+
+    def service():
+        return watcher(
+            layout,
+            runtime_config=runtime_path,
+            feedback_recorder=lambda *_: {"recorded": True},
+            now=lambda: FIXED_NOW,
+        )
+
+    return {
+        "adaptive_root": adaptive_root,
+        "adaptive_spec": adaptive_spec,
+        "adaptive_spec_path": adaptive_spec_path,
+        "champion": champion,
+        "champion_path": champion_path,
+        "checkpoint": checkpoint,
+        "recorder": recorder,
+        "runtime_path": runtime_path,
+        "service": service,
+        "services_path": services_path,
+        "shuffle_path": shuffle_path,
+    }
 
 
 def test_strict_shuffle_manifest_detects_mixed_generations(layout):
@@ -449,3 +600,288 @@ def test_trainer_rejects_selected_file_not_in_manifest(layout):
         recorder.record_consumption(
             [outside], samples_before=0, samples_after=8
         )
+
+
+def test_adaptive_observation_is_legacy_v2_noop(layout):
+    configs = layout["promotion"].parent / "configs"
+    canonical_write(
+        configs / "promotion-services.json",
+        {
+            "schema_version": 2,
+            "contract": "risk-score-host-services-v2",
+            "mutation_enabled": True,
+            "full_autonomy": False,
+        },
+    )
+
+    result = watcher(layout).scan_once()
+
+    assert "adaptive_observation" not in result
+    assert not (layout["promotion"] / "adaptive").exists()
+
+
+def test_adaptive_observation_publishes_hash_bound_snapshots(layout):
+    fixture = configure_adaptive_observation(layout)
+
+    result = fixture["service"]().scan_once()
+    adaptive = result["adaptive_observation"]
+    observation = load_adaptive_observation(
+        fixture["adaptive_spec"].observation_path
+    )
+
+    assert adaptive["status"] == "PUBLISHED"
+    assert observation["admitted_samples"] == 8
+    assert observation["last_promotion_admitted_samples"] == 8
+    assert observation["current_champion_model_sha256"] == fixture[
+        "champion"
+    ].champion_hash
+    checkpoint_snapshot = Path(
+        observation["champion_checkpoint"]["path"]
+    )
+    assert checkpoint_snapshot.parent == (
+        fixture["adaptive_root"] / "parents" / "checkpoints"
+    )
+    assert checkpoint_snapshot != fixture["checkpoint"]
+    assert checkpoint_snapshot.read_bytes() == fixture["checkpoint"].read_bytes()
+    admitted_snapshot = Path(
+        observation["admitted_data_manifest"]["path"]
+    )
+    assert admitted_snapshot.parent == (
+        fixture["adaptive_root"] / "parents" / "admitted-data"
+    )
+    admitted_value = load_canonical_json(admitted_snapshot)
+    assert admitted_value["source_inventory"]
+    assert admitted_value["provenance_receipts"]
+
+
+def test_adaptive_observation_updates_baseline_on_champion_change(layout):
+    fixture = configure_adaptive_observation(layout)
+    fixture["service"]().scan_once()
+    train_file = fixture["shuffle_path"] / "train" / "data.npz"
+    fixture["recorder"].record_consumption(
+        [train_file], samples_before=8, samples_after=16
+    )
+    fixture["checkpoint"].write_bytes(b"adaptive-checkpoint-v2")
+    fixture["recorder"].record_checkpoint(
+        fixture["checkpoint"], sample_count=16
+    )
+    promoted_hash = digest("adaptive-promoted-champion")
+    promoted = ChampionRecord.build(
+        champion_hash=promoted_hash,
+        generation_id="generation-promoted",
+        previous_champion_hash=fixture["champion"].champion_hash,
+        provenance=adaptive_provenance(),
+        activated_at_utc="2026-08-11T11:30:00.000000Z",
+        evaluation_key="adaptive-confirmation",
+        pass_report_path=str(
+            layout["promotion"] / "reports" / "adaptive.json"
+        ),
+        pass_report_hash=digest("adaptive-pass-report"),
+        actor="adaptive-feedback-test",
+        bootstrap=False,
+    )
+    atomic_replace_json(fixture["champion_path"], promoted.to_dict())
+
+    result = fixture["service"]().scan_once()
+    observation = load_adaptive_observation(
+        fixture["adaptive_spec"].observation_path
+    )
+
+    assert result["adaptive_observation"]["status"] == "PUBLISHED"
+    assert observation["admitted_samples"] == 16
+    assert observation["last_promotion_admitted_samples"] == 16
+    assert observation["current_champion_model_sha256"] == promoted_hash
+    baselines = sorted(
+        (
+            fixture["adaptive_root"] / "parents" / "baselines"
+        ).glob("*.json")
+    )
+    assert len(baselines) == 2
+
+
+def test_adaptive_observation_checkpoint_tamper_is_blocked(layout):
+    fixture = configure_adaptive_observation(layout)
+    fixture["service"]().scan_once()
+    observation_path = fixture["adaptive_spec"].observation_path
+    before = observation_path.read_bytes()
+    fixture["checkpoint"].write_bytes(b"adaptive-checkpoint-X1")
+
+    result = fixture["service"]().scan_once()
+
+    assert result["adaptive_observation"]["status"] == "BLOCKED"
+    assert "contradicts its immutable receipt" in result[
+        "adaptive_observation"
+    ]["blocked_reason"]
+    assert observation_path.read_bytes() == before
+
+
+def test_adaptive_observation_checkpoint_race_is_blocked(
+    layout, monkeypatch
+):
+    fixture = configure_adaptive_observation(layout)
+    import risk_score.promotion_feedback as promotion_feedback
+
+    original_copy = promotion_feedback.shutil.copyfileobj
+
+    def racing_copy(source, destination, length):
+        original_copy(source, destination, length)
+        fixture["checkpoint"].write_bytes(b"adaptive-checkpoint-X1")
+
+    monkeypatch.setattr(
+        promotion_feedback.shutil, "copyfileobj", racing_copy
+    )
+
+    result = fixture["service"]().scan_once()
+
+    assert result["adaptive_observation"]["status"] == "BLOCKED"
+    assert "changed while snapshotting" in result[
+        "adaptive_observation"
+    ]["blocked_reason"]
+    assert not fixture["adaptive_spec"].observation_path.exists()
+
+
+def test_adaptive_observation_missing_provenance_retains_prior(layout):
+    fixture = configure_adaptive_observation(layout)
+    fixture["service"]().scan_once()
+    observation_path = fixture["adaptive_spec"].observation_path
+    before = observation_path.read_bytes()
+    for directory in ("checkpoints", "consumption"):
+        for path in (layout["trainer"] / directory).glob("*.json"):
+            path.unlink()
+
+    result = fixture["service"]().scan_once()
+    producer_status = load_canonical_json(
+        fixture["adaptive_root"] / "observation-producer-status.json"
+    )
+
+    assert result["adaptive_observation"]["status"] == "BLOCKED"
+    assert producer_status["state"] == "BLOCKED"
+    assert result["adaptive_observation"]["observation_retained"] is True
+    assert observation_path.read_bytes() == before
+
+
+def test_adaptive_observation_scan_is_snapshot_idempotent(layout):
+    fixture = configure_adaptive_observation(layout)
+    first = fixture["service"]().scan_once()
+    observation_path = fixture["adaptive_spec"].observation_path
+    observation_bytes = observation_path.read_bytes()
+    immutable_before = {
+        str(path.relative_to(fixture["adaptive_root"])): path.read_bytes()
+        for path in (
+            fixture["adaptive_root"] / "parents"
+        ).rglob("*")
+        if path.is_file()
+    }
+
+    second = fixture["service"]().scan_once()
+    immutable_after = {
+        str(path.relative_to(fixture["adaptive_root"])): path.read_bytes()
+        for path in (
+            fixture["adaptive_root"] / "parents"
+        ).rglob("*")
+        if path.is_file()
+    }
+
+    assert first["adaptive_observation"]["status"] == "PUBLISHED"
+    assert second["adaptive_observation"]["status"] == "PUBLISHED"
+    assert observation_path.read_bytes() == observation_bytes
+    assert immutable_after == immutable_before
+
+
+def test_adaptive_checkpoint_snapshots_only_advance_when_trial_is_due(layout):
+    fixture = configure_adaptive_observation(layout)
+    fixture["service"]().scan_once()
+    observation_path = fixture["adaptive_spec"].observation_path
+    first = load_adaptive_observation(observation_path)
+    train_file = fixture["shuffle_path"] / "train" / "data.npz"
+
+    fixture["recorder"].record_consumption(
+        [train_file], samples_before=8, samples_after=16
+    )
+    fixture["checkpoint"].write_bytes(b"adaptive-checkpoint-v2")
+    fixture["recorder"].record_checkpoint(
+        fixture["checkpoint"], sample_count=16
+    )
+    fixture["service"]().scan_once()
+    second = load_adaptive_observation(observation_path)
+
+    assert second["admitted_samples"] == 16
+    assert (
+        second["champion_checkpoint"]["path"]
+        == first["champion_checkpoint"]["path"]
+    )
+    assert len(
+        list(
+            (
+                fixture["adaptive_root"] / "parents" / "checkpoints"
+            ).glob("*.ckpt")
+        )
+    ) == 1
+
+    due_samples = 3_000_008
+    fixture["recorder"].record_consumption(
+        [train_file], samples_before=16, samples_after=due_samples
+    )
+    fixture["checkpoint"].write_bytes(b"adaptive-checkpoint-due")
+    fixture["recorder"].record_checkpoint(
+        fixture["checkpoint"], sample_count=due_samples
+    )
+    fixture["service"]().scan_once()
+    due = load_adaptive_observation(observation_path)
+
+    assert due["admitted_samples"] == due_samples
+    assert (
+        due["champion_checkpoint"]["path"]
+        != first["champion_checkpoint"]["path"]
+    )
+    assert len(
+        list(
+            (
+                fixture["adaptive_root"] / "parents" / "checkpoints"
+            ).glob("*.ckpt")
+        )
+    ) == 2
+
+    later_samples = due_samples + 8
+    fixture["recorder"].record_consumption(
+        [train_file], samples_before=due_samples, samples_after=later_samples
+    )
+    fixture["checkpoint"].write_bytes(b"adaptive-checkpoint-after-due")
+    fixture["recorder"].record_checkpoint(
+        fixture["checkpoint"], sample_count=later_samples
+    )
+    fixture["service"]().scan_once()
+    later = load_adaptive_observation(observation_path)
+    assert (
+        later["champion_checkpoint"]["path"]
+        == due["champion_checkpoint"]["path"]
+    )
+    assert len(
+        list(
+            (
+                fixture["adaptive_root"] / "parents" / "checkpoints"
+            ).glob("*.ckpt")
+        )
+    ) == 2
+
+
+def test_adaptive_observation_service_spec_hash_change_is_blocked(layout):
+    fixture = configure_adaptive_observation(layout)
+    fixture["service"]().scan_once()
+    observation_path = fixture["adaptive_spec"].observation_path
+    before = observation_path.read_bytes()
+    changed = load_canonical_json(fixture["adaptive_spec_path"])
+    changed["actor"] = "changed-adaptive-service"
+    body = dict(changed)
+    body.pop("spec_sha256")
+    changed["spec_sha256"] = canonical_sha256(body)
+    atomic_replace_json(fixture["adaptive_spec_path"], changed)
+
+    result = fixture["service"]().scan_once()
+
+    assert result["adaptive_observation"]["status"] == "BLOCKED"
+    assert "service_inputs hash" in result["adaptive_observation"][
+        "blocked_reason"
+    ]
+    assert result["adaptive_observation"]["observation_retained"] is True
+    assert observation_path.read_bytes() == before

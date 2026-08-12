@@ -17,6 +17,10 @@ from risk_score.paired_stats import load_policy
 from risk_score.position_samples import canonical_json, file_sha256
 from risk_score.promotion_host import HostCommandError, atomic_write_json
 from risk_score.promotion_state import atomic_write_bytes
+from risk_score.service_activation import (
+    AUTONOMY_SERVICE_SPEC_CONTRACT,
+    AUTONOMY_SERVICE_UNIT_NAMES,
+)
 
 
 def _replace(value: Any, replacements: Mapping[str, str]) -> Any:
@@ -42,6 +46,35 @@ def _required_file(path: Path, role: str) -> Path:
     return source
 
 
+def _canonical_json_file(path: Path, role: str) -> Mapping[str, Any]:
+    source = _required_file(path, role)
+    data = source.read_bytes()
+    try:
+        value = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HostCommandError(f"{role} is invalid JSON: {exc}") from exc
+    if (
+        not isinstance(value, dict)
+        or data != (canonical_json(value) + "\n").encode("utf-8")
+    ):
+        raise HostCommandError(f"{role} must be canonical JSON")
+    return value
+
+
+def _self_hashed_spec(
+    path: Path,
+    *,
+    role: str,
+    contract: str,
+) -> Mapping[str, Any]:
+    value = _canonical_json_file(path, role)
+    body = dict(value)
+    supplied = body.pop("spec_sha256", None)
+    if value.get("contract") != contract or supplied != policy_sha256(body):
+        raise HostCommandError(f"{role} contract or self-hash is invalid")
+    return value
+
+
 def _service_argv(value: Optional[Sequence[str]], role: str) -> list[str]:
     if value is None:
         return []
@@ -56,6 +89,17 @@ def _service_argv(value: Optional[Sequence[str]], role: str) -> list[str]:
         raise HostCommandError(f"{role} service command must be a nonempty argv")
     if not Path(result[0]).is_absolute():
         raise HostCommandError(f"{role} service executable must be absolute")
+    return result
+
+
+def _reconcile_argv(value: Sequence[str], role: str) -> list[str]:
+    result = list(value)
+    indexes = [index for index, argument in enumerate(result) if argument == "watch"]
+    if len(indexes) != 1:
+        raise HostCommandError(
+            f"{role} full-autonomy command must contain one watch mode"
+        )
+    result[indexes[0]] = "once"
     return result
 
 
@@ -209,6 +253,15 @@ def build_live_runtime(
     shuffler_command: Optional[Sequence[str]] = None,
     exporter_command: Optional[Sequence[str]] = None,
     evaluator_command: Optional[Sequence[str]] = None,
+    full_autonomy: bool = False,
+    cluster_executor_command: Optional[Sequence[str]] = None,
+    adaptive_training_command: Optional[Sequence[str]] = None,
+    suite_rotation_command: Optional[Sequence[str]] = None,
+    autonomy_policy: Optional[Path] = None,
+    cluster_executor_spec: Optional[Path] = None,
+    adaptive_training_spec: Optional[Path] = None,
+    suite_registry_spec: Optional[Path] = None,
+    evaluator_process_count: int = 8,
 ) -> Mapping[str, Any]:
     repository = Path(repo).resolve()
     root = Path(run_root).resolve()
@@ -222,9 +275,189 @@ def build_live_runtime(
         raise HostCommandError("suite directory must be a non-symlink directory")
     if not actor or not gpu_uuid.startswith("GPU-"):
         raise HostCommandError("actor and verified GPU UUID are required")
+    if (
+        type(evaluator_process_count) is not int
+        or evaluator_process_count not in {4, 8, 16}
+    ):
+        raise HostCommandError(
+            "evaluator process count must be benchmarked at 4, 8, or 16"
+        )
     shuffler_argv = _service_argv(shuffler_command, "shuffler")
     exporter_argv = _service_argv(exporter_command, "exporter")
     evaluator_argv = _service_argv(evaluator_command, "evaluator")
+    executor_argv = _service_argv(
+        cluster_executor_command, "cluster executor"
+    )
+    adaptive_argv = _service_argv(
+        adaptive_training_command, "adaptive training"
+    )
+    suite_rotation_argv = _service_argv(
+        suite_rotation_command, "suite rotation"
+    )
+    autonomy_commands = (executor_argv, adaptive_argv, suite_rotation_argv)
+    runtime_autonomy: Optional[Mapping[str, Any]] = None
+    if type(full_autonomy) is not bool:
+        raise HostCommandError("full autonomy flag must be boolean")
+    if full_autonomy and (
+        not mutation_enabled
+        or not all(autonomy_commands)
+    ):
+        raise HostCommandError(
+            "full autonomy requires mutation mode and every autonomy service command"
+        )
+    if not full_autonomy and any(autonomy_commands):
+        raise HostCommandError(
+            "autonomy service commands require full autonomy mode"
+        )
+    autonomy_input_paths: Dict[str, Path] = {}
+    if full_autonomy:
+        raw_inputs = {
+            "autonomy_policy": autonomy_policy,
+            "executor_spec": cluster_executor_spec,
+            "adaptive_spec": adaptive_training_spec,
+            "suite_registry_spec": suite_registry_spec,
+        }
+        if any(path is None for path in raw_inputs.values()):
+            raise HostCommandError(
+                "full autonomy requires every hash-bound service input"
+            )
+        autonomy_input_paths = {
+            name: _required_file(Path(path), name.replace("_", " "))
+            for name, path in raw_inputs.items()
+        }
+        for role, command, spec_name in (
+            ("cluster executor", executor_argv, "executor_spec"),
+            ("adaptive training", adaptive_argv, "adaptive_spec"),
+            ("suite rotation", suite_rotation_argv, "suite_registry_spec"),
+        ):
+            if str(autonomy_input_paths[spec_name]) not in command:
+                raise HostCommandError(
+                    f"{role} command does not bind its frozen specification"
+                )
+        from risk_score.adaptive_training import (
+            POLICY_HASH as AUTONOMY_POLICY_HASH,
+        )
+
+        policy_value = _canonical_json_file(
+            autonomy_input_paths["autonomy_policy"],
+            "autonomy policy",
+        )
+        if policy_sha256(policy_value) != AUTONOMY_POLICY_HASH:
+            raise HostCommandError("autonomy policy identity is not frozen")
+        executor_spec_value = _self_hashed_spec(
+            autonomy_input_paths["executor_spec"],
+            role="cluster executor specification",
+            contract="risk-score-cluster-executor-spec-v1",
+        )
+        adaptive_spec_value = _self_hashed_spec(
+            autonomy_input_paths["adaptive_spec"],
+            role="adaptive training specification",
+            contract="risk-score-adaptive-training-service-spec-v1",
+        )
+        suite_service_value = _self_hashed_spec(
+            autonomy_input_paths["suite_registry_spec"],
+            role="suite rotation service specification",
+            contract="risk-score-suite-rotation-service-spec-v1",
+        )
+        scheduler_paths = {
+            executor_spec_value.get("scheduler_directory"),
+            adaptive_spec_value.get("scheduler_directory"),
+            suite_service_value.get("scheduler_directory"),
+        }
+        guardian_prefixes = {
+            canonical_json(executor_spec_value.get("gpu7_guardian_prefix")),
+            canonical_json(
+                adaptive_spec_value.get(
+                    "gpu_lease_guardian_argv_prefix"
+                )
+            ),
+            canonical_json(suite_service_value.get("guardian_argv_prefix")),
+        }
+        if (
+            len(scheduler_paths) != 1
+            or None in scheduler_paths
+            or {
+                executor_spec_value.get("gpu7_id"),
+                adaptive_spec_value.get("gpu7_id"),
+                suite_service_value.get("gpu7_id"),
+            }
+            != {"7"}
+            or len(guardian_prefixes) != 1
+            or "null" in guardian_prefixes
+        ):
+            raise HostCommandError(
+                "autonomy services disagree on scheduler, GPU7, or guardian"
+            )
+        if (
+            adaptive_spec_value.get("autonomy_policy_path")
+            != str(autonomy_input_paths["autonomy_policy"])
+            or adaptive_spec_value.get("autonomy_policy_sha256")
+            != AUTONOMY_POLICY_HASH
+        ):
+            raise HostCommandError(
+                "adaptive service does not bind the frozen autonomy policy"
+            )
+        registry_binding = suite_service_value.get("registry_spec")
+        if not isinstance(registry_binding, Mapping):
+            raise HostCommandError(
+                "suite rotation service has no registry specification"
+            )
+        registry_path = Path(str(registry_binding.get("path", "")))
+        if (
+            not registry_path.is_absolute()
+            or registry_path.is_symlink()
+            or not registry_path.is_file()
+            or file_sha256(registry_path) != registry_binding.get("sha256")
+        ):
+            raise HostCommandError(
+                "suite registry specification changed or is unsafe"
+            )
+        registry_value = _self_hashed_spec(
+            registry_path,
+            role="suite registry specification",
+            contract="risk-score-evaluation-suite-registry-spec-v1",
+        )
+        active_suite_path = (
+            Path(str(registry_value.get("registry_root", "")))
+            / "active-suite.json"
+        )
+        active_suite = _canonical_json_file(
+            active_suite_path, "active suite pointer"
+        )
+        active_body = dict(active_suite)
+        active_record_hash = active_body.pop("record_sha256", None)
+        manifest_path = suites / "manifest.json"
+        if (
+            active_suite.get("contract")
+            != "risk-score-active-evaluation-suite-v1"
+            or active_record_hash != policy_sha256(active_body)
+            or active_suite.get("spec_sha256")
+            != registry_value.get("spec_sha256")
+            or active_suite.get("manifest_path") != str(manifest_path)
+            or active_suite.get("manifest_sha256")
+            != file_sha256(manifest_path)
+            or suites.name != active_suite.get("suite_id")
+        ):
+            raise HostCommandError(
+                "active suite pointer does not match the frozen runtime suite"
+            )
+        runtime_autonomy = {
+            "suiteRegistrySpec": {
+                "path": str(registry_path),
+                "sha256": file_sha256(registry_path),
+                "identity": registry_value["spec_sha256"],
+            },
+            "activeSuitePointer": {
+                "path": str(active_suite_path),
+                "sha256": file_sha256(active_suite_path),
+                "recordSha256": active_suite["record_sha256"],
+                "suiteId": active_suite["suite_id"],
+            },
+            "adaptive": {
+                "policySha256": AUTONOMY_POLICY_HASH,
+                "root": str(root / "promotion" / "adaptive"),
+            },
+        }
     if mutation_enabled and (
         service_user is None
         or not shuffler_argv
@@ -328,6 +561,7 @@ def build_live_runtime(
         "eventLog": str(promotion_root / "gpu-lease-events.jsonl"),
     }
     gpu["gpu"]["expectedUuid"] = gpu_uuid
+    gpu["evaluator"]["processCount"] = evaluator_process_count
     gpu["trainer"]["checkpointPath"] = str(checkpoint)
     gpu["trainer"]["launchCommand"][
         gpu["trainer"]["launchCommand"].index("--spec") + 1
@@ -397,6 +631,13 @@ def build_live_runtime(
     ):
         _required_file(path, role)
     promotion["mutationEnabled"] = mutation_enabled
+    if full_autonomy:
+        if runtime_autonomy is None:
+            raise HostCommandError(
+                "full-autonomy runtime has no control-plane binding"
+            )
+        promotion["schemaVersion"] = 2
+        promotion["autonomy"] = dict(runtime_autonomy)
     promotion["actor"] = actor
     promotion["commands"]["trainer"][
         promotion["commands"]["trainer"].index("--spec") + 1
@@ -628,6 +869,30 @@ def build_live_runtime(
         },
     }
     if mutation_enabled:
+        reconcile_commands = [
+            feedback_once_argv,
+            gpu_reconcile_argv,
+        ]
+        if full_autonomy:
+            reconcile_commands.extend(
+                [
+                    _reconcile_argv(
+                        executor_argv, "cluster executor"
+                    ),
+                    _reconcile_argv(
+                        adaptive_argv, "adaptive training"
+                    ),
+                    _reconcile_argv(
+                        suite_rotation_argv, "suite rotation"
+                    ),
+                ]
+            )
+        reconcile_commands.extend(
+            [
+                controller_reconcile_argv,
+                boot_ready_argv,
+            ]
+        )
         services["auditor"] = {
             "argv": auditor_argv,
             "description": "KataGo risk-training rollout and deep-audit worker",
@@ -635,17 +900,35 @@ def build_live_runtime(
             "restart": "always",
         }
         services["reconcile"] = {
-            "commands": [
-                feedback_once_argv,
-                gpu_reconcile_argv,
-                controller_reconcile_argv,
-                boot_ready_argv,
-            ],
+            "commands": reconcile_commands,
             "description": "KataGo risk-training boot reconciliation",
             "environment": {},
             "restart": "no",
             "type": "oneshot",
         }
+    if full_autonomy:
+        services.update(
+            {
+                "executor": {
+                    "argv": executor_argv,
+                    "description": "KataGo durable GPU cluster executor",
+                    "environment": {},
+                    "restart": "always",
+                },
+                "adaptive": {
+                    "argv": adaptive_argv,
+                    "description": "KataGo bounded adaptive training controller",
+                    "environment": {},
+                    "restart": "always",
+                },
+                "suite_rotation": {
+                    "argv": suite_rotation_argv,
+                    "description": "KataGo evaluation-suite rotation controller",
+                    "environment": {},
+                    "restart": "always",
+                },
+            }
+        )
     for name, command, description, environment in (
         (
             "shuffler",
@@ -681,13 +964,37 @@ def build_live_runtime(
             "shuffler": "katago-risk-shuffler.service",
             "exporter": "katago-risk-exporter.service",
             "reconcile": "katago-risk-boot-reconcile.service",
+            **(
+                AUTONOMY_SERVICE_UNIT_NAMES
+                if full_autonomy
+                else {}
+            ),
         }
         for name, spec in services.items():
             dependencies = []
-            if name in {"controller", "auditor", "feedback", "reconcile"}:
+            if name in {
+                "controller",
+                "auditor",
+                "feedback",
+                "reconcile",
+                "executor",
+                "adaptive",
+                "suite_rotation",
+            }:
                 dependencies.append("katago-risk-promotion-host.service")
             if mutation_enabled and name not in {"supervisor", "reconcile"}:
                 dependencies.append("katago-risk-boot-reconcile.service")
+            if name in {"adaptive", "suite_rotation"}:
+                dependencies.append(
+                    AUTONOMY_SERVICE_UNIT_NAMES["executor"]
+                )
+                dependencies.append(
+                    "katago-risk-promotion-controller.service"
+                )
+            if name == "suite_rotation":
+                dependencies.append(
+                    "katago-risk-promotion-auditor.service"
+                )
             before = (
                 tuple(
                     unit_names[service_name]
@@ -753,9 +1060,30 @@ def build_live_runtime(
             "sha256": file_sha256(target_path),
         }
     service_spec = {
-        "schema_version": 2,
-        "contract": "risk-score-host-services-v2",
+        "schema_version": 3 if full_autonomy else 2,
+        "contract": (
+            AUTONOMY_SERVICE_SPEC_CONTRACT
+            if full_autonomy
+            else "risk-score-host-services-v2"
+        ),
         "mutation_enabled": mutation_enabled,
+        "full_autonomy": full_autonomy,
+        "evaluator_process_count": evaluator_process_count,
+        **(
+            {
+                "service_inputs": {
+                    name: {
+                        "path": str(path),
+                        "sha256": file_sha256(path),
+                    }
+                    for name, path in sorted(
+                        autonomy_input_paths.items()
+                    )
+                }
+            }
+            if full_autonomy
+            else {}
+        ),
         "service_user": service_user,
         "services": services,
         "systemd_units": systemd_units,
@@ -817,12 +1145,19 @@ def build_live_runtime(
         "promotion_runtime": promotion_path,
         "gpu_lease_runtime": gpu_path,
         "service_spec": service_path,
+        **{
+            f"autonomy:{name}": path
+            for name, path in autonomy_input_paths.items()
+        },
     }
     command_bindings = {
         "trainer": tuple(trainer_spec_value.get("argv", ())),
         "shuffler": shuffler_argv,
         "exporter": exporter_argv,
         "legacy_evaluator": evaluator_argv,
+        "cluster_executor": executor_argv,
+        "adaptive_training": adaptive_argv,
+        "suite_rotation": suite_rotation_argv,
     }
     for command_name, command in command_bindings.items():
         for index, argument in enumerate(command):
@@ -868,6 +1203,8 @@ def build_live_runtime(
         "service_spec_sha256": file_sha256(service_path),
         "systemd_units": systemd_units,
         "mutation_enabled": mutation_enabled,
+        "full_autonomy": full_autonomy,
+        "evaluator_process_count": evaluator_process_count,
     }
 
 
@@ -922,6 +1259,20 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--shuffler-command-json")
     parser.add_argument("--exporter-command-json")
     parser.add_argument("--evaluator-command-json")
+    parser.add_argument("--full-autonomy", action="store_true")
+    parser.add_argument("--cluster-executor-command-json")
+    parser.add_argument("--adaptive-training-command-json")
+    parser.add_argument("--suite-rotation-command-json")
+    parser.add_argument("--autonomy-policy", type=Path)
+    parser.add_argument("--cluster-executor-spec", type=Path)
+    parser.add_argument("--adaptive-training-spec", type=Path)
+    parser.add_argument("--suite-registry-spec", type=Path)
+    parser.add_argument(
+        "--evaluator-process-count",
+        type=int,
+        choices=(4, 8, 16),
+        default=8,
+    )
     return parser.parse_args(argv)
 
 
@@ -932,6 +1283,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         exporter_command = _parse_command_json(args.exporter_command_json, "exporter")
         evaluator_command = _parse_command_json(
             args.evaluator_command_json, "evaluator"
+        )
+        cluster_executor_command = _parse_command_json(
+            args.cluster_executor_command_json, "cluster executor"
+        )
+        adaptive_training_command = _parse_command_json(
+            args.adaptive_training_command_json, "adaptive training"
+        )
+        suite_rotation_command = _parse_command_json(
+            args.suite_rotation_command_json, "suite rotation"
         )
         result = build_live_runtime(
             repo=args.repo,
@@ -952,6 +1312,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             shuffler_command=shuffler_command,
             exporter_command=exporter_command,
             evaluator_command=evaluator_command,
+            full_autonomy=args.full_autonomy,
+            cluster_executor_command=cluster_executor_command,
+            adaptive_training_command=adaptive_training_command,
+            suite_rotation_command=suite_rotation_command,
+            autonomy_policy=args.autonomy_policy,
+            cluster_executor_spec=args.cluster_executor_spec,
+            adaptive_training_spec=args.adaptive_training_spec,
+            suite_registry_spec=args.suite_registry_spec,
+            evaluator_process_count=args.evaluator_process_count,
         )
     except (HostCommandError, OSError, TypeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)

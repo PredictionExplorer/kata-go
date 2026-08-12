@@ -1,4 +1,5 @@
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -10,7 +11,17 @@ from risk_score.build_live_runtime import (
     verify_deployment_manifest,
 )
 from risk_score.promotion_host import HostCommandError
-from risk_score.position_samples import file_sha256
+from risk_score.adaptive_training import POLICY_HASH as AUTONOMY_POLICY_HASH
+from risk_score.position_samples import (
+    canonical_json,
+    canonical_sha256,
+    file_sha256,
+)
+from risk_score.service_activation import (
+    AUTONOMY_SERVICE_SPEC_CONTRACT,
+    AUTONOMY_SERVICE_UNIT_NAMES,
+)
+from risk_score.suite_rotation import publish_registry_spec
 
 
 REPO = Path(__file__).resolve().parents[2]
@@ -24,12 +35,16 @@ SYSTEMD_SERVICE_UNITS = {
     "exporter": "katago-risk-exporter.service",
     "reconcile": "katago-risk-boot-reconcile.service",
 }
+FULL_SYSTEMD_SERVICE_UNITS = {
+    **SYSTEMD_SERVICE_UNITS,
+    **AUTONOMY_SERVICE_UNIT_NAMES,
+}
 
 
 def _assert_durable_systemd_runtime(result, services):
     expected_services = set(services["services"])
     expected_units = {
-        SYSTEMD_SERVICE_UNITS[name] for name in expected_services
+        FULL_SYSTEMD_SERVICE_UNITS[name] for name in expected_services
     }
     target_unit = Path(services["systemd_units"]["target"]["path"]).read_text(
         encoding="utf-8"
@@ -449,6 +464,266 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
     ).read_text(encoding="utf-8")
     assert "katago-risk-boot-reconcile.service" not in supervisor_unit
     _assert_durable_systemd_runtime(automatic, automatic_services)
+
+    autonomy_inputs = run / "autonomy-inputs"
+    autonomy_inputs.mkdir()
+    autonomy_policy = (
+        REPO / "python" / "risk_score" / "autonomy_policy_v1.json"
+    ).resolve()
+    executor_spec = autonomy_inputs / "cluster-executor.json"
+    adaptive_spec = autonomy_inputs / "adaptive-training.json"
+    suite_registry_spec = autonomy_inputs / "suite-rotation.json"
+    scheduler_directory = (autonomy_inputs / "scheduler").resolve()
+    scheduler_directory.mkdir()
+    guardian_prefix = [
+        sys.executable,
+        "-m",
+        "risk_score.gpu_lease_worker",
+        "--spec-sha256",
+        "a" * 64,
+        "--receipt",
+        "{guardian_receipt}",
+        "--claim-id",
+        "{claim_id}",
+        "--work-id",
+        "{work_id}",
+        "--",
+    ]
+
+    def write_self_hashed(path, value):
+        value["spec_sha256"] = canonical_sha256(value)
+        path.write_text(canonical_json(value) + "\n", encoding="utf-8")
+
+    write_self_hashed(
+        executor_spec,
+        {
+            "schema_version": 1,
+            "contract": "risk-score-cluster-executor-spec-v1",
+            "scheduler_directory": str(scheduler_directory),
+            "state_directory": str(
+                (autonomy_inputs / "executor-state").resolve()
+            ),
+            "owner_id": "executor-test",
+            "gpu_ids": [str(index) for index in range(8)],
+            "gpu7_id": "7",
+            "poll_interval_seconds": 1.0,
+            "heartbeat_interval_seconds": 2.0,
+            "stale_after_seconds": 10.0,
+            "retry_budget": 2,
+            "backoff_initial_seconds": 5.0,
+            "backoff_max_seconds": 60.0,
+            "lease_proof_command": None,
+            "lease_proof_timeout_seconds": 10.0,
+            "gpu7_guardian_prefix": guardian_prefix,
+        },
+    )
+    write_self_hashed(
+        adaptive_spec,
+        {
+            "schema_version": 1,
+            "contract": "risk-score-adaptive-training-service-spec-v1",
+            "root": str((autonomy_inputs / "adaptive-root").resolve()),
+            "autonomy_policy_path": str(autonomy_policy),
+            "autonomy_policy_sha256": AUTONOMY_POLICY_HASH,
+            "scheduler_directory": str(scheduler_directory),
+            "gpu7_id": "7",
+            "observation_path": str(
+                (autonomy_inputs / "adaptive-observation.json").resolve()
+            ),
+            "trial_command_argv_template": [
+                "/bin/true",
+                "{trial_manifest}",
+                "{trial_result}",
+                "{work_id}",
+            ],
+            "gpu_lease_guardian_argv_prefix": guardian_prefix,
+            "poll_interval_seconds": 5.0,
+            "actor": "adaptive-test",
+        },
+    )
+    registry_root = (autonomy_inputs / "suite-registry").resolve()
+    registry_root.mkdir()
+    registry_spec = autonomy_inputs / "suite-registry.json"
+    initial_suite_champion = (
+        autonomy_inputs / "initial-suite-champion.bin.gz"
+    )
+    initial_suite_champion.write_bytes(b"initial-suite-champion")
+    registry = publish_registry_spec(
+        registry_spec,
+        registry_root=registry_root,
+        policy_path=(
+            REPO
+            / "python"
+            / "risk_score"
+            / "promotion_policy_v3.json"
+        ),
+        original_model_path=original,
+        initial_champion_path=initial_suite_champion,
+        initial_generation_id="generation-initial",
+    )
+    suite_id = file_sha256(suites / "manifest.json")
+    full_suites = registry_root / "suites" / suite_id
+    shutil.copytree(suites, full_suites)
+    active_suite = {
+        "schema_version": 1,
+        "contract": "risk-score-active-evaluation-suite-v1",
+        "spec_sha256": registry.identity,
+        "suite_id": suite_id,
+        "version_sha256": "b" * 64,
+        "manifest_path": str(full_suites / "manifest.json"),
+        "manifest_sha256": suite_id,
+        "manifest_identity": "c" * 64,
+        "activated_at_utc": "2026-08-11T00:00:00.000000Z",
+        "activation_champion_sha256": file_sha256(
+            initial_suite_champion
+        ),
+        "activation_generation_id": "generation-initial",
+        "event_sequence": 1,
+        "event_sha256": "d" * 64,
+    }
+    active_suite["record_sha256"] = canonical_sha256(active_suite)
+    (registry_root / "active-suite.json").write_text(
+        canonical_json(active_suite) + "\n",
+        encoding="utf-8",
+    )
+    write_self_hashed(
+        suite_registry_spec,
+        {
+            "schema_version": 1,
+            "contract": "risk-score-suite-rotation-service-spec-v1",
+            "root": str((autonomy_inputs / "suite-service").resolve()),
+            "registry_spec": {
+                "path": str(registry_spec.resolve()),
+                "sha256": file_sha256(registry_spec),
+            },
+            "scheduler_directory": str(scheduler_directory),
+            "gpu7_id": "7",
+            "guardian_argv_prefix": guardian_prefix,
+        },
+    )
+    full = build_live_runtime(
+        repo=REPO,
+        run_root=run,
+        suite_dir=full_suites,
+        katago_binary=katago,
+        python_executable=Path(sys.executable),
+        trainer_spec=trainer_spec,
+        consumer_spec=consumer_spec,
+        original_model=original,
+        trainer_checkpoint=checkpoint,
+        gpu_uuid="GPU-test-production",
+        actor="controller-test",
+        source_revision=revision,
+        output_dir=run / "full-autonomy-configs",
+        mutation_enabled=True,
+        require_clean_source=False,
+        service_user="ubuntu",
+        shuffler_command=[str(shuffler_service)],
+        exporter_command=[str(exporter_service)],
+        evaluator_command=evaluator_command,
+        full_autonomy=True,
+        cluster_executor_command=[
+            sys.executable,
+            "-m",
+            "risk_score.cluster_executor",
+            "--spec",
+            str(executor_spec),
+            "watch",
+        ],
+        adaptive_training_command=[
+            sys.executable,
+            "-m",
+            "risk_score.adaptive_training",
+            "--spec",
+            str(adaptive_spec),
+            "watch",
+        ],
+        suite_rotation_command=[
+            sys.executable,
+            "-m",
+            "risk_score.suite_rotation_service",
+            "--spec",
+            str(suite_registry_spec),
+            "watch",
+        ],
+        autonomy_policy=autonomy_policy,
+        cluster_executor_spec=executor_spec,
+        adaptive_training_spec=adaptive_spec,
+        suite_registry_spec=suite_registry_spec,
+        evaluator_process_count=16,
+    )
+    full_services = json.loads(
+        Path(full["service_spec"]).read_text(encoding="utf-8")
+    )
+    assert full["full_autonomy"] is True
+    assert full["evaluator_process_count"] == 16
+    assert full_services["schema_version"] == 3
+    assert full_services["contract"] == AUTONOMY_SERVICE_SPEC_CONTRACT
+    assert set(full_services["services"]) == set(
+        FULL_SYSTEMD_SERVICE_UNITS
+    )
+    assert set(full_services["systemd_units"]) == {
+        *FULL_SYSTEMD_SERVICE_UNITS,
+        "target",
+    }
+    assert set(full_services["service_inputs"]) == {
+        "autonomy_policy",
+        "executor_spec",
+        "adaptive_spec",
+        "suite_registry_spec",
+    }
+    full_gpu = json.loads(
+        Path(full["gpu_lease_runtime"]).read_text(encoding="utf-8")
+    )
+    assert full_gpu["evaluator"]["processCount"] == 16
+    full_promotion = json.loads(
+        Path(full["promotion_runtime"]).read_text(encoding="utf-8")
+    )
+    assert full_promotion["schemaVersion"] == 2
+    assert full_promotion["autonomy"]["activeSuitePointer"][
+        "suiteId"
+    ] == suite_id
+    assert full_promotion["paths"]["suites"] == str(full_suites)
+    full_reconcile = full_services["services"]["reconcile"]["commands"]
+    assert [
+        command[command.index("-m") + 1]
+        for command in full_reconcile
+    ] == [
+        "risk_score.promotion_feedback",
+        "risk_score.gpu_lease",
+        "risk_score.cluster_executor",
+        "risk_score.adaptive_training",
+        "risk_score.suite_rotation_service",
+        "risk_score.promotion_controller",
+        "risk_score.promotion_host",
+    ]
+    assert all(
+        "watch" not in command
+        for command in full_reconcile[2:5]
+    )
+    assert all(
+        "once" in command
+        for command in full_reconcile[2:5]
+    )
+    for name in ("adaptive", "suite_rotation"):
+        unit = Path(
+            full_services["systemd_units"][name]["path"]
+        ).read_text(encoding="utf-8")
+        expected_dependencies = [
+            "katago-risk-promotion-host.service",
+            "katago-risk-boot-reconcile.service",
+            "katago-risk-cluster-executor.service",
+            "katago-risk-promotion-controller.service",
+        ]
+        if name == "suite_rotation":
+            expected_dependencies.append(
+                "katago-risk-promotion-auditor.service"
+            )
+        assert (
+            "Requires="
+            + " ".join(expected_dependencies)
+        ) in unit
+    _assert_durable_systemd_runtime(full, full_services)
     deployment = verify_deployment_manifest(Path(result["deployment_manifest"]))
     assert deployment["source_revision"] == revision
     katago.write_bytes(b"changed")

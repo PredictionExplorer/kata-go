@@ -51,6 +51,20 @@ from risk_score.promotion_state import (
     utc_timestamp,
 )
 from risk_score.hardened_exporter import EXPORT_CONTRACT
+from risk_score.adaptive_training import (
+    POLICY_HASH as ADAPTIVE_POLICY_HASH,
+    AdaptiveTrainingError,
+    compare_and_swap_recipe_binding,
+    load_candidate_handoff,
+    load_recipe_binding,
+    rollback_recipe_binding,
+)
+from risk_score.suite_rotation import (
+    ACTIVE_SUITE_CONTRACT,
+    SuiteRotationError,
+    SuiteRotationRegistry,
+    load_registry_spec,
+)
 
 
 _SHA_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -92,6 +106,26 @@ PROMOTION_FAILURE_STEPS = (
     "promotion-active-event",
     "promotion-generation-data-admitted",
 )
+ADAPTIVE_PROMOTION_FAILURE_STEPS = (
+    "promotion-training-handoff-intent",
+    "promotion-training-quiesced",
+    "promotion-training-checkpoint-installed",
+    "promotion-training-recipe-cas",
+    "promotion-champion-cas",
+    "promotion-training-commit",
+)
+ADAPTIVE_ROLLBACK_FAILURE_STEPS = (
+    "rollback-training-checkpoint-restored",
+    "rollback-training-recipe-restored",
+    "rollback-champion-restored",
+)
+_ALL_ROLE_QUIESCENCE = [
+    "selfplay",
+    "shuffler",
+    "trainer",
+    "exporter",
+    "evaluator",
+]
 
 
 class ControllerError(RuntimeError):
@@ -148,6 +182,21 @@ class ControllerConfig:
 
 
 @dataclass(frozen=True)
+class RuntimeAutonomyBinding:
+    """Immutable control-plane bindings carried by runtime schema v2."""
+
+    suite_registry_spec_path: Path
+    suite_registry_spec_file_hash: str
+    suite_registry_spec_identity: str
+    active_suite_pointer_path: Path
+    active_suite_pointer_file_hash: str
+    active_suite_pointer_record_hash: str
+    active_suite_id: str
+    adaptive_policy_hash: str
+    adaptive_root: Path
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     """Absolute live paths, argv templates, and controller policy."""
 
@@ -186,6 +235,8 @@ class RuntimeConfig:
     original_model_path: Path
     commands: Mapping[str, Tuple[str, ...]]
     frozen_policy: Mapping[str, Any]
+    schema_version: int = 1
+    autonomy: Optional[RuntimeAutonomyBinding] = None
 
     @classmethod
     def load(cls, path: Path) -> "RuntimeConfig":
@@ -199,24 +250,30 @@ class RuntimeConfig:
 
     @classmethod
     def from_mapping(cls, value: Any) -> "RuntimeConfig":
+        if not isinstance(value, dict):
+            raise ConfigurationError("runtime config must be an object")
+        schema_version = value.get("schemaVersion")
+        if type(schema_version) is not int or schema_version not in {1, 2}:
+            raise ConfigurationError("schemaVersion must be integer 1 or 2")
+        root_keys = {
+            "schemaVersion",
+            "mutationEnabled",
+            "actor",
+            "hashes",
+            "paths",
+            "commands",
+            "polling",
+            "limits",
+            "backlog",
+            "rollout",
+        }
+        if schema_version == 2 and "autonomy" in value:
+            root_keys.add("autonomy")
         root = _strict_object(
             value,
             "runtime config",
-            {
-                "schemaVersion",
-                "mutationEnabled",
-                "actor",
-                "hashes",
-                "paths",
-                "commands",
-                "polling",
-                "limits",
-                "backlog",
-                "rollout",
-            },
+            root_keys,
         )
-        if root["schemaVersion"] != 1 or type(root["schemaVersion"]) is not int:
-            raise ConfigurationError("schemaVersion must be integer 1")
         if type(root["mutationEnabled"]) is not bool:
             raise ConfigurationError("mutationEnabled must be boolean")
         actor = _nonempty(root["actor"], "actor")
@@ -400,6 +457,15 @@ class RuntimeConfig:
                 "GPU lease config is missing gpu.expectedUuid"
             ) from exc
         _validate_runtime_paths(normalized_paths)
+        autonomy = (
+            _parse_runtime_autonomy(
+                root["autonomy"],
+                paths=normalized_paths,
+                hashes=hashes,
+            )
+            if schema_version == 2 and "autonomy" in root
+            else None
+        )
 
         controller = ControllerConfig(
             mutation_enabled=root["mutationEnabled"],
@@ -472,6 +538,8 @@ class RuntimeConfig:
             original_model_path=normalized_paths["originalModel"],
             commands=command_values,
             frozen_policy=policy_value,
+            schema_version=schema_version,
+            autonomy=autonomy,
         )
 
 
@@ -675,6 +743,261 @@ def _absolute_path(value: Any, name: str) -> Path:
     if any(part == ".." for part in path.parts):
         raise ConfigurationError(f"{name} may not contain '..'")
     return path
+
+
+def _runtime_autonomy_values(value: Any) -> Mapping[str, Any]:
+    """Normalize the two strict v2 serialization forms used by runtime builders."""
+
+    if not isinstance(value, dict):
+        raise ConfigurationError("autonomy must be an object")
+    if set(value) == {
+        "suiteRegistrySpec",
+        "activeSuitePointer",
+        "adaptive",
+    }:
+        registry = value["suiteRegistrySpec"]
+        active = value["activeSuitePointer"]
+        adaptive = value["adaptive"]
+        if not isinstance(registry, dict):
+            raise ConfigurationError("autonomy.suiteRegistrySpec must be an object")
+        if set(registry) == {"path", "sha256", "identity"}:
+            registry_hash = registry["sha256"]
+        elif set(registry) == {"path", "fileSha256", "identity"}:
+            registry_hash = registry["fileSha256"]
+        else:
+            _strict_object(
+                registry,
+                "autonomy.suiteRegistrySpec",
+                {"path", "sha256", "identity"},
+            )
+            raise AssertionError("unreachable")
+        if not isinstance(active, dict):
+            raise ConfigurationError("autonomy.activeSuitePointer must be an object")
+        if set(active) == {"path", "sha256", "recordSha256", "suiteId"}:
+            active_hash = active["sha256"]
+        elif set(active) == {
+            "path",
+            "fileSha256",
+            "recordSha256",
+            "suiteId",
+        }:
+            active_hash = active["fileSha256"]
+        else:
+            _strict_object(
+                active,
+                "autonomy.activeSuitePointer",
+                {"path", "sha256", "recordSha256", "suiteId"},
+            )
+            raise AssertionError("unreachable")
+        if not isinstance(adaptive, dict):
+            raise ConfigurationError("autonomy.adaptive must be an object")
+        if set(adaptive) == {"policySha256", "root"}:
+            adaptive_hash = adaptive["policySha256"]
+        elif set(adaptive) == {"policyHash", "root"}:
+            adaptive_hash = adaptive["policyHash"]
+        else:
+            _strict_object(
+                adaptive,
+                "autonomy.adaptive",
+                {"policySha256", "root"},
+            )
+            raise AssertionError("unreachable")
+        return {
+            "suite_registry_spec_path": registry["path"],
+            "suite_registry_spec_file_hash": registry_hash,
+            "suite_registry_spec_identity": registry["identity"],
+            "active_suite_pointer_path": active["path"],
+            "active_suite_pointer_file_hash": active_hash,
+            "active_suite_pointer_record_hash": active["recordSha256"],
+            "active_suite_id": active["suiteId"],
+            "adaptive_policy_hash": adaptive_hash,
+            "adaptive_root": adaptive["root"],
+        }
+
+    flat_variants = (
+        {
+            "suiteRegistrySpecPath": "suite_registry_spec_path",
+            "suiteRegistrySpecSha256": "suite_registry_spec_file_hash",
+            "suiteRegistrySpecIdentity": "suite_registry_spec_identity",
+            "activeSuitePointerPath": "active_suite_pointer_path",
+            "activeSuitePointerSha256": "active_suite_pointer_file_hash",
+            "activeSuitePointerRecordSha256": "active_suite_pointer_record_hash",
+            "activeSuiteId": "active_suite_id",
+            "adaptivePolicySha256": "adaptive_policy_hash",
+            "adaptiveRoot": "adaptive_root",
+        },
+        {
+            "suiteRegistrySpecPath": "suite_registry_spec_path",
+            "suiteRegistrySpecFileSha256": "suite_registry_spec_file_hash",
+            "suiteRegistrySpecIdentity": "suite_registry_spec_identity",
+            "activeSuitePointerPath": "active_suite_pointer_path",
+            "activeSuitePointerFileSha256": "active_suite_pointer_file_hash",
+            "activeSuitePointerRecordSha256": "active_suite_pointer_record_hash",
+            "activeSuiteId": "active_suite_id",
+            "adaptivePolicyHash": "adaptive_policy_hash",
+            "adaptiveRoot": "adaptive_root",
+        },
+    )
+    for fields in flat_variants:
+        if set(value) == set(fields):
+            return {normalized: value[key] for key, normalized in fields.items()}
+    _strict_object(
+        value,
+        "autonomy",
+        {"suiteRegistrySpec", "activeSuitePointer", "adaptive"},
+    )
+    raise AssertionError("unreachable")
+
+
+def _parse_runtime_autonomy(
+    value: Any,
+    *,
+    paths: Mapping[str, Path],
+    hashes: Mapping[str, str],
+) -> RuntimeAutonomyBinding:
+    raw = _runtime_autonomy_values(value)
+    spec_path = _absolute_path(
+        raw["suite_registry_spec_path"],
+        "autonomy suite registry specification path",
+    )
+    spec_file_hash = _hash(
+        raw["suite_registry_spec_file_hash"],
+        "autonomy suite registry specification file hash",
+    )
+    spec_identity = _hash(
+        raw["suite_registry_spec_identity"],
+        "autonomy suite registry specification identity",
+    )
+    pointer_path = _absolute_path(
+        raw["active_suite_pointer_path"],
+        "autonomy active-suite pointer path",
+    )
+    pointer_file_hash = _hash(
+        raw["active_suite_pointer_file_hash"],
+        "autonomy active-suite pointer file hash",
+    )
+    pointer_record_hash = _hash(
+        raw["active_suite_pointer_record_hash"],
+        "autonomy active-suite pointer record hash",
+    )
+    active_suite_id = _hash(
+        raw["active_suite_id"],
+        "autonomy active suite ID",
+    )
+    adaptive_policy_hash = _hash(
+        raw["adaptive_policy_hash"],
+        "autonomy adaptive policy hash",
+    )
+    adaptive_root = _absolute_path(
+        raw["adaptive_root"],
+        "autonomy adaptive root",
+    )
+
+    for path, expected, role in (
+        (spec_path, spec_file_hash, "suite registry specification"),
+        (pointer_path, pointer_file_hash, "active-suite pointer"),
+    ):
+        if path.is_symlink() or not path.is_file():
+            raise ConfigurationError(f"autonomy {role} is not a regular file: {path}")
+        if sha256_file(path) != expected:
+            raise ConfigurationError(f"autonomy {role} file hash mismatch")
+    try:
+        spec = load_registry_spec(spec_path)
+    except (OSError, ValueError, SuiteRotationError) as exc:
+        raise ConfigurationError(f"invalid autonomy suite registry spec: {exc}") from exc
+    if (
+        spec.file_sha256 != spec_file_hash
+        or spec.identity != spec_identity
+        or spec.policy_path != paths["policy"]
+        or spec.policy_identity != hashes["policy"]
+        or spec.original.path != paths["originalModel"]
+        or spec.original.sha256 != hashes["original"]
+    ):
+        raise ConfigurationError(
+            "autonomy suite registry specification contradicts frozen runtime"
+        )
+    if pointer_path != spec.root / "active-suite.json":
+        raise ConfigurationError(
+            "autonomy active-suite pointer is not owned by the suite registry"
+        )
+
+    try:
+        pointer_data = pointer_path.read_bytes()
+        pointer = json.loads(pointer_data)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ConfigurationError(f"cannot load autonomy active-suite pointer: {exc}") from exc
+    pointer = _strict_object(
+        pointer,
+        "autonomy active-suite pointer",
+        {
+            "schema_version",
+            "contract",
+            "spec_sha256",
+            "suite_id",
+            "version_sha256",
+            "manifest_path",
+            "manifest_sha256",
+            "manifest_identity",
+            "activated_at_utc",
+            "activation_champion_sha256",
+            "activation_generation_id",
+            "event_sequence",
+            "event_sha256",
+            "record_sha256",
+        },
+    )
+    if pointer_data != canonical_json_bytes(pointer) + b"\n":
+        raise ConfigurationError("autonomy active-suite pointer is not canonical")
+    pointer_payload = dict(pointer)
+    supplied_record_hash = pointer_payload.pop("record_sha256")
+    if (
+        pointer["schema_version"] != 1
+        or pointer["contract"] != ACTIVE_SUITE_CONTRACT
+        or pointer["spec_sha256"] != spec_identity
+        or pointer["suite_id"] != active_suite_id
+        or pointer["manifest_sha256"] != active_suite_id
+        or supplied_record_hash != pointer_record_hash
+        or supplied_record_hash != canonical_sha256(pointer_payload)
+    ):
+        raise ConfigurationError("autonomy active-suite pointer identity is invalid")
+    manifest_path = _absolute_path(
+        pointer["manifest_path"],
+        "autonomy active suite manifest path",
+    )
+    if (
+        manifest_path != paths["suites"] / "manifest.json"
+        or paths["suites"].name != active_suite_id
+        or pointer["manifest_sha256"] != hashes["suiteManifest"]
+        or manifest_path.is_symlink()
+        or not manifest_path.is_file()
+        or sha256_file(manifest_path) != hashes["suiteManifest"]
+    ):
+        raise ConfigurationError(
+            "autonomy active-suite pointer diverges from frozen runtime suite"
+        )
+    if adaptive_policy_hash != ADAPTIVE_POLICY_HASH:
+        raise ConfigurationError("autonomy adaptive policy hash is not frozen")
+    if adaptive_root != paths["promotionRoot"] / "adaptive":
+        raise ConfigurationError(
+            "autonomy adaptive root is not the canonical promotion/adaptive path"
+        )
+    if os.path.lexists(os.fspath(adaptive_root)) and (
+        adaptive_root.is_symlink() or not adaptive_root.is_dir()
+    ):
+        raise ConfigurationError(
+            "autonomy adaptive root must be a non-symlink directory"
+        )
+    return RuntimeAutonomyBinding(
+        suite_registry_spec_path=spec_path,
+        suite_registry_spec_file_hash=spec_file_hash,
+        suite_registry_spec_identity=spec_identity,
+        active_suite_pointer_path=pointer_path,
+        active_suite_pointer_file_hash=pointer_file_hash,
+        active_suite_pointer_record_hash=pointer_record_hash,
+        active_suite_id=active_suite_id,
+        adaptive_policy_hash=adaptive_policy_hash,
+        adaptive_root=adaptive_root,
+    )
 
 
 def _validate_runtime_paths(paths: Mapping[str, Path]) -> None:
@@ -1144,6 +1467,10 @@ def _recoverable_rename(
 
 
 class PromotionController:
+    # Some read-only validator fixtures construct a controller without running
+    # __init__. Keep the optional v2 integration safely disabled in that case.
+    suite_registry: Optional[SuiteRotationRegistry] = None
+
     """Single-writer controller with injectable evaluation and process seams."""
 
     def __init__(
@@ -1174,6 +1501,7 @@ class PromotionController:
         self.disk_usage = disk_usage
         self.now = now or (lambda: datetime.now(timezone.utc))
         self.registry = EventRegistry(runtime.promotion_root)
+        self.suite_registry: Optional[SuiteRotationRegistry] = None
         self._writer_lock_depth = 0
         if held_controller_lock is not None:
             if (
@@ -1184,6 +1512,20 @@ class PromotionController:
                     "held_controller_lock must already own the configured lock path"
                 )
         self.held_controller_lock = held_controller_lock
+        if runtime.schema_version == 2 and runtime.autonomy is not None:
+            try:
+                self.suite_registry = SuiteRotationRegistry(
+                    runtime.autonomy.suite_registry_spec_path,
+                    clock=self.now,
+                )
+                self._validate_suite_runtime_binding()
+                self._validate_suite_champion_startup()
+            except SafetyHalt:
+                raise
+            except (OSError, ValueError, SuiteRotationError) as exc:
+                raise SafetyHalt(
+                    f"cannot initialize suite-registry data plane: {exc}"
+                ) from exc
 
     def _validate_gpu_handoff(self, proof: Any) -> Mapping[str, Any]:
         if not isinstance(proof, Mapping):
@@ -1264,6 +1606,674 @@ class PromotionController:
                 yield
             finally:
                 self._writer_lock_depth -= 1
+
+    @staticmethod
+    def _suite_evaluation_id(candidate_hash: str) -> str:
+        _hash(candidate_hash, "suite-registry evaluation candidate hash")
+        return f"promotion-candidate-{candidate_hash}"
+
+    def _validate_suite_runtime_binding(self) -> Optional[Any]:
+        """Revalidate the v2 pointer against this frozen data-plane runtime."""
+
+        if self.suite_registry is None:
+            return None
+        binding = self.runtime.autonomy
+        if self.runtime.schema_version != 2 or binding is None:
+            raise SafetyHalt("suite registry exists without a runtime-v2 binding")
+        try:
+            if (
+                binding.adaptive_policy_hash != ADAPTIVE_POLICY_HASH
+                or binding.adaptive_root
+                != self.runtime.promotion_root / "adaptive"
+                or self.suite_registry.spec.path
+                != binding.suite_registry_spec_path
+                or self.suite_registry.spec.file_sha256
+                != binding.suite_registry_spec_file_hash
+                or self.suite_registry.spec.identity
+                != binding.suite_registry_spec_identity
+                or self.suite_registry.active_path
+                != binding.active_suite_pointer_path
+                or sha256_file(binding.suite_registry_spec_path)
+                != binding.suite_registry_spec_file_hash
+            ):
+                raise SafetyHalt(
+                    "suite registry specification/adaptive binding diverges from runtime"
+                )
+            pointer_data = binding.active_suite_pointer_path.read_bytes()
+            if sha256_bytes(pointer_data) != binding.active_suite_pointer_file_hash:
+                raise SafetyHalt("active-suite pointer file hash diverges from runtime")
+            pointer = json.loads(pointer_data)
+            pointer = _strict_object(
+                pointer,
+                "active-suite pointer",
+                {
+                    "schema_version",
+                    "contract",
+                    "spec_sha256",
+                    "suite_id",
+                    "version_sha256",
+                    "manifest_path",
+                    "manifest_sha256",
+                    "manifest_identity",
+                    "activated_at_utc",
+                    "activation_champion_sha256",
+                    "activation_generation_id",
+                    "event_sequence",
+                    "event_sha256",
+                    "record_sha256",
+                },
+            )
+            if pointer_data != canonical_json_bytes(pointer) + b"\n":
+                raise SafetyHalt("active-suite pointer is not canonical")
+            payload = dict(pointer)
+            record_hash = payload.pop("record_sha256")
+            manifest_path = Path(pointer["manifest_path"])
+            if (
+                pointer["schema_version"] != 1
+                or pointer["contract"] != ACTIVE_SUITE_CONTRACT
+                or pointer["spec_sha256"]
+                != binding.suite_registry_spec_identity
+                or pointer["suite_id"] != binding.active_suite_id
+                or pointer["manifest_sha256"] != binding.active_suite_id
+                or record_hash != binding.active_suite_pointer_record_hash
+                or record_hash != canonical_sha256(payload)
+                or manifest_path
+                != self.runtime.suites / "manifest.json"
+                or manifest_path.is_symlink()
+                or not manifest_path.is_file()
+                or pointer["manifest_sha256"]
+                != self.runtime.controller.suite_manifest_hash
+                or sha256_file(manifest_path)
+                != self.runtime.controller.suite_manifest_hash
+            ):
+                raise SafetyHalt(
+                    "active-suite pointer diverges from frozen runtime suite"
+                )
+            state = self.suite_registry.reconstruct()
+            version = state.versions.get(binding.active_suite_id)
+            if (
+                state.active_suite_id != binding.active_suite_id
+                or version is None
+                or version.manifest_path != manifest_path
+                or version.manifest_sha256
+                != self.runtime.controller.suite_manifest_hash
+                or not self.suite_registry._projection_consistent(state)
+            ):
+                raise SafetyHalt(
+                    "suite registry state diverges from its bound active pointer"
+                )
+            return state
+        except SafetyHalt:
+            raise
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, SuiteRotationError) as exc:
+            raise SafetyHalt(f"cannot validate suite-registry data plane: {exc}") from exc
+
+    def _suite_champion_replayable(
+        self,
+        promotion_state: Any,
+        suite_state: Any,
+    ) -> bool:
+        if (
+            promotion_state.current_champion_hash is None
+            or promotion_state.current_generation_id is None
+            or suite_state.current_champion is None
+        ):
+            return False
+        generation = promotion_state.generations.get(
+            promotion_state.current_generation_id
+        )
+        transaction = (
+            self.runtime.promotion_root
+            / "transactions"
+            / str(promotion_state.current_generation_id)
+        )
+        try:
+            projected = load_champion(self.runtime.champion_path)
+            champion_cas = self._marker_payload(
+                transaction / "champion-cas.json"
+            )
+        except (OSError, RegistryCorruptionError, SafetyHalt):
+            return False
+        return bool(
+            generation is not None
+            and generation.state == GenerationState.ACTIVE
+            and generation.candidate_hash
+            == promotion_state.current_champion_hash
+            and suite_state.current_champion.sha256
+            == generation.previous_champion_hash
+            and champion_cas.get("champion_hash")
+            == generation.candidate_hash
+            and projected.champion_hash == generation.candidate_hash
+            and projected.generation_id == generation.generation_id
+        )
+
+    def _validate_suite_champion_startup(self) -> None:
+        if self.suite_registry is None:
+            return
+        promotion_state = self.registry.reconstruct()
+        if promotion_state.current_champion_hash is None:
+            return
+        suite_state = self._validate_suite_runtime_binding()
+        assert suite_state is not None
+        current = suite_state.current_champion
+        if (
+            current is not None
+            and current.sha256 == promotion_state.current_champion_hash
+            and current.generation_id == promotion_state.current_generation_id
+        ):
+            return
+        if self._suite_champion_replayable(promotion_state, suite_state):
+            return
+        if self._suite_champion_stale_after_rollback(
+            promotion_state,
+            suite_state,
+        ):
+            # The suite registry has no rollback event type. Permit startup
+            # only far enough for the controller-locked pin cleanup; the next
+            # automatic iteration still fails closed on this divergence.
+            return
+        raise SafetyHalt(
+            "suite registry champion is stale relative to promotion state"
+        )
+
+    def _suite_champion_stale_after_rollback(
+        self,
+        promotion_state: Any,
+        suite_state: Any,
+    ) -> bool:
+        current = suite_state.current_champion
+        if (
+            current is None
+            or promotion_state.current_champion_hash is None
+        ):
+            return False
+        try:
+            projection = load_champion(self.runtime.champion_path)
+        except (OSError, RegistryCorruptionError):
+            return False
+        return any(
+            generation.state == GenerationState.ROLLED_BACK
+            and generation.candidate_hash == current.sha256
+            and generation.generation_id == current.generation_id
+            and generation.previous_champion_hash
+            == promotion_state.current_champion_hash
+            and projection.champion_hash
+            == promotion_state.current_champion_hash
+            and projection.generation_id
+            == promotion_state.current_generation_id
+            and (
+                self._transaction_dir(generation.generation_id)
+                / "rollback-intent.json"
+            ).is_file()
+            for generation in promotion_state.generations.values()
+        )
+
+    def _record_suite_accepted_champion_locked(
+        self,
+        generation_id: str,
+        candidate_hash: str,
+        previous_champion_hash: str,
+    ) -> Optional[Any]:
+        if self.suite_registry is None:
+            return None
+        if self._writer_lock_depth <= 0:
+            raise SafetyHalt(
+                "suite accepted-champion publication requires controller lock"
+            )
+        state = self.registry.reconstruct()
+        generation = state.generations.get(generation_id)
+        transaction = self._transaction_dir(generation_id)
+        champion_cas = self._marker_payload(
+            transaction / "champion-cas.json"
+        )
+        if (
+            generation is None
+            or generation.state != GenerationState.ACTIVE
+            or generation.candidate_hash != candidate_hash
+            or generation.previous_champion_hash != previous_champion_hash
+            or state.current_champion_hash != candidate_hash
+            or state.current_generation_id != generation_id
+            or champion_cas.get("champion_hash") != candidate_hash
+        ):
+            raise SafetyHalt(
+                "suite champion event requires committed champion CAS/ACTIVE state"
+            )
+        champion = load_champion(self.runtime.champion_path)
+        if (
+            champion.champion_hash != candidate_hash
+            or champion.generation_id != generation_id
+        ):
+            raise SafetyHalt(
+                "suite champion event contradicts champion projection"
+            )
+        suite_state = self._validate_suite_runtime_binding()
+        assert suite_state is not None
+        current = suite_state.current_champion
+        if (
+            current is not None
+            and current.sha256 == candidate_hash
+            and current.generation_id == generation_id
+        ):
+            matches = [
+                event
+                for event in suite_state.events
+                if event.event_type == "champion.accepted"
+                and event.payload["generation_id"] == generation_id
+            ]
+            if len(matches) != 1:
+                raise SafetyHalt(
+                    "suite registry champion lacks one accepted event"
+                )
+            return matches[0]
+        if (
+            current is None
+            or current.sha256 != previous_champion_hash
+        ):
+            raise SafetyHalt(
+                "suite registry champion is stale before accepted promotion"
+            )
+        model_path = (
+            self._verify_generation_leaf(generation_id, candidate_hash)
+            / "model.bin.gz"
+        )
+        try:
+            event = self.suite_registry.record_accepted_champion(
+                model_path,
+                generation_id=generation_id,
+                expected_previous_champion_sha256=previous_champion_hash,
+            )
+        except (OSError, ValueError, SuiteRotationError) as exc:
+            raise SafetyHalt(
+                f"cannot record accepted champion in suite registry: {exc}"
+            ) from exc
+        self._checkpoint("promotion-suite-champion-accepted")
+        return event
+
+    def _ensure_suite_evaluation_pin_locked(
+        self,
+        candidate_hash: str,
+        expected_champion_hash: str,
+    ) -> Optional[Mapping[str, Any]]:
+        if self.suite_registry is None:
+            return None
+        if self._writer_lock_depth <= 0:
+            raise SafetyHalt("suite evaluation pin requires controller lock")
+        _hash(expected_champion_hash, "suite evaluation champion hash")
+        self._validate_suite_runtime_binding()
+        evaluation_id = self._suite_evaluation_id(candidate_hash)
+        try:
+            pin = self.suite_registry.pin_evaluation(
+                evaluation_id,
+                expected_active_suite_id=self.runtime.autonomy.active_suite_id,
+                expected_champion_sha256=expected_champion_hash,
+            )
+        except (OSError, ValueError, SuiteRotationError) as exc:
+            raise SafetyHalt(f"cannot pin suite evaluation: {exc}") from exc
+        if (
+            pin.get("evaluation_id") != evaluation_id
+            or pin.get("suite_id") != self.runtime.autonomy.active_suite_id
+            or pin.get("champion_sha256") != expected_champion_hash
+        ):
+            raise SafetyHalt("suite evaluation pin contradicts candidate identity")
+        return pin
+
+    def _unpin_suite_evaluation_locked(
+        self,
+        candidate_hash: str,
+    ) -> Optional[Any]:
+        if self.suite_registry is None:
+            return None
+        if self._writer_lock_depth <= 0:
+            raise SafetyHalt("suite evaluation unpin requires controller lock")
+        try:
+            return self.suite_registry.unpin_evaluation(
+                self._suite_evaluation_id(candidate_hash)
+            )
+        except (OSError, ValueError, SuiteRotationError) as exc:
+            raise SafetyHalt(f"cannot unpin suite evaluation: {exc}") from exc
+
+    def _deep_audit_pending(self, generation_id: str) -> bool:
+        queue = (
+            self.runtime.promotion_root
+            / "audits"
+            / "queue"
+            / f"{generation_id}.json"
+        )
+        report = (
+            self.runtime.promotion_root
+            / "audits"
+            / "reports"
+            / f"{generation_id}.json"
+        )
+        return queue.is_file() and not report.is_file()
+
+    def _reconcile_suite_pins_locked(self) -> None:
+        if self.suite_registry is None:
+            return
+        if self._writer_lock_depth <= 0:
+            raise SafetyHalt("suite pin reconciliation requires controller lock")
+        state = self.registry.reconstruct()
+        suite_state = self._validate_suite_runtime_binding()
+        assert suite_state is not None
+        evaluating = {
+            CandidateState.EVALUATING_INTEGRITY,
+            CandidateState.EVALUATING_SCREEN,
+            CandidateState.EVALUATING_FINALIST,
+            CandidateState.EVALUATING_CONFIRMATION,
+        }
+        terminal = {
+            CandidateState.SUPERSEDED,
+            CandidateState.REJECTED,
+            CandidateState.QUARANTINED,
+        }
+        for candidate in state.candidates.values():
+            evaluation_id = self._suite_evaluation_id(
+                candidate.candidate_hash
+            )
+            pinned = evaluation_id in suite_state.pins
+            if candidate.state in terminal:
+                if pinned:
+                    self._unpin_suite_evaluation_locked(
+                        candidate.candidate_hash
+                    )
+                    suite_state = self._validate_suite_runtime_binding()
+                    assert suite_state is not None
+                continue
+            if candidate.state in evaluating:
+                expected = candidate.tested_champion_hash
+                if expected is None:
+                    raise SafetyHalt(
+                        "evaluating candidate has no tested champion for suite pin"
+                    )
+                self._ensure_suite_evaluation_pin_locked(
+                    candidate.candidate_hash,
+                    expected,
+                )
+                suite_state = self._validate_suite_runtime_binding()
+                assert suite_state is not None
+                continue
+            if candidate.state != CandidateState.CONFIRMED:
+                # A pin can precede the first durable stage transition after a
+                # crash. Keep that CLAIMED pin for the retry.
+                continue
+            expected = candidate.tested_champion_hash
+            if expected is None:
+                raise SafetyHalt(
+                    "confirmed candidate has no tested champion for suite pin"
+                )
+            generation = (
+                state.generations.get(candidate.generation_id)
+                if candidate.generation_id is not None
+                else None
+            )
+            terminal_generation = generation is not None and generation.state in {
+                GenerationState.QUARANTINED,
+                GenerationState.ROLLED_BACK,
+            }
+            completed_active = bool(
+                generation is not None
+                and generation.state == GenerationState.ACTIVE
+                and (
+                    self._transaction_dir(generation.generation_id)
+                    / "complete.json"
+                ).is_file()
+                and not self._deep_audit_pending(generation.generation_id)
+            )
+            if terminal_generation or completed_active:
+                if pinned:
+                    self._unpin_suite_evaluation_locked(
+                        candidate.candidate_hash
+                    )
+                    suite_state = self._validate_suite_runtime_binding()
+                    assert suite_state is not None
+            else:
+                self._ensure_suite_evaluation_pin_locked(
+                    candidate.candidate_hash,
+                    expected,
+                )
+                suite_state = self._validate_suite_runtime_binding()
+                assert suite_state is not None
+
+    def _reconcile_suite_data_plane_locked(self) -> None:
+        if self.suite_registry is None:
+            return
+        if self._writer_lock_depth <= 0:
+            raise SafetyHalt(
+                "suite data-plane reconciliation requires controller lock"
+            )
+        promotion_state = self.registry.reconstruct()
+        suite_state = self._validate_suite_runtime_binding()
+        assert suite_state is not None
+        self._reconcile_suite_pins_locked()
+        promotion_state = self.registry.reconstruct()
+        suite_state = self._validate_suite_runtime_binding()
+        assert suite_state is not None
+        if promotion_state.current_champion_hash is not None:
+            current = suite_state.current_champion
+            if not (
+                current is not None
+                and current.sha256
+                == promotion_state.current_champion_hash
+                and current.generation_id
+                == promotion_state.current_generation_id
+            ):
+                if not self._suite_champion_replayable(
+                    promotion_state, suite_state
+                ):
+                    raise SafetyHalt(
+                        "suite registry champion is stale relative to promotion state"
+                    )
+                generation = promotion_state.generations[
+                    promotion_state.current_generation_id
+                ]
+                self._record_suite_accepted_champion_locked(
+                    generation.generation_id,
+                    generation.candidate_hash,
+                    generation.previous_champion_hash,
+                )
+        promotion_state = self.registry.reconstruct()
+        suite_state = self._validate_suite_runtime_binding()
+        assert suite_state is not None
+        if promotion_state.current_champion_hash is not None and (
+            suite_state.current_champion is None
+            or suite_state.current_champion.sha256
+            != promotion_state.current_champion_hash
+            or suite_state.current_champion.generation_id
+            != promotion_state.current_generation_id
+        ):
+            raise SafetyHalt(
+                "suite registry champion remains stale after reconciliation"
+            )
+
+    def _clean_boundary_blockers_locked(self) -> Tuple[str, ...]:
+        if self.suite_registry is None:
+            return ("suite-registry-disabled",)
+        if self._writer_lock_depth <= 0:
+            raise SafetyHalt("generation boundary check requires controller lock")
+        state = self.registry.reconstruct()
+        suite_state = self._validate_suite_runtime_binding()
+        assert suite_state is not None
+        blockers = set()
+        evaluating = {
+            CandidateState.EVALUATING_INTEGRITY,
+            CandidateState.EVALUATING_SCREEN,
+            CandidateState.EVALUATING_FINALIST,
+            CandidateState.EVALUATING_CONFIRMATION,
+        }
+        for candidate in state.candidates.values():
+            if candidate.state in evaluating:
+                blockers.add("evaluating-candidates")
+            elif candidate.state == CandidateState.CONFIRMED:
+                generation = (
+                    state.generations.get(candidate.generation_id)
+                    if candidate.generation_id is not None
+                    else None
+                )
+                if (
+                    generation is None
+                    or generation.state
+                    not in {
+                        GenerationState.ACTIVE,
+                        GenerationState.ROLLED_BACK,
+                        GenerationState.QUARANTINED,
+                    }
+                    or (
+                        generation.state == GenerationState.ACTIVE
+                        and not (
+                            self._transaction_dir(generation.generation_id)
+                            / "complete.json"
+                        ).is_file()
+                    )
+                ):
+                    blockers.add("confirmed-candidates")
+        if any(
+            generation.state
+            in {
+                GenerationState.PROMOTION_INTENT,
+                GenerationState.CANARY,
+                GenerationState.ROLLOUT,
+                GenerationState.ROLLBACK_PENDING,
+            }
+            for generation in state.generations.values()
+        ):
+            blockers.add("incomplete-promotions-or-rollbacks")
+        transaction_root = self.runtime.promotion_root / "transactions"
+        if transaction_root.exists():
+            for intent in transaction_root.glob("*/intent.json"):
+                generation = state.generations.get(intent.parent.name)
+                if (
+                    generation is not None
+                    and generation.state
+                    in {
+                        GenerationState.ROLLED_BACK,
+                        GenerationState.QUARANTINED,
+                    }
+                ):
+                    continue
+                if not (intent.parent / "complete.json").is_file():
+                    blockers.add("incomplete-promotions-or-rollbacks")
+            for rollback_intent in transaction_root.glob(
+                "*/rollback-intent.json"
+            ):
+                generation = state.generations.get(
+                    rollback_intent.parent.name
+                )
+                if (
+                    generation is None
+                    or generation.state != GenerationState.ROLLED_BACK
+                ):
+                    blockers.add("incomplete-promotions-or-rollbacks")
+        if self._audit_queue_status()["pendingDepth"]:
+            blockers.add("pending-deep-audits")
+        try:
+            self._training_gpu_lease_proof()
+        except SafetyHalt:
+            blockers.add("non-trainer-gpu-lease")
+        if suite_state.pins:
+            blockers.add("suite-pins")
+        return tuple(sorted(blockers))
+
+    def _publish_clean_generation_boundary_locked(self) -> Mapping[str, Any]:
+        """Publish one idempotent post-continuity boundary; never activate."""
+
+        if self.suite_registry is None:
+            return {"published": False, "blockers": ["suite-registry-disabled"]}
+        if self._writer_lock_depth <= 0:
+            raise SafetyHalt("generation boundary publication requires controller lock")
+        self._reconcile_suite_data_plane_locked()
+        blockers = self._clean_boundary_blockers_locked()
+        if blockers:
+            return {"published": False, "blockers": list(blockers)}
+        promotion_state = self.registry.reconstruct()
+        suite_state = self._validate_suite_runtime_binding()
+        assert suite_state is not None
+        current = suite_state.current_champion
+        if (
+            current is None
+            or promotion_state.current_champion_hash != current.sha256
+            or promotion_state.current_generation_id != current.generation_id
+        ):
+            raise SafetyHalt("generation boundary champion is stale")
+        relevant_registrations = {
+            suite_id: registration
+            for suite_id, registration in suite_state.registrations.items()
+            if (
+                registration["request_id"] in suite_state.requests
+                and suite_state.requests[registration["request_id"]][
+                    "base_suite_id"
+                ]
+                == suite_state.active_suite_id
+                and suite_state.requests[registration["request_id"]][
+                    "champion_sha256"
+                ]
+                == current.sha256
+            )
+        }
+        if not relevant_registrations:
+            return {
+                "published": False,
+                "blockers": ["continuity-not-ready"],
+            }
+        missing_continuity = sorted(
+            suite_id
+            for suite_id in relevant_registrations
+            if suite_id not in suite_state.continuity
+        )
+        if missing_continuity:
+            return {
+                "published": False,
+                "blockers": ["continuity-not-ready"],
+                "missingSuiteIds": missing_continuity,
+            }
+        latest_continuity_sequence = max(
+            suite_state.continuity[suite_id]["_sequence"]
+            for suite_id in relevant_registrations
+        )
+        existing = [
+            (boundary_id, boundary)
+            for boundary_id, boundary in suite_state.boundaries.items()
+            if (
+                boundary["champion_sha256"] == current.sha256
+                and boundary["generation_id"] == current.generation_id
+                and boundary["_sequence"] > latest_continuity_sequence
+            )
+        ]
+        if existing:
+            boundary_id, _ = max(
+                existing, key=lambda item: item[1]["_sequence"]
+            )
+            return {
+                "published": False,
+                "reused": True,
+                "boundaryId": boundary_id,
+                "blockers": [],
+            }
+        boundary_id = "promotion-boundary-" + canonical_sha256(
+            {
+                "spec_identity": self.runtime.autonomy.suite_registry_spec_identity,
+                "active_suite_id": suite_state.active_suite_id,
+                "champion_sha256": current.sha256,
+                "generation_id": current.generation_id,
+                "latest_continuity_sequence": latest_continuity_sequence,
+                "continuity_suite_ids": sorted(relevant_registrations),
+            }
+        )
+        try:
+            event = self.suite_registry.record_generation_boundary(
+                boundary_id,
+                generation_id=current.generation_id,
+                champion_sha256=current.sha256,
+            )
+        except (OSError, ValueError, SuiteRotationError) as exc:
+            raise SafetyHalt(
+                f"cannot publish clean generation boundary: {exc}"
+            ) from exc
+        return {
+            "published": True,
+            "boundaryId": boundary_id,
+            "eventHash": event.event_sha256,
+            "blockers": [],
+        }
 
     def _provenance(self, config_hash: str, schedule_hash: str) -> EventProvenance:
         config = self.runtime.controller
@@ -1704,6 +2714,8 @@ class PromotionController:
     def validate_static_inputs(self) -> None:
         """Verify every configured immutable policy/model/config/schedule hash."""
 
+        if self.suite_registry is not None:
+            self._validate_suite_runtime_binding()
         _validate_queue_contract(
             self.runtime.controller, self.runtime.frozen_policy
         )
@@ -3411,6 +4423,8 @@ class PromotionController:
         }
         if stage not in targets:
             raise ValueError(f"unknown evaluation stage: {stage}")
+        if self.suite_registry is not None:
+            self._validate_suite_runtime_binding()
         state = self.registry.reconstruct()
         candidate_record = state.candidates.get(candidate_hash)
         if candidate_record is None:
@@ -3421,13 +4435,18 @@ class PromotionController:
             else look
         )
         if (
-            stage == "confirmation"
-            and candidate_record.tested_champion_hash is not None
-            and candidate_record.state == CandidateState.EVALUATING_CONFIRMATION
+            candidate_record.tested_champion_hash is not None
+            and candidate_record.state
+            in {
+                CandidateState.EVALUATING_INTEGRITY,
+                CandidateState.EVALUATING_SCREEN,
+                CandidateState.EVALUATING_FINALIST,
+                CandidateState.EVALUATING_CONFIRMATION,
+            }
             and candidate_record.tested_champion_hash != state.current_champion_hash
         ):
             raise SafetyHalt(
-                "confirmation candidate was evaluated against a stale champion"
+                "candidate was evaluated against a stale champion"
             )
         artifact = inspect_candidate(Path(candidate_record.candidate_path))
         plan = self.build_evaluation_plan(
@@ -3440,6 +4459,20 @@ class PromotionController:
         )
         if self.recommendation_only:
             return {"decision": "RECOMMEND", "plan": plan.to_dict()}
+        if (
+            self.suite_registry is not None
+            and candidate_record.state != CandidateState.CLAIMED
+        ):
+            expected_pin_champion = candidate_record.tested_champion_hash
+            if expected_pin_champion is None:
+                raise SafetyHalt(
+                    "started candidate has no champion for suite pin"
+                )
+            with self._writer_lock():
+                self._ensure_suite_evaluation_pin_locked(
+                    candidate_hash,
+                    expected_pin_champion,
+                )
         if (
             stage == "confirmation"
             and candidate_record.state == CandidateState.CONFIRMED
@@ -3600,6 +4633,15 @@ class PromotionController:
             current = self.registry.reconstruct()
             if current.current_champion_hash != state.current_champion_hash:
                 raise SafetyHalt("champion changed before evaluation stage started")
+            if self.suite_registry is not None:
+                expected_pin_champion = (
+                    candidate_record.tested_champion_hash
+                    or state.current_champion_hash
+                )
+                self._ensure_suite_evaluation_pin_locked(
+                    candidate_hash,
+                    expected_pin_champion,
+                )
             provenance = self._provenance(plan.config_hash, plan.schedule_hash)
             transition_payload: Dict[str, Any] = {
                 "matrix": plan.to_dict(),
@@ -4118,6 +5160,14 @@ class PromotionController:
             actor=self.runtime.controller.actor,
             payload={"manifest_hash": candidate.directory_manifest_hash},
         )
+        if self.suite_registry is not None:
+            if self._writer_lock_depth > 0:
+                self._unpin_suite_evaluation_locked(candidate.model_hash)
+            else:
+                with self._writer_lock():
+                    self._unpin_suite_evaluation_locked(
+                        candidate.model_hash
+                    )
         _write_immutable_json(
             intent_path.with_name(intent_path.stem + ".complete.json"),
             {
@@ -4171,6 +5221,10 @@ class PromotionController:
                     reason=intent["reason"],
                     actor=self.runtime.controller.actor,
                     payload={"manifest_hash": artifact.directory_manifest_hash},
+                )
+            if self.suite_registry is not None:
+                self._unpin_suite_evaluation_locked(
+                    intent["candidate_hash"]
                 )
             _write_immutable_json(
                 complete,
@@ -5748,6 +6802,13 @@ class PromotionController:
                 "candidate_hash": candidate_hash,
                 "reasons": sorted(set(reasons)),
             }
+        if self.suite_registry is not None and self._writer_lock_depth <= 0:
+            with self._writer_lock():
+                return self.schedule_deep_audit(
+                    generation_id,
+                    candidate_hash,
+                    reasons=reasons,
+                )
         self._transaction_dir(generation_id)
         _hash(candidate_hash, "deep-audit candidate hash")
         normalized_reasons = sorted(
@@ -5766,6 +6827,11 @@ class PromotionController:
             or generation.state != GenerationState.ACTIVE
         ):
             raise SafetyHalt("deep audit requires the active generation")
+        if self.suite_registry is not None:
+            self._ensure_suite_evaluation_pin_locked(
+                candidate_hash,
+                generation.previous_champion_hash,
+            )
         activation = next(
             (
                 event
@@ -6464,6 +7530,12 @@ class PromotionController:
             / f"{generation_id}.json"
         )
         _write_immutable_json(destination, stored)
+        if self.suite_registry is not None:
+            if self._writer_lock_depth > 0:
+                self._reconcile_suite_pins_locked()
+            else:
+                with self._writer_lock():
+                    self._reconcile_suite_pins_locked()
         return destination
 
     def _deep_audit_rollbacks(self) -> Tuple[str, ...]:
@@ -6655,19 +7727,36 @@ class PromotionController:
                 if existing is not None
                 else f"generation-{candidate.candidate_hash[:20]}"
             )
-            kwargs = {
-                "pass_report_path": report_path,
-                "pass_report_hash": sha256_file(report_path),
-                "trainer_checkpoint_hash": sha256_file(
-                    self.runtime.trainer_checkpoint
-                ),
-                "data_watermark_hash": sha256_file(
-                    self.runtime.data_watermark_path
-                ),
-                "shuffle_watermark_hash": sha256_file(
-                    self.runtime.shuffle_watermark_path
-                ),
-            }
+            intent_path = self._transaction_dir(generation_id) / "intent.json"
+            if intent_path.exists():
+                intent = json.loads(intent_path.read_text(encoding="utf-8"))
+                if intent.get("candidate_hash") != candidate.candidate_hash:
+                    raise SafetyHalt(
+                        "existing promotion intent names a different candidate"
+                    )
+                kwargs = {
+                    "pass_report_path": Path(intent["pass_report_path"]),
+                    "pass_report_hash": intent["pass_report_hash"],
+                    "trainer_checkpoint_hash":
+                        intent["trainer_checkpoint_hash"],
+                    "data_watermark_hash": intent["data_watermark_hash"],
+                    "shuffle_watermark_hash":
+                        intent["shuffle_watermark_hash"],
+                }
+            else:
+                kwargs = {
+                    "pass_report_path": report_path,
+                    "pass_report_hash": sha256_file(report_path),
+                    "trainer_checkpoint_hash": sha256_file(
+                        self.runtime.trainer_checkpoint
+                    ),
+                    "data_watermark_hash": sha256_file(
+                        self.runtime.data_watermark_path
+                    ),
+                    "shuffle_watermark_hash": sha256_file(
+                        self.runtime.shuffle_watermark_path
+                    ),
+                }
             ingested = self._ingest_rollout_ipc()
             first = self.promote(
                 candidate.candidate_hash, generation_id, **kwargs
@@ -6702,6 +7791,7 @@ class PromotionController:
             )
         with self._writer_lock():
             self.ensure_layout()
+            self._reconcile_suite_data_plane_locked()
             self._require_disk()
             self._reconcile_unregistered_claims()
             self._reconcile_lifecycle_moves()
@@ -6717,6 +7807,12 @@ class PromotionController:
             }
         status["orchestration"] = list(self._orchestrate_active_queue())
         status["promotions"] = list(self._advance_confirmed_promotions())
+        if self.suite_registry is not None:
+            with self._writer_lock():
+                self._reconcile_suite_data_plane_locked()
+                status["suiteGenerationBoundary"] = (
+                    self._publish_clean_generation_boundary_locked()
+                )
         return status
 
     def run_reconcile(self) -> Mapping[str, Any]:
@@ -6725,14 +7821,19 @@ class PromotionController:
         self.validate_static_inputs()
         if self.recommendation_only:
             return self.reconcile(mutate=False)
+        if self.suite_registry is not None:
+            with self._writer_lock():
+                self._reconcile_suite_data_plane_locked()
         self._ingest_rollout_ipc()
         with self._writer_lock():
             self.ensure_layout()
+            self._reconcile_suite_data_plane_locked()
             self._require_disk()
             self._reconcile_unregistered_claims()
             self._reconcile_lifecycle_moves()
             self.reconcile_trash(mutate=True)
             pending = []
+            orphaned_adaptive = []
             rollback_pending = [
                 generation.generation_id
                 for generation in self.registry.reconstruct().generations.values()
@@ -6743,8 +7844,60 @@ class PromotionController:
             for path in sorted(transaction_root.glob("*/intent.json")):
                 if not (path.parent / "complete.json").exists():
                     pending.append(json.loads(path.read_text(encoding="utf-8")))
+            for path in sorted(
+                transaction_root.glob("*/training-handoff-intent.json")
+            ):
+                if not (path.parent / "intent.json").exists():
+                    orphaned_adaptive.append(self._marker_payload(path))
         for generation_id in sorted(set(rollback_pending + audit_rollbacks)):
             self.rollback(generation_id)
+        for marker in orphaned_adaptive:
+            candidate_hash = marker.get("candidate_model_sha256")
+            generation_id = marker.get("generation_id")
+            _hash(candidate_hash, "orphaned adaptive candidate hash")
+            self._transaction_dir(generation_id)
+            candidate = self.registry.reconstruct().candidates.get(
+                candidate_hash
+            )
+            if (
+                candidate is None
+                or candidate.state != CandidateState.CONFIRMED
+                or not candidate.evaluation_key
+            ):
+                raise SafetyHalt(
+                    "orphaned adaptive handoff has no confirmed candidate"
+                )
+            report_path = self._canonical_binding_path(
+                marker.get("pass_report_path"),
+                "orphaned adaptive PASS report",
+            )
+            report_hash = _hash(
+                marker.get("pass_report_sha256"),
+                "orphaned adaptive PASS report hash",
+            )
+            if (
+                not report_path.is_file()
+                or sha256_file(report_path) != report_hash
+            ):
+                raise SafetyHalt(
+                    "orphaned adaptive handoff PASS report changed"
+                )
+            watermark_hashes = marker.get("data_watermark_sha256s")
+            if not isinstance(watermark_hashes, Mapping):
+                raise SafetyHalt(
+                    "orphaned adaptive handoff has no pinned watermarks"
+                )
+            self.promote(
+                candidate_hash,
+                generation_id,
+                pass_report_path=report_path,
+                pass_report_hash=report_hash,
+                trainer_checkpoint_hash=marker[
+                    "parent_champion_checkpoint_sha256"
+                ],
+                data_watermark_hash=watermark_hashes["data"],
+                shuffle_watermark_hash=watermark_hashes["shuffle"],
+            )
         for intent in pending:
             generation = self.registry.reconstruct().generations.get(
                 intent["generation_id"]
@@ -6766,6 +7919,14 @@ class PromotionController:
                 data_watermark_hash=intent["data_watermark_hash"],
                 shuffle_watermark_hash=intent["shuffle_watermark_hash"],
             )
+        if self.suite_registry is not None:
+            with self._writer_lock():
+                self._reconcile_suite_data_plane_locked()
+                result = dict(self.reconcile(mutate=True))
+                result["suiteGenerationBoundary"] = (
+                    self._publish_clean_generation_boundary_locked()
+                )
+                return result
         return self.reconcile(mutate=True)
 
     def bootstrap(
@@ -6785,6 +7946,19 @@ class PromotionController:
         self.validate_static_inputs()
         with self._writer_lock():
             self.ensure_layout()
+            if self.suite_registry is not None:
+                suite_state = self._validate_suite_runtime_binding()
+                assert suite_state is not None
+                if (
+                    suite_state.current_champion is None
+                    or suite_state.current_champion.sha256
+                    != champion_hash
+                    or suite_state.current_champion.generation_id
+                    != generation_id
+                ):
+                    raise SafetyHalt(
+                        "promotion bootstrap champion is stale in suite registry"
+                    )
             provenance = self._provenance(
                 self.runtime.controller.powered_config_hash,
                 self.runtime.controller.discovery_schedule_hash,
@@ -6828,13 +8002,23 @@ class PromotionController:
             return
         _write_immutable_json(path, {"timestamp_utc": utc_timestamp(), **stable})
 
-    def _snapshot_checkpoint(self, generation_id: str, expected_hash: str) -> Path:
+    def _snapshot_checkpoint(
+        self,
+        generation_id: str,
+        expected_hash: str,
+        *,
+        allow_installed_replay: bool = False,
+    ) -> Path:
         source = self.runtime.trainer_checkpoint
+        root = self.runtime.rollback_quarantine / generation_id
+        destination = root / "trainer-checkpoint"
+        if allow_installed_replay and destination.exists():
+            if sha256_file(destination) != expected_hash:
+                raise SafetyHalt("rollback checkpoint snapshot contradicts intent")
+            return destination
         if sha256_file(source) != expected_hash:
             raise SafetyHalt("trainer checkpoint changed before promotion")
-        root = self.runtime.rollback_quarantine / generation_id
         root.mkdir(parents=True, exist_ok=True)
-        destination = root / "trainer-checkpoint"
         if destination.exists():
             if sha256_file(destination) != expected_hash:
                 raise SafetyHalt("rollback checkpoint snapshot contradicts intent")
@@ -6856,6 +8040,744 @@ class PromotionController:
             except FileNotFoundError:
                 pass
         return destination
+
+    @staticmethod
+    def _marker_payload(path: Path) -> Dict[str, Any]:
+        try:
+            data = path.read_bytes()
+            value = json.loads(data)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SafetyHalt(f"invalid durable marker {path}: {exc}") from exc
+        if (
+            not isinstance(value, dict)
+            or value.get("schema_version") != 1
+            or data != canonical_json_bytes(value) + b"\n"
+        ):
+            raise SafetyHalt(f"durable marker is not canonical: {path}")
+        payload = dict(value)
+        payload.pop("schema_version")
+        timestamp = payload.pop("timestamp_utc", None)
+        if not isinstance(timestamp, str) or not timestamp:
+            raise SafetyHalt(f"durable marker has no timestamp: {path}")
+        return payload
+
+    @staticmethod
+    def _canonical_binding_path(value: Any, role: str) -> Path:
+        if not isinstance(value, str) or not value:
+            raise SafetyHalt(f"{role} path is missing")
+        path = Path(value)
+        if not path.is_absolute() or str(path.absolute()) != value:
+            raise SafetyHalt(f"{role} path is not canonical and absolute")
+        return path
+
+    @staticmethod
+    def _stable_regular_file_hash(
+        path: Path,
+        role: str,
+        *,
+        expected_hash: Optional[str] = None,
+    ) -> str:
+        try:
+            before = path.lstat()
+            if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+                raise SafetyHalt(f"{role} is not a regular non-symlink file")
+            actual = sha256_file(path)
+            after = path.lstat()
+        except FileNotFoundError as exc:
+            raise SafetyHalt(f"{role} is missing: {path}") from exc
+        except OSError as exc:
+            raise SafetyHalt(f"cannot inspect {role} {path}: {exc}") from exc
+        before_identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        )
+        after_identity = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        )
+        if before_identity != after_identity:
+            raise SafetyHalt(f"{role} changed while it was hashed")
+        if expected_hash is not None and actual != expected_hash:
+            raise SafetyHalt(f"{role} hash contradicts its immutable binding")
+        return actual
+
+    def _adaptive_handoff_index(self, candidate_hash: str) -> Path:
+        return (
+            self.runtime.promotion_root
+            / "adaptive"
+            / "handoffs"
+            / "by-candidate"
+            / f"{candidate_hash}.json"
+        )
+
+    @staticmethod
+    def _recipe_binding_matches(
+        binding: Mapping[str, Any],
+        expected: Mapping[str, Any],
+    ) -> bool:
+        return all(binding.get(key) == value for key, value in expected.items())
+
+    def _load_adaptive_promotion_context(
+        self,
+        *,
+        transaction: Path,
+        existing_intent: Optional[Mapping[str, Any]],
+        artifact: CandidateArtifact,
+        candidate_hash: str,
+        generation_id: str,
+        tested_champion_hash: str,
+        pass_report_path: Path,
+        pass_report_hash: str,
+        trainer_checkpoint_hash: str,
+        data_watermark_hash: str,
+        shuffle_watermark_hash: str,
+    ) -> Optional[Mapping[str, Any]]:
+        """Validate and pin an optional adaptive handoff before promotion intent.
+
+        The adaptive index is consulted only for a transaction that has not yet
+        written its normal promotion intent. Once ``intent.json`` exists, that
+        immutable intent decides whether the transaction is adaptive, so a
+        handoff cannot be attached to an in-flight normal promotion.
+        """
+
+        marker_path = transaction / "training-handoff-intent.json"
+        pinned: Optional[Dict[str, Any]] = None
+        if existing_intent is not None:
+            raw = existing_intent.get("adaptive_training")
+            if raw is None:
+                if marker_path.exists():
+                    raise SafetyHalt(
+                        "normal promotion intent conflicts with adaptive marker"
+                    )
+                return None
+            if not isinstance(raw, Mapping):
+                raise SafetyHalt("adaptive promotion intent is malformed")
+            pinned = dict(raw)
+        elif marker_path.exists():
+            pinned = self._marker_payload(marker_path)
+
+        expected_handoff_path = self._adaptive_handoff_index(candidate_hash)
+        if pinned is None:
+            if expected_handoff_path.is_symlink():
+                raise SafetyHalt("adaptive handoff index must not be a symlink")
+            if not expected_handoff_path.exists():
+                return None
+            handoff_path = expected_handoff_path
+        else:
+            handoff_path = self._canonical_binding_path(
+                pinned.get("handoff_path"),
+                "adaptive handoff",
+            )
+            if handoff_path != expected_handoff_path:
+                raise SafetyHalt(
+                    "adaptive handoff is not at the candidate-indexed path"
+                )
+
+        try:
+            handoff = load_candidate_handoff(
+                handoff_path,
+                expected_candidate_sha256=candidate_hash,
+            )
+        except (AdaptiveTrainingError, FileNotFoundError, OSError) as exc:
+            raise SafetyHalt(f"adaptive candidate handoff is invalid: {exc}") from exc
+        handoff_file_hash = self._stable_regular_file_hash(
+            handoff_path,
+            "adaptive handoff",
+        )
+
+        candidate_binding = handoff.get("candidate")
+        checkpoint_binding = handoff.get("candidate_checkpoint")
+        parent_checkpoint = handoff.get("parent_champion_checkpoint")
+        parent_data = handoff.get("parent_admitted_data")
+        if any(
+            not isinstance(item, Mapping)
+            for item in (
+                candidate_binding,
+                checkpoint_binding,
+                parent_checkpoint,
+                parent_data,
+            )
+        ):
+            raise SafetyHalt("adaptive handoff bindings are incomplete")
+        assert isinstance(candidate_binding, Mapping)
+        assert isinstance(checkpoint_binding, Mapping)
+        assert isinstance(parent_checkpoint, Mapping)
+        assert isinstance(parent_data, Mapping)
+
+        candidate_path = self._canonical_binding_path(
+            candidate_binding.get("path"),
+            "adaptive candidate model",
+        )
+        if candidate_path.exists():
+            self._stable_regular_file_hash(
+                candidate_path,
+                "adaptive candidate model",
+                expected_hash=candidate_hash,
+            )
+        elif (
+            existing_intent is None
+            or candidate_path
+            != Path(existing_intent.get("source_path", ""))
+            / "model.bin.gz"
+        ):
+            raise SafetyHalt("adaptive candidate model path binding is missing")
+        else:
+            # The normal promotion transaction durably renames the candidate
+            # directory. After that rename, the pinned pre-intent path can be
+            # absent, but the accepted artifact still proves the same bytes.
+            self._stable_regular_file_hash(
+                artifact.path / "model.bin.gz",
+                "accepted adaptive candidate model",
+                expected_hash=candidate_hash,
+            )
+
+        resume_checkpoint_path = self._canonical_binding_path(
+            checkpoint_binding.get("path"),
+            "adaptive resumable checkpoint",
+        )
+        parent_checkpoint_path = self._canonical_binding_path(
+            parent_checkpoint.get("path"),
+            "adaptive parent champion checkpoint",
+        )
+        parent_data_path = self._canonical_binding_path(
+            parent_data.get("path"),
+            "adaptive parent admitted manifest",
+        )
+        recipe_path = self._canonical_binding_path(
+            handoff.get("recipe_path"),
+            "adaptive recipe",
+        )
+        live_checkpoint = self.runtime.trainer_checkpoint.absolute()
+        if resume_checkpoint_path == live_checkpoint:
+            raise SafetyHalt(
+                "adaptive resumable checkpoint must be immutable and distinct "
+                "from the live trainer checkpoint"
+            )
+        if parent_checkpoint_path == live_checkpoint:
+            raise SafetyHalt(
+                "adaptive parent checkpoint must be an immutable snapshot; "
+                "the live trainer checkpoint cannot survive replay validation"
+            )
+
+        resume_checkpoint_hash = _hash(
+            checkpoint_binding.get("sha256"),
+            "adaptive resumable checkpoint hash",
+        )
+        parent_checkpoint_hash = _hash(
+            parent_checkpoint.get("sha256"),
+            "adaptive parent champion checkpoint hash",
+        )
+        parent_data_hash = _hash(
+            parent_data.get("sha256"),
+            "adaptive parent admitted manifest hash",
+        )
+        recipe_hash = _hash(
+            handoff.get("recipe_sha256"),
+            "adaptive recipe hash",
+        )
+        parent_model_hash = _hash(
+            handoff.get("parent_champion_model_sha256"),
+            "adaptive parent champion model hash",
+        )
+        if parent_model_hash != tested_champion_hash:
+            raise SafetyHalt(
+                "adaptive handoff parent champion does not match the tested "
+                "current champion"
+            )
+        if handoff.get("policy_hash") != ADAPTIVE_POLICY_HASH:
+            raise SafetyHalt("adaptive handoff autonomy policy is not frozen")
+
+        previous_snapshot = transaction / "previous-champion.json"
+        try:
+            previous_champion = load_champion(
+                previous_snapshot
+                if previous_snapshot.exists()
+                else self.runtime.champion_path
+            )
+        except (OSError, RegistryCorruptionError) as exc:
+            raise SafetyHalt(
+                f"cannot validate adaptive parent champion record: {exc}"
+            ) from exc
+        if previous_champion.champion_hash != tested_champion_hash:
+            raise SafetyHalt(
+                "adaptive handoff parent champion is not the champion record "
+                "tested by confirmation"
+            )
+
+        active_recipe_path = (
+            self.runtime.promotion_root / "adaptive" / "active-recipe.json"
+        )
+        try:
+            active_recipe = load_recipe_binding(active_recipe_path)
+        except (AdaptiveTrainingError, FileNotFoundError, OSError) as exc:
+            raise SafetyHalt(
+                f"adaptive active recipe binding is missing or invalid: {exc}"
+            ) from exc
+
+        watermark_hashes = {
+            "data": data_watermark_hash,
+            "shuffle": shuffle_watermark_hash,
+        }
+        expected_record_hash = (
+            _hash(
+                pinned.get("active_recipe_record_sha256"),
+                "pinned active recipe record hash",
+            )
+            if pinned is not None
+            else active_recipe["record_sha256"]
+        )
+        parent_recipe_identity = {
+            "champion_model_sha256": parent_model_hash,
+            "champion_checkpoint_sha256": parent_checkpoint_hash,
+            "admitted_data_manifest_sha256": parent_data_hash,
+            "data_watermark_sha256s": watermark_hashes,
+            "generation_id": previous_champion.generation_id,
+        }
+        target_recipe_identity = {
+            "recipe_sha256": recipe_hash,
+            "recipe_path": str(recipe_path),
+            "champion_model_sha256": candidate_hash,
+            "champion_checkpoint_sha256": resume_checkpoint_hash,
+            "admitted_data_manifest_sha256": parent_data_hash,
+            "data_watermark_sha256s": watermark_hashes,
+            "generation_id": generation_id,
+        }
+        current_is_parent = (
+            active_recipe.get("record_sha256") == expected_record_hash
+            and self._recipe_binding_matches(
+                active_recipe,
+                parent_recipe_identity,
+            )
+        )
+        rollback_value = active_recipe.get("rollback")
+        current_is_target = (
+            self._recipe_binding_matches(
+                active_recipe,
+                target_recipe_identity,
+            )
+            and active_recipe.get("previous_record_sha256")
+            == expected_record_hash
+            and isinstance(rollback_value, Mapping)
+            and rollback_value.get("source_record_sha256")
+            == expected_record_hash
+        )
+        if not current_is_parent and not current_is_target:
+            raise SafetyHalt(
+                "adaptive active recipe does not match the pinned parent or "
+                "replayed candidate binding"
+            )
+        if pinned is None and not current_is_parent:
+            raise SafetyHalt(
+                "adaptive recipe was already activated without promotion intent"
+            )
+
+        metadata = {
+            "generation_id": generation_id,
+            "pass_report_path": str(Path(pass_report_path).absolute()),
+            "pass_report_sha256": pass_report_hash,
+            "handoff_id": handoff["handoff_id"],
+            "handoff_path": str(handoff_path),
+            "handoff_file_sha256": handoff_file_hash,
+            "handoff_manifest_sha256": handoff["manifest_sha256"],
+            "candidate_model_path": str(candidate_path),
+            "candidate_model_sha256": candidate_hash,
+            "resume_checkpoint_path": str(resume_checkpoint_path),
+            "resume_checkpoint_sha256": resume_checkpoint_hash,
+            "recipe_path": str(recipe_path),
+            "recipe_sha256": recipe_hash,
+            "parent_champion_model_sha256": parent_model_hash,
+            "parent_champion_checkpoint_path": str(parent_checkpoint_path),
+            "parent_champion_checkpoint_sha256": parent_checkpoint_hash,
+            "parent_admitted_manifest_path": str(parent_data_path),
+            "parent_admitted_manifest_sha256": parent_data_hash,
+            "autonomy_policy_sha256": ADAPTIVE_POLICY_HASH,
+            "active_recipe_path": str(active_recipe_path),
+            "active_recipe_record_sha256": expected_record_hash,
+            "previous_champion_generation_id": previous_champion.generation_id,
+            "previous_champion_record_sha256": previous_champion.record_hash,
+            "data_watermark_sha256s": watermark_hashes,
+        }
+        if pinned is not None and pinned != metadata:
+            raise SafetyHalt(
+                "adaptive handoff no longer matches its durable promotion intent"
+            )
+        return {
+            "handoff": handoff,
+            "metadata": metadata,
+            "active_recipe": active_recipe,
+        }
+
+    def _training_gpu_lease_proof(self) -> Mapping[str, Any]:
+        """Require a canonical trainer-only GPU lease before checkpoint mutation.
+
+        ``rollback/consumers-stop`` proves process quiescence, but it does not
+        own the GPU lease state machine. The controller therefore fails closed
+        unless the independently persisted lease is healthy and in its
+        trainer-only resting phase. In particular, an evaluator/leased phase
+        is never treated as safe merely because the stop command returned.
+        """
+
+        config_path = self.runtime.gpu_lease_config_path
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SafetyHalt(
+                f"cannot inspect GPU lease runtime for training handoff: {exc}"
+            ) from exc
+        paths = config.get("paths") if isinstance(config, Mapping) else None
+        if not isinstance(paths, Mapping):
+            raise SafetyHalt(
+                "GPU lease runtime cannot prove a lease-state path for "
+                "checkpoint replacement"
+            )
+        lease_path = self._canonical_binding_path(
+            paths.get("leaseState"),
+            "GPU lease state",
+        )
+        try:
+            before = lease_path.lstat()
+            if (
+                stat.S_ISLNK(before.st_mode)
+                or not stat.S_ISREG(before.st_mode)
+            ):
+                raise SafetyHalt(
+                    "GPU lease state is not a regular non-symlink file"
+                )
+            data = lease_path.read_bytes()
+            lease = json.loads(data)
+            after = lease_path.lstat()
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SafetyHalt(
+                f"cannot inspect GPU lease state for training handoff: {exc}"
+            ) from exc
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise SafetyHalt("GPU lease state changed while it was inspected")
+        if (
+            not isinstance(lease, dict)
+            or data != canonical_json_bytes(lease) + b"\n"
+        ):
+            raise SafetyHalt("GPU lease state is not canonical")
+        trainer_identity = lease.get("trainer")
+        if (
+            lease.get("schemaVersion") != 2
+            or not isinstance(lease.get("leaseId"), str)
+            or not lease["leaseId"]
+            or not isinstance(lease.get("ownerId"), str)
+            or not lease["ownerId"]
+            or lease.get("expectedGpuUuid")
+            != self.runtime.controller.expected_gpu_uuid
+            or lease.get("phase") != "trainer_running"
+            or lease.get("safetyHalt") is not False
+            or lease.get("safetyReason") not in {None, ""}
+            or lease.get("restorationStatus") == "safety_halt"
+            or lease.get("evaluators") != []
+            or not isinstance(trainer_identity, Mapping)
+            or type(trainer_identity.get("pid")) is not int
+            or trainer_identity["pid"] <= 0
+            or type(trainer_identity.get("startTimeTicks")) is not int
+            or trainer_identity["startTimeTicks"] < 0
+        ):
+            raise SafetyHalt(
+                "GPU lease does not prove healthy trainer-only ownership"
+            )
+        return {
+            "lease_state_path": str(lease_path),
+            "lease_state_sha256": sha256_bytes(data),
+            "lease_id": lease["leaseId"],
+            "owner_id": lease["ownerId"],
+            "phase": lease["phase"],
+            "safety_halt": False,
+            "non_trainer_owners": [],
+        }
+
+    def _atomic_install_checkpoint(
+        self,
+        source: Path,
+        *,
+        expected_hash: str,
+        expected_current_hash: Optional[str] = None,
+    ) -> None:
+        destination = self.runtime.trainer_checkpoint
+        self._stable_regular_file_hash(
+            source,
+            "adaptive resumable checkpoint",
+            expected_hash=expected_hash,
+        )
+        if destination.exists():
+            current_hash = sha256_file(destination)
+            if current_hash == expected_hash:
+                return
+            if (
+                expected_current_hash is not None
+                and current_hash != expected_current_hash
+            ):
+                raise SafetyHalt(
+                    "live trainer checkpoint contradicts adaptive handoff replay"
+                )
+        elif expected_current_hash is not None:
+            raise SafetyHalt("live trainer checkpoint disappeared before handoff")
+
+        descriptor, name = tempfile.mkstemp(
+            prefix=f".{destination.name}.adaptive.",
+            suffix=".tmp",
+            dir=str(destination.parent),
+        )
+        temporary = Path(name)
+        try:
+            with os.fdopen(descriptor, "wb") as output, source.open("rb") as input_file:
+                shutil.copyfileobj(input_file, output)
+                output.flush()
+                os.fsync(output.fileno())
+            if sha256_file(temporary) != expected_hash:
+                raise SafetyHalt("installed adaptive checkpoint hash mismatch")
+            self._stable_regular_file_hash(
+                source,
+                "adaptive resumable checkpoint",
+                expected_hash=expected_hash,
+            )
+            os.replace(temporary, destination)
+            fsync_directory(destination.parent)
+            if sha256_file(destination) != expected_hash:
+                raise SafetyHalt("adaptive checkpoint changed during installation")
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _restore_checkpoint_snapshot(
+        self,
+        generation_id: str,
+        expected_hash: str,
+    ) -> None:
+        snapshot = (
+            self.runtime.rollback_quarantine
+            / generation_id
+            / "trainer-checkpoint"
+        )
+        self._stable_regular_file_hash(
+            snapshot,
+            "rollback checkpoint snapshot",
+            expected_hash=expected_hash,
+        )
+        self._atomic_install_checkpoint(
+            snapshot,
+            expected_hash=expected_hash,
+        )
+
+    def _converge_adaptive_training_handoff(
+        self,
+        *,
+        transaction: Path,
+        generation_id: str,
+        candidate_hash: str,
+        intent: Mapping[str, Any],
+        context: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        metadata = context["metadata"]
+        if not isinstance(metadata, Mapping):
+            raise SafetyHalt("adaptive training context is malformed")
+        commit_path = transaction / "training-commit.json"
+        recipe_marker_path = transaction / "training-recipe-cas.json"
+        checkpoint_marker_path = transaction / "training-checkpoint-installed.json"
+        if commit_path.exists():
+            commit = self._marker_payload(commit_path)
+            if (
+                commit.get("candidate_hash") != candidate_hash
+                or commit.get("handoff_file_sha256")
+                != metadata["handoff_file_sha256"]
+                or commit.get("resume_checkpoint_sha256")
+                != metadata["resume_checkpoint_sha256"]
+                or not recipe_marker_path.exists()
+                or not checkpoint_marker_path.exists()
+            ):
+                raise SafetyHalt("adaptive training commit marker is inconsistent")
+            checkpoint_marker = self._marker_payload(checkpoint_marker_path)
+            if (
+                checkpoint_marker.get("checkpoint_sha256")
+                != metadata["resume_checkpoint_sha256"]
+                or checkpoint_marker.get("previous_checkpoint_sha256")
+                != intent["trainer_checkpoint_hash"]
+            ):
+                raise SafetyHalt(
+                    "adaptive training commit contradicts checkpoint journal"
+                )
+            recipe_marker = self._marker_payload(recipe_marker_path)
+            active_recipe = load_recipe_binding(
+                Path(metadata["active_recipe_path"])
+            )
+            if (
+                active_recipe["record_sha256"]
+                != recipe_marker.get("record_sha256")
+                or commit.get("recipe_record_sha256")
+                != active_recipe["record_sha256"]
+            ):
+                raise SafetyHalt(
+                    "adaptive training commit contradicts active recipe"
+                )
+            return active_recipe
+
+        stop_result = self.execute_argv(
+            "rollback",
+            {
+                "generation_id": metadata["previous_champion_generation_id"],
+                "model_hash": metadata["parent_champion_model_sha256"],
+            },
+        )
+        if (
+            not isinstance(stop_result, Mapping)
+            or stop_result.get("quiescent") is not True
+            or stop_result.get("quiescent_roles") != _ALL_ROLE_QUIESCENCE
+        ):
+            raise SafetyHalt(
+                "adaptive handoff stop command lacks exact all-role "
+                "quiescence proof"
+            )
+        lease_proof = self._training_gpu_lease_proof()
+        quiescence_path = transaction / "training-quiesced.json"
+        quiescence_payload = {
+            "generation_id": generation_id,
+            "candidate_hash": candidate_hash,
+            "stopped_generation_id":
+                metadata["previous_champion_generation_id"],
+            "stopped_model_sha256":
+                metadata["parent_champion_model_sha256"],
+            "quiescent": True,
+            "quiescent_roles": list(_ALL_ROLE_QUIESCENCE),
+            "gpu_lease": dict(lease_proof),
+        }
+        if quiescence_path.exists():
+            prior = self._marker_payload(quiescence_path)
+            if (
+                prior.get("generation_id") != generation_id
+                or prior.get("candidate_hash") != candidate_hash
+                or prior.get("stopped_generation_id")
+                != metadata["previous_champion_generation_id"]
+                or prior.get("stopped_model_sha256")
+                != metadata["parent_champion_model_sha256"]
+                or prior.get("quiescent") is not True
+                or prior.get("quiescent_roles") != _ALL_ROLE_QUIESCENCE
+                or not isinstance(prior.get("gpu_lease"), Mapping)
+            ):
+                raise SafetyHalt(
+                    "adaptive training quiescence marker is inconsistent"
+                )
+        else:
+            self._mark(
+                transaction,
+                "training-quiesced",
+                quiescence_payload,
+            )
+        self._checkpoint("promotion-training-quiesced")
+
+        self._snapshot_checkpoint(
+            generation_id,
+            intent["trainer_checkpoint_hash"],
+            allow_installed_replay=True,
+        )
+        resume_path = Path(metadata["resume_checkpoint_path"])
+        self._atomic_install_checkpoint(
+            resume_path,
+            expected_hash=metadata["resume_checkpoint_sha256"],
+            expected_current_hash=intent["trainer_checkpoint_hash"],
+        )
+        checkpoint_payload = {
+            "generation_id": generation_id,
+            "candidate_hash": candidate_hash,
+            "source_path": str(resume_path),
+            "destination_path": str(self.runtime.trainer_checkpoint),
+            "previous_checkpoint_sha256": intent["trainer_checkpoint_hash"],
+            "checkpoint_sha256": metadata["resume_checkpoint_sha256"],
+        }
+        if checkpoint_marker_path.exists():
+            if self._marker_payload(checkpoint_marker_path) != checkpoint_payload:
+                raise SafetyHalt(
+                    "adaptive checkpoint installation marker is inconsistent"
+                )
+        else:
+            self._mark(
+                transaction,
+                "training-checkpoint-installed",
+                checkpoint_payload,
+            )
+        self._checkpoint("promotion-training-checkpoint-installed")
+
+        active_recipe_path = Path(metadata["active_recipe_path"])
+        if recipe_marker_path.exists():
+            recipe_marker = self._marker_payload(recipe_marker_path)
+            active_recipe = load_recipe_binding(active_recipe_path)
+            if (
+                recipe_marker.get("generation_id") != generation_id
+                or recipe_marker.get("candidate_hash") != candidate_hash
+                or recipe_marker.get("previous_record_sha256")
+                != metadata["active_recipe_record_sha256"]
+                or active_recipe["record_sha256"]
+                != recipe_marker.get("record_sha256")
+                or not isinstance(recipe_marker.get("rollback"), Mapping)
+            ):
+                raise SafetyHalt("adaptive recipe CAS marker is inconsistent")
+        else:
+            try:
+                active_recipe = compare_and_swap_recipe_binding(
+                    active_recipe_path,
+                    expected_record_sha256=
+                        metadata["active_recipe_record_sha256"],
+                    recipe_sha256=metadata["recipe_sha256"],
+                    recipe_path=metadata["recipe_path"],
+                    champion_model_sha256=candidate_hash,
+                    champion_checkpoint_sha256=
+                        metadata["resume_checkpoint_sha256"],
+                    admitted_data_manifest_sha256=
+                        metadata["parent_admitted_manifest_sha256"],
+                    data_watermark_sha256s=
+                        metadata["data_watermark_sha256s"],
+                    generation_id=generation_id,
+                )
+            except (AdaptiveTrainingError, FileNotFoundError, OSError) as exc:
+                raise SafetyHalt(
+                    f"adaptive active recipe CAS failed: {exc}"
+                ) from exc
+            rollback_value = active_recipe.get("rollback")
+            if (
+                active_recipe.get("previous_record_sha256")
+                != metadata["active_recipe_record_sha256"]
+                or not isinstance(rollback_value, Mapping)
+                or rollback_value.get("source_record_sha256")
+                != metadata["active_recipe_record_sha256"]
+            ):
+                raise SafetyHalt(
+                    "adaptive active recipe CAS returned invalid lineage"
+                )
+            recipe_marker = {
+                "generation_id": generation_id,
+                "candidate_hash": candidate_hash,
+                "recipe_sha256": metadata["recipe_sha256"],
+                "previous_record_sha256":
+                    metadata["active_recipe_record_sha256"],
+                "record_sha256": active_recipe["record_sha256"],
+                "rollback": dict(rollback_value),
+            }
+            self._mark(
+                transaction,
+                "training-recipe-cas",
+                recipe_marker,
+            )
+        self._checkpoint("promotion-training-recipe-cas")
+        return active_recipe
 
     def _generation_leaf(
         self, generation_id: str, accepted: Path, candidate_hash: str
@@ -7686,6 +9608,7 @@ class PromotionController:
                     "report_hash": report_hash,
                 },
             )
+            self._unpin_suite_evaluation_locked(candidate_hash)
             return marker
 
     def _admit_canary(self, generation_id: str, candidate_hash: str) -> bool:
@@ -7859,6 +9782,8 @@ class PromotionController:
 
         if not self.automatic:
             raise SafetyHalt("promotion requires --automatic and mutationEnabled=true")
+        if self.suite_registry is not None:
+            self._validate_suite_runtime_binding()
         readiness_errors = self._promotion_readiness_errors()
         if readiness_errors:
             raise SafetyHalt(
@@ -7922,6 +9847,7 @@ class PromotionController:
             authoritative_shuffle_paths.append(str(path))
         with self._writer_lock():
             self.ensure_layout()
+            self._reconcile_suite_data_plane_locked()
             state = self.registry.reconstruct()
             candidate = state.candidates.get(candidate_hash)
             if candidate is None or candidate.state != CandidateState.CONFIRMED:
@@ -7973,7 +9899,6 @@ class PromotionController:
                 )
             provenance = self._provenance(report.config_hash, report.schedule_hash)
             transaction = self._transaction_dir(generation_id)
-            transaction.mkdir(parents=True, exist_ok=True)
             existing_intent = None
             if (transaction / "intent.json").exists():
                 existing_intent = json.loads(
@@ -7994,6 +9919,30 @@ class PromotionController:
             if artifact.model_hash != candidate_hash:
                 raise SafetyHalt("candidate files contradict registry identity")
             self._require_disk(artifact.size_bytes)
+            adaptive_context = self._load_adaptive_promotion_context(
+                transaction=transaction,
+                existing_intent=existing_intent,
+                artifact=artifact,
+                candidate_hash=candidate_hash,
+                generation_id=generation_id,
+                tested_champion_hash=report.tested_champion_hash,
+                pass_report_path=Path(pass_report_path),
+                pass_report_hash=pass_report_hash,
+                trainer_checkpoint_hash=trainer_checkpoint_hash,
+                data_watermark_hash=data_watermark_hash,
+                shuffle_watermark_hash=shuffle_watermark_hash,
+            )
+            transaction.mkdir(parents=True, exist_ok=True)
+            if adaptive_context is not None:
+                adaptive_metadata = adaptive_context["metadata"]
+                if not isinstance(adaptive_metadata, Mapping):
+                    raise SafetyHalt("adaptive handoff context is malformed")
+                self._mark(
+                    transaction,
+                    "training-handoff-intent",
+                    adaptive_metadata,
+                )
+                self._checkpoint("promotion-training-handoff-intent")
             intent = {
                 "schema_version": 1,
                 "generation_id": generation_id,
@@ -8023,17 +9972,39 @@ class PromotionController:
                 ),
                 "derived_shuffle_paths": authoritative_shuffle_paths,
             }
+            if adaptive_context is not None:
+                intent["adaptive_training"] = dict(
+                    adaptive_context["metadata"]
+                )
             _write_immutable_json(transaction / "intent.json", intent)
             if not (transaction / "previous-champion.json").exists():
                 _write_immutable_json(
                     transaction / "previous-champion.json",
                     load_champion(self.runtime.champion_path).to_dict(),
                 )
-            self._snapshot_checkpoint(generation_id, trainer_checkpoint_hash)
+            if adaptive_context is None:
+                self._snapshot_checkpoint(generation_id, trainer_checkpoint_hash)
             self._checkpoint("promotion-intent-written")
             if generation is not None and generation.state == GenerationState.ACTIVE:
                 if load_champion(self.runtime.champion_path).champion_hash != candidate_hash:
                     raise SafetyHalt("active generation contradicts champion projection")
+                if adaptive_context is not None:
+                    if not (transaction / "training-commit.json").exists():
+                        raise SafetyHalt(
+                            "active adaptive generation has no training commit"
+                        )
+                    self._converge_adaptive_training_handoff(
+                        transaction=transaction,
+                        generation_id=generation_id,
+                        candidate_hash=candidate_hash,
+                        intent=intent,
+                        context=adaptive_context,
+                    )
+                self._record_suite_accepted_champion_locked(
+                    generation_id,
+                    candidate_hash,
+                    report.tested_champion_hash,
+                )
                 acknowledged = self._acknowledged(
                     generation_id, candidate_hash
                 )
@@ -8051,6 +10022,7 @@ class PromotionController:
                     report_value,
                 )
                 self._mark(transaction, "complete", {"champion_hash": candidate_hash})
+                self._reconcile_suite_pins_locked()
                 return {
                     "status": "ACTIVE",
                     "generation_id": generation_id,
@@ -8077,6 +10049,25 @@ class PromotionController:
                 ("data-watermark", data_watermark_hash, "data-watermark"),
                 ("shuffle-watermark", shuffle_watermark_hash, "shuffle-watermark"),
             )
+            if adaptive_context is not None:
+                adaptive_metadata = adaptive_context["metadata"]
+                pins += (
+                    (
+                        "training-handoff",
+                        adaptive_metadata["handoff_file_sha256"],
+                        "adaptive-training-handoff",
+                    ),
+                    (
+                        "resume-checkpoint",
+                        adaptive_metadata["resume_checkpoint_sha256"],
+                        "adaptive-resume-checkpoint",
+                    ),
+                    (
+                        "training-recipe",
+                        adaptive_metadata["recipe_sha256"],
+                        "adaptive-training-recipe",
+                    ),
+                )
             for suffix, reference, kind in pins:
                 self.registry.pin_reference(
                     f"{generation_id}:{suffix}",
@@ -8205,6 +10196,15 @@ class PromotionController:
             if not required.issubset(acknowledged):
                 return {"status": "WAITING_ROLLOUT_ACK", "acknowledged": sorted(acknowledged)}
             self._checkpoint("promotion-all-workers-acknowledged")
+            activated_recipe = None
+            if adaptive_context is not None:
+                activated_recipe = self._converge_adaptive_training_handoff(
+                    transaction=transaction,
+                    generation_id=generation_id,
+                    candidate_hash=candidate_hash,
+                    intent=intent,
+                    context=adaptive_context,
+                )
             compare_and_swap_champion(
                 self.runtime.champion_path,
                 expected_champion_hash=report.tested_champion_hash,
@@ -8218,6 +10218,25 @@ class PromotionController:
             )
             self._mark(transaction, "champion-cas", {"champion_hash": candidate_hash})
             self._checkpoint("promotion-champion-cas")
+            if adaptive_context is not None:
+                assert isinstance(activated_recipe, Mapping)
+                adaptive_metadata = adaptive_context["metadata"]
+                self._mark(
+                    transaction,
+                    "training-commit",
+                    {
+                        "generation_id": generation_id,
+                        "candidate_hash": candidate_hash,
+                        "handoff_file_sha256":
+                            adaptive_metadata["handoff_file_sha256"],
+                        "resume_checkpoint_sha256":
+                            adaptive_metadata["resume_checkpoint_sha256"],
+                        "recipe_record_sha256":
+                            activated_recipe["record_sha256"],
+                        "champion_hash": candidate_hash,
+                    },
+                )
+                self._checkpoint("promotion-training-commit")
             generation = self.registry.reconstruct().generations[generation_id]
             if generation.state == GenerationState.ROLLOUT:
                 self.registry.transition_generation(
@@ -8235,6 +10254,11 @@ class PromotionController:
                     f"cannot commit activation from {generation.state.value}"
                 )
             self._checkpoint("promotion-active-event")
+            self._record_suite_accepted_champion_locked(
+                generation_id,
+                candidate_hash,
+                report.tested_champion_hash,
+            )
             if not self._commit_generation_data(generation_id, candidate_hash):
                 return {
                     "status": "WAITING_GENERATION_DATA",
@@ -8247,7 +10271,197 @@ class PromotionController:
                 report_value,
             )
             self._mark(transaction, "complete", {"champion_hash": candidate_hash})
+            self._reconcile_suite_pins_locked()
             return {"status": "ACTIVE", "generation_id": generation_id, "candidate_hash": candidate_hash}
+
+    def _adaptive_handoff_was_applied(
+        self,
+        transaction: Path,
+        intent: Mapping[str, Any],
+    ) -> bool:
+        metadata = intent.get("adaptive_training")
+        if not isinstance(metadata, Mapping):
+            return False
+        if any(
+            (transaction / name).exists()
+            for name in (
+                "training-checkpoint-installed.json",
+                "training-recipe-cas.json",
+                "training-commit.json",
+            )
+        ):
+            return True
+        snapshot = (
+            self.runtime.rollback_quarantine
+            / str(intent.get("generation_id"))
+            / "trainer-checkpoint"
+        )
+        resume_hash = metadata.get("resume_checkpoint_sha256")
+        return (
+            isinstance(resume_hash, str)
+            and _SHA_RE.fullmatch(resume_hash) is not None
+            and snapshot.is_file()
+            and self.runtime.trainer_checkpoint.is_file()
+            and sha256_file(self.runtime.trainer_checkpoint) == resume_hash
+        )
+
+    def _rollback_adaptive_recipe(
+        self,
+        transaction: Path,
+        intent: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        metadata = intent.get("adaptive_training")
+        if not isinstance(metadata, Mapping):
+            raise SafetyHalt("adaptive rollback has no pinned handoff metadata")
+        active_path = self._canonical_binding_path(
+            metadata.get("active_recipe_path"),
+            "adaptive active recipe",
+        )
+        expected_parent_record = _hash(
+            metadata.get("active_recipe_record_sha256"),
+            "adaptive parent recipe record hash",
+        )
+        try:
+            current = load_recipe_binding(active_path)
+        except (AdaptiveTrainingError, FileNotFoundError, OSError) as exc:
+            raise SafetyHalt(
+                f"cannot load adaptive recipe during rollback: {exc}"
+            ) from exc
+
+        rollback_marker_path = transaction / "training-recipe-rolled-back.json"
+        if rollback_marker_path.exists():
+            marker = self._marker_payload(rollback_marker_path)
+            if (
+                marker.get("restored_record_sha256")
+                != current["record_sha256"]
+                or marker.get("parent_record_sha256")
+                != expected_parent_record
+            ):
+                raise SafetyHalt(
+                    "adaptive recipe rollback marker contradicts active recipe"
+                )
+            return current
+
+        cas_marker_path = transaction / "training-recipe-cas.json"
+        if cas_marker_path.exists():
+            cas_marker = self._marker_payload(cas_marker_path)
+        elif current["record_sha256"] == expected_parent_record:
+            self._mark(
+                transaction,
+                "training-recipe-rolled-back",
+                {
+                    "generation_id": intent["generation_id"],
+                    "candidate_hash": intent["candidate_hash"],
+                    "parent_record_sha256": expected_parent_record,
+                    "activated_record_sha256": None,
+                    "restored_record_sha256": current["record_sha256"],
+                    "rollback_applied": False,
+                },
+            )
+            self._checkpoint("rollback-training-recipe-restored")
+            return current
+        else:
+            rollback_value = current.get("rollback")
+            target_identity = {
+                "recipe_sha256": metadata.get("recipe_sha256"),
+                "recipe_path": metadata.get("recipe_path"),
+                "champion_model_sha256": intent["candidate_hash"],
+                "champion_checkpoint_sha256":
+                    metadata.get("resume_checkpoint_sha256"),
+                "admitted_data_manifest_sha256":
+                    metadata.get("parent_admitted_manifest_sha256"),
+                "data_watermark_sha256s":
+                    metadata.get("data_watermark_sha256s"),
+                "generation_id": intent["generation_id"],
+            }
+            if (
+                not self._recipe_binding_matches(current, target_identity)
+                or current.get("previous_record_sha256")
+                != expected_parent_record
+                or not isinstance(rollback_value, Mapping)
+                or rollback_value.get("source_record_sha256")
+                != expected_parent_record
+            ):
+                raise SafetyHalt(
+                    "adaptive recipe state cannot be reconciled for rollback"
+                )
+            cas_marker = {
+                "generation_id": intent["generation_id"],
+                "candidate_hash": intent["candidate_hash"],
+                "recipe_sha256": metadata["recipe_sha256"],
+                "previous_record_sha256": expected_parent_record,
+                "record_sha256": current["record_sha256"],
+                "rollback": dict(rollback_value),
+            }
+            self._mark(
+                transaction,
+                "training-recipe-cas",
+                cas_marker,
+            )
+
+        activated_record = _hash(
+            cas_marker.get("record_sha256"),
+            "activated adaptive recipe record hash",
+        )
+        rollback_value = cas_marker.get("rollback")
+        if (
+            cas_marker.get("previous_record_sha256") != expected_parent_record
+            or not isinstance(rollback_value, Mapping)
+            or rollback_value.get("source_record_sha256")
+            != expected_parent_record
+        ):
+            raise SafetyHalt("adaptive recipe CAS rollback lineage is invalid")
+
+        if current["record_sha256"] == activated_record:
+            try:
+                restored = rollback_recipe_binding(
+                    active_path,
+                    expected_record_sha256=activated_record,
+                    rollback=rollback_value,
+                )
+            except (AdaptiveTrainingError, FileNotFoundError, OSError) as exc:
+                raise SafetyHalt(
+                    f"adaptive recipe rollback CAS failed: {exc}"
+                ) from exc
+        else:
+            restore_identity = {
+                "recipe_sha256": rollback_value.get("restore_recipe_sha256"),
+                "recipe_path": rollback_value.get("restore_recipe_path"),
+                "champion_model_sha256":
+                    rollback_value.get("restore_champion_model_sha256"),
+                "champion_checkpoint_sha256":
+                    rollback_value.get("restore_champion_checkpoint_sha256"),
+                "admitted_data_manifest_sha256":
+                    rollback_value.get(
+                        "restore_admitted_data_manifest_sha256"
+                    ),
+                "data_watermark_sha256s":
+                    rollback_value.get("restore_data_watermark_sha256s"),
+                "generation_id": rollback_value.get("restore_generation_id"),
+            }
+            if (
+                current.get("previous_record_sha256") != activated_record
+                or not self._recipe_binding_matches(current, restore_identity)
+            ):
+                raise SafetyHalt(
+                    "adaptive recipe rollback replay found a foreign binding"
+                )
+            restored = current
+
+        self._mark(
+            transaction,
+            "training-recipe-rolled-back",
+            {
+                "generation_id": intent["generation_id"],
+                "candidate_hash": intent["candidate_hash"],
+                "parent_record_sha256": expected_parent_record,
+                "activated_record_sha256": activated_record,
+                "restored_record_sha256": restored["record_sha256"],
+                "rollback_applied": True,
+            },
+        )
+        self._checkpoint("rollback-training-recipe-restored")
+        return restored
 
     def rollback(
         self,
@@ -8260,6 +10474,8 @@ class PromotionController:
 
         if not self.automatic:
             raise SafetyHalt("rollback requires automatic mutation mode")
+        if self.suite_registry is not None:
+            self._validate_suite_runtime_binding()
         with self._writer_lock():
             transaction = self._transaction_dir(generation_id)
             intent_path = transaction / "intent.json"
@@ -8325,11 +10541,33 @@ class PromotionController:
                     "rollback paths must come from the frozen promotion lineage"
                 )
             if generation.state == GenerationState.ROLLED_BACK:
+                self._unpin_suite_evaluation_locked(
+                    generation.candidate_hash
+                )
                 return {"status": "ROLLED_BACK", "generation_id": generation_id}
-            if generation.state not in {
+            adaptive_transaction = isinstance(
+                intent.get("adaptive_training"),
+                Mapping,
+            )
+            adaptive_applied = self._adaptive_handoff_was_applied(
+                transaction,
+                intent,
+            )
+            if (
+                adaptive_transaction
+                and generation.state == GenerationState.ACTIVE
+                and not adaptive_applied
+            ):
+                raise SafetyHalt(
+                    "active adaptive generation has no applied handoff journal"
+                )
+            allowed_states = {
                 GenerationState.ACTIVE,
                 GenerationState.ROLLBACK_PENDING,
-            }:
+            }
+            if adaptive_applied:
+                allowed_states.add(GenerationState.ROLLOUT)
+            if generation.state not in allowed_states:
                 raise SafetyHalt(
                     "historical or non-active rollback requires forensic flow"
                 )
@@ -8342,6 +10580,23 @@ class PromotionController:
                 raise SafetyHalt(
                     "rollback target is not the current generation/champion"
                 )
+            if generation.state == GenerationState.ROLLOUT:
+                champion_projection = load_champion(
+                    self.runtime.champion_path
+                ).champion_hash
+                if (
+                    state.current_champion_hash
+                    != generation.previous_champion_hash
+                    or champion_projection
+                    not in {
+                        generation.previous_champion_hash,
+                        generation.candidate_hash,
+                    }
+                ):
+                    raise SafetyHalt(
+                        "partially applied adaptive rollback has a foreign "
+                        "champion projection"
+                    )
             provenance = self._provenance(intent["config_hash"], intent["schedule_hash"])
             quarantine = self.runtime.rollback_quarantine / generation_id / "data"
             staged = self.runtime.rollout_quarantine / generation_id
@@ -8391,8 +10646,17 @@ class PromotionController:
                     "trainer_consumed": effective_trainer_consumed,
                     "moves": move_intents,
                 }
+                if adaptive_transaction:
+                    rollback_intent["adaptive_handoff_applied"] = adaptive_applied
                 _write_immutable_json(rollback_intent_path, rollback_intent)
-            if generation.state == GenerationState.ACTIVE:
+            if adaptive_transaction and (
+                rollback_intent.get("adaptive_handoff_applied")
+                is not adaptive_applied
+            ):
+                raise SafetyHalt(
+                    "adaptive rollback intent contradicts applied handoff state"
+                )
+            if generation.state != GenerationState.ROLLBACK_PENDING:
                 self.registry.transition_generation(
                     generation_id,
                     generation.candidate_hash,
@@ -8411,19 +10675,14 @@ class PromotionController:
                     "model_hash": generation.candidate_hash,
                 },
             )
-            required_roles = [
-                "selfplay",
-                "shuffler",
-                "trainer",
-                "exporter",
-                "evaluator",
-            ]
             if (
                 not isinstance(stop_result, Mapping)
                 or stop_result.get("quiescent") is not True
-                or stop_result.get("quiescent_roles") != required_roles
+                or stop_result.get("quiescent_roles") != _ALL_ROLE_QUIESCENCE
             ):
                 raise SafetyHalt("rollback stop command lacks all-role quiescence proof")
+            if adaptive_applied:
+                self._training_gpu_lease_proof()
             self._mark(
                 transaction,
                 "rollback-command",
@@ -8439,32 +10698,39 @@ class PromotionController:
                 )
             self._checkpoint("rollback-data-quarantined")
             effective_trainer_consumed = rollback_intent["trainer_consumed"]
-            if effective_trainer_consumed:
-                snapshot = self.runtime.rollback_quarantine / generation_id / "trainer-checkpoint"
+            if effective_trainer_consumed or adaptive_applied:
                 expected = intent["trainer_checkpoint_hash"]
-                if sha256_file(snapshot) != expected:
-                    raise SafetyHalt("rollback checkpoint snapshot is corrupt")
-                descriptor, name = tempfile.mkstemp(
-                    prefix=f".{self.runtime.trainer_checkpoint.name}.",
-                    suffix=".tmp",
-                    dir=str(self.runtime.trainer_checkpoint.parent),
+                self._restore_checkpoint_snapshot(
+                    generation_id,
+                    expected,
                 )
-                temporary = Path(name)
-                try:
-                    with os.fdopen(descriptor, "wb") as output, snapshot.open("rb") as input_file:
-                        shutil.copyfileobj(input_file, output)
-                        output.flush()
-                        os.fsync(output.fileno())
-                    if sha256_file(temporary) != expected:
-                        raise SafetyHalt("restored checkpoint hash mismatch")
-                    os.replace(temporary, self.runtime.trainer_checkpoint)
-                    fsync_directory(self.runtime.trainer_checkpoint.parent)
-                finally:
-                    try:
-                        temporary.unlink()
-                    except FileNotFoundError:
-                        pass
+                if adaptive_applied:
+                    adaptive_metadata = intent["adaptive_training"]
+                    self._mark(
+                        transaction,
+                        "training-checkpoint-rolled-back",
+                        {
+                            "generation_id": generation_id,
+                            "candidate_hash": generation.candidate_hash,
+                            "installed_checkpoint_sha256":
+                                adaptive_metadata[
+                                    "resume_checkpoint_sha256"
+                                ],
+                            "restored_checkpoint_sha256": expected,
+                            "destination_path":
+                                str(self.runtime.trainer_checkpoint),
+                        },
+                    )
                 self._checkpoint("rollback-checkpoint-restored")
+                if adaptive_applied:
+                    self._checkpoint(
+                        "rollback-training-checkpoint-restored"
+                    )
+            if adaptive_applied:
+                # Recipe rollback restores the prior metadata projection only.
+                # Watermark files may contain newer immutable lineage and are
+                # intentionally never byte-rewound by this transaction.
+                self._rollback_adaptive_recipe(transaction, intent)
             previous_snapshot = transaction / "previous-champion.json"
             if self.runtime.champion_path.exists():
                 champion = load_champion(self.runtime.champion_path)
@@ -8485,6 +10751,9 @@ class PromotionController:
                 restore_champion_hash=generation.previous_champion_hash,
                 reason="rollback filesystem transaction completed",
                 actor=self.runtime.controller.actor,
+            )
+            self._unpin_suite_evaluation_locked(
+                generation.candidate_hash
             )
             self._mark(
                 transaction,
