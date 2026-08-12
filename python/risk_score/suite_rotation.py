@@ -612,6 +612,7 @@ class RegistrySpec:
     policy_identity: str
     original: ModelBinding
     initial_champion: ModelBinding
+    curation_champion: ModelBinding
     holdout_quotas: Mapping[str, Mapping[str, int]]
     source_quotas: Mapping[str, int]
     raw: Mapping[str, Any]
@@ -689,9 +690,12 @@ def load_registry_spec(path: Path) -> RegistrySpec:
         ):
             raise ValueError("registry policy is not the frozen policy-v3 contract")
 
-        models = _require_exact_keys(
-            raw["models"], {"original", "initial_champion"}, "model bindings"
-        )
+        if not isinstance(raw["models"], Mapping) or set(raw["models"]) not in (
+            {"original", "initial_champion"},
+            {"original", "initial_champion", "curation_champion"},
+        ):
+            raise ValueError("model bindings fields differ from the schema")
+        models = raw["models"]
         original = _parse_model_binding(
             models["original"], "original model", "immutable_original", with_generation=False
         )
@@ -701,8 +705,23 @@ def load_registry_spec(path: Path) -> RegistrySpec:
             "frozen_champion",
             with_generation=True,
         )
+        curation_champion = (
+            champion
+            if "curation_champion" not in models
+            else _parse_model_binding(
+                models["curation_champion"],
+                "curation champion model",
+                "frozen_champion",
+                with_generation=False,
+            )
+        )
         if original.sha256 == champion.sha256 or original.path == champion.path:
             raise ValueError("original and initial champion must be distinct")
+        if (
+            original.sha256 == curation_champion.sha256
+            or original.path == curation_champion.path
+        ):
+            raise ValueError("original and curation champion must be distinct")
 
         cadence = _require_exact_keys(
             raw["cadence"],
@@ -780,6 +799,7 @@ def load_registry_spec(path: Path) -> RegistrySpec:
         policy_identity=policy_plan.policy_hash,
         original=original,
         initial_champion=champion,
+        curation_champion=curation_champion,
         holdout_quotas=MappingProxyType(
             {label: MappingProxyType(dict(quotas[label])) for label in LABELS}
         ),
@@ -796,6 +816,7 @@ def publish_registry_spec(
     original_model_path: Path,
     initial_champion_path: Path,
     initial_generation_id: str,
+    curation_champion_path: Optional[Path] = None,
     created_at_utc: Optional[str] = None,
 ) -> RegistrySpec:
     """Publish the one immutable registry specification."""
@@ -813,6 +834,11 @@ def publish_registry_spec(
             or existing.initial_champion.path
             != _absolute_file(initial_champion_path, "initial champion")
             or existing.initial_champion.generation_id != initial_generation_id
+            or existing.curation_champion.path
+            != _absolute_file(
+                curation_champion_path or initial_champion_path,
+                "curation champion",
+            )
         ):
             raise SuiteConflictError("existing registry specification conflicts")
         return existing
@@ -823,10 +849,20 @@ def publish_registry_spec(
         raise SuiteSpecError("promotion policy must satisfy policy-v3")
     original = _absolute_file(original_model_path, "original model")
     champion = _absolute_file(initial_champion_path, "initial champion")
+    curation_champion = _absolute_file(
+        curation_champion_path or initial_champion_path,
+        "curation champion",
+    )
     original_hash = file_sha256(original)
     champion_hash = file_sha256(champion)
+    curation_champion_hash = file_sha256(curation_champion)
     if original_hash == champion_hash or original == champion:
         raise SuiteSpecError("original and initial champion must be distinct")
+    if (
+        original_hash == curation_champion_hash
+        or original == curation_champion
+    ):
+        raise SuiteSpecError("original and curation champion must be distinct")
     generation_id = _require_id(initial_generation_id, "initial generation ID")
     created = (
         _format_utc(datetime.now(timezone.utc))
@@ -855,6 +891,11 @@ def publish_registry_spec(
                 champion_hash,
                 "frozen_champion",
                 generation_id=generation_id,
+            ),
+            "curation_champion": _model_value(
+                curation_champion,
+                curation_champion_hash,
+                "frozen_champion",
             ),
         },
         "cadence": {
@@ -1457,6 +1498,11 @@ class SuiteRotationRegistry:
                 self.spec.initial_champion.sha256,
                 "initial champion",
             ),
+            (
+                self.spec.curation_champion.path,
+                self.spec.curation_champion.sha256,
+                "curation champion",
+            ),
         )
         for path, expected_hash, role in frozen:
             if (
@@ -1821,7 +1867,8 @@ class SuiteRotationRegistry:
                     or champion.sha256 != self.spec.initial_champion.sha256
                     or champion.path != self.spec.initial_champion.path
                     or generation != self.spec.initial_champion.generation_id
-                    or version.champion_sha256 != champion.sha256
+                    or version.champion_sha256
+                    != self.spec.curation_champion.sha256
                     or _format_utc(
                         _parse_utc(payload["activated_at_utc"], "activation timestamp")
                     )
@@ -2104,7 +2151,7 @@ class SuiteRotationRegistry:
                 if (
                     first.event_type == "registry.bootstrapped"
                     and state.versions[state.active_suite_id].champion_sha256
-                    == self.spec.initial_champion.sha256
+                    == self.spec.curation_champion.sha256
                     and first.payload["previous_champion_sha256"]
                     == previous_champion_sha256
                 ):
@@ -2114,7 +2161,7 @@ class SuiteRotationRegistry:
             validated = validate_suite_manifest(
                 suite_manifest_path,
                 self.spec,
-                expected_champion_sha256=self.spec.initial_champion.sha256,
+                expected_champion_sha256=self.spec.curation_champion.sha256,
             )
             version = self._publish_suite(validated)
             self.failure_hook("suite-version-published")

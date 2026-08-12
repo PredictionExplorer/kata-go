@@ -460,6 +460,49 @@ def test_rotation_trigger_is_fifth_accepted_champion_or_ninety_days(
     assert age_due["cadence"]["reasons"] == ["maximum-age"]
 
 
+def test_bootstrap_separates_live_and_curation_champions(
+    registry_fixture,
+):
+    curation_champion = (
+        registry_fixture["tmp"] / "models" / "curation-champion.bin.gz"
+    )
+    curation_champion.write_bytes(b"curation-champion")
+    spec_path = registry_fixture["tmp"] / "separate-champions-spec.json"
+    spec = publish_registry_spec(
+        spec_path,
+        registry_root=registry_fixture["tmp"] / "separate-registry",
+        policy_path=registry_fixture["policy_path"],
+        original_model_path=registry_fixture["original"],
+        initial_champion_path=registry_fixture["champion"],
+        initial_generation_id="generation-live-initial",
+        curation_champion_path=curation_champion,
+        created_at_utc="2026-01-01T00:00:00.000000Z",
+    )
+    manifest = make_suite(
+        registry_fixture["tmp"] / "separate-suite",
+        spec,
+        file_sha256(curation_champion),
+        nonce=9,
+    )
+    registry = SuiteRotationRegistry(spec_path, clock=Clock())
+
+    registry.bootstrap(manifest)
+    state = registry.reconstruct()
+
+    assert state.current_champion.sha256 == file_sha256(
+        registry_fixture["champion"]
+    )
+    assert (
+        state.versions[state.active_suite_id].champion_sha256
+        == file_sha256(curation_champion)
+    )
+    pin = registry.pin_evaluation(
+        "initial-live-evaluation",
+        expected_champion_sha256=state.current_champion.sha256,
+    )
+    assert pin["champion_sha256"] == state.current_champion.sha256
+
+
 def test_suite_validation_rejects_non_consensus_provenance_and_semantic_overlap(
     registry_fixture,
 ):
