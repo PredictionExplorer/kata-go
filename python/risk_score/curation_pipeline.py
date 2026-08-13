@@ -414,7 +414,13 @@ def nvidia_smi_gpu_occupancy() -> GpuOccupancy:
 
 
 def production_target_is_inactive() -> bool:
-    """Conservatively prove the production training target is inactive."""
+    """Conservatively prove the production training target is not using GPUs.
+
+    The target is installed only when the closed-loop services are activated.
+    Before activation, systemd reports ``not-found`` (exit code 4), which is
+    equivalent to inactive for GPU ownership. Unexpected states still fail
+    closed.
+    """
 
     result = subprocess.run(
         ["systemctl", "is-active", "katago-risk-training.target"],
@@ -423,7 +429,9 @@ def production_target_is_inactive() -> bool:
         text=True,
         shell=False,
     )
-    return result.returncode == 3 and result.stdout.strip() == "inactive"
+    if result.returncode == 0:
+        return False
+    return result.stdout.strip() in {"inactive", "not-found", "unknown"}
 
 
 def gpu7_lease_is_trainer_safe(run_root: Path) -> bool:

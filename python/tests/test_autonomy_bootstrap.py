@@ -791,7 +791,8 @@ def test_root_bootstrap_unit_is_separate_and_hash_pinned(tmp_path):
     )
 
     unit = destination.read_text(encoding="utf-8")
-    assert f"Before={TARGET_UNIT}" in unit
+    assert f"Before={TARGET_UNIT}" not in unit
+    assert "synchronously restarts that target" in unit
     assert "PartOf=" not in unit
     assert "User=" not in unit
     assert "--expected-spec-sha256" in unit

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 
@@ -32,6 +33,7 @@ from risk_score.curation_pipeline import (
     infer_pipeline_snapshot,
     load_pipeline_spec,
     plan_next_stage,
+    production_target_is_inactive,
 )
 from risk_score.curation_supplement import SPEC_CONTRACT as SUPPLEMENT_SPEC_CONTRACT
 from risk_score.gpu_lease import ProcessIdentity
@@ -1377,6 +1379,43 @@ def test_gpu_ownership_requires_safe_lease_and_inactive_target(tmp_path):
     )
     with pytest.raises(PipelineContradiction, match="systemd target"):
         active_target._acquire_gpu_ownership(poll_interval=0)
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "expected"),
+    [
+        (0, "active\n", False),
+        (3, "inactive\n", True),
+        (4, "inactive\n", True),
+        (4, "not-found\n", True),
+        (4, "unknown\n", True),
+        (1, "activating\n", False),
+        (1, "failed\n", False),
+        (1, "\n", False),
+    ],
+)
+def test_production_target_probe_is_fail_closed(
+    monkeypatch, returncode, stdout, expected
+):
+    observed = {}
+
+    def run(argv, **kwargs):
+        observed["argv"] = argv
+        observed["kwargs"] = kwargs
+        return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr="")
+
+    monkeypatch.setattr("risk_score.curation_pipeline.subprocess.run", run)
+
+    assert production_target_is_inactive() is expected
+    assert observed == {
+        "argv": ["systemctl", "is-active", "katago-risk-training.target"],
+        "kwargs": {
+            "check": False,
+            "capture_output": True,
+            "text": True,
+            "shell": False,
+        },
+    }
 
 
 def test_global_gpu_lock_excludes_other_pipeline_instances(tmp_path):

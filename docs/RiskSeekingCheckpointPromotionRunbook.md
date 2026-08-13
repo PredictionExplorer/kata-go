@@ -349,8 +349,13 @@ coordinator publishes `blocked_insufficient_sources` before spending on full
 consensus.
 
 Benchmark per-GPU parallelism on a bounded pilot before using the example
-value. The manual commands below remain useful for diagnosis, but do not use
-detached SSH children as the production scheduler.
+value. Select the topology with the highest completed analysis rows per second
+on identical queries, not the topology with the highest CPU load or process
+count. A valid pilot records GPU utilization, VRAM, host RAM, OOM events,
+service restarts, and deterministic output hashes; 100% utilization alone is
+not evidence of maximum throughput. The manual commands below remain useful
+for diagnosis, but do not use detached SSH children as the production
+scheduler.
 
 ```bash
 ROLE=original/standard-2000

@@ -2104,6 +2104,9 @@ class CurationSupplement:
             if not callable(getattr(self.runners, name)):
                 raise ValueError(f"supplement runner {name!r} must be callable")
         self.layout = supplement_layout(self.spec)
+        self._frozen_input_validation_token: (
+            tuple[tuple[str, int, int, int, int, int, int], ...] | None
+        ) = None
         self.gpu_ownership = GpuOwnershipManager(
             claim_path=self.spec.run_root
             / "evaluation"
@@ -2118,15 +2121,68 @@ class CurationSupplement:
             probes=self.ownership_probes,
         )
 
-    def _assert_frozen_inputs(self) -> None:
-        if (
-            self.spec.path.is_symlink()
-            or not self.spec.path.is_file()
-            or file_sha256(self.spec.path) != self.spec.file_sha256
-        ):
-            raise SupplementContradiction(
-                "supplement specification changed during execution"
+    def _frozen_input_token(
+        self,
+    ) -> tuple[tuple[str, int, int, int, int, int, int], ...]:
+        model_directory = self.spec.selfplay_models_directory.path
+        if model_directory.is_symlink() or not model_directory.is_dir():
+            raise SupplementContradiction("self-play models directory changed")
+        paths = {self.spec.path, *(binding.path for binding in self.spec.frozen_files)}
+        try:
+            deployment = _load_json_object(
+                self.spec.deployment_manifest.path,
+                "deployment manifest",
             )
+        except (OSError, TypeError, ValueError) as exc:
+            raise SupplementContradiction(
+                "deployment manifest changed or became invalid"
+            ) from exc
+        deployment_files = deployment.get("files")
+        if not isinstance(deployment_files, Mapping):
+            raise SupplementContradiction(
+                "deployment manifest file inventory is malformed"
+            )
+        for role, record in deployment_files.items():
+            if (
+                not isinstance(role, str)
+                or not isinstance(record, Mapping)
+                or not isinstance(record.get("path"), str)
+            ):
+                raise SupplementContradiction(
+                    "deployment manifest file inventory is malformed"
+                )
+            paths.add(_canonical_path(record["path"], f"deployment file {role}"))
+        paths.update(model_directory.iterdir())
+        observed_paths = [model_directory, *sorted(paths, key=str)]
+        token = []
+        for path in observed_paths:
+            try:
+                observed = path.lstat()
+            except OSError as exc:
+                raise SupplementContradiction(
+                    f"frozen input changed: {path}"
+                ) from exc
+            is_directory = path == model_directory
+            if stat.S_ISLNK(observed.st_mode) or (
+                not stat.S_ISDIR(observed.st_mode)
+                if is_directory
+                else not stat.S_ISREG(observed.st_mode)
+            ):
+                raise SupplementContradiction(f"frozen input changed: {path}")
+            token.append(
+                (
+                    str(path),
+                    observed.st_mode,
+                    observed.st_dev,
+                    observed.st_ino,
+                    observed.st_size,
+                    observed.st_mtime_ns,
+                    observed.st_ctime_ns,
+                )
+            )
+        return tuple(token)
+
+    def _assert_frozen_inputs(self) -> None:
         for root, role in (
             (self.spec.run_root, "run root"),
             (self.spec.training_input_root, "training input root"),
@@ -2148,6 +2204,13 @@ class CurationSupplement:
             raise SupplementContradiction("deployment repository revision changed")
         if self.repository_status_reader(self.spec.deployment.repository_path):
             raise SupplementContradiction("deployment repository became dirty")
+        before = self._frozen_input_token()
+        if self._frozen_input_validation_token == before:
+            return
+        if file_sha256(self.spec.path) != self.spec.file_sha256:
+            raise SupplementContradiction(
+                "supplement specification changed during execution"
+            )
         _verify_deployment(
             self.spec.deployment_manifest,
             self.spec.deployment,
@@ -2181,6 +2244,10 @@ class CurationSupplement:
                 raise SupplementContradiction(
                     f"primary prefilter recomputation failed: {source.manifest.path}"
                 ) from exc
+        after = self._frozen_input_token()
+        if after != before:
+            raise SupplementContradiction("frozen inputs changed during validation")
+        self._frozen_input_validation_token = after
 
     def _validate_existing_status(self) -> None:
         if not _lexists(self.layout.status):

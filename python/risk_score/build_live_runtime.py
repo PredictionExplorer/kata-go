@@ -1046,6 +1046,8 @@ def build_live_runtime(
                 [
                     "[Unit]",
                     "Description=KataGo risk-training closed-loop services",
+                    "Conflicts=katago-risk-supplement-v3.service "
+                    "katago-risk-curation-pipeline-v3.service",
                     "Wants=" + " ".join(generated_unit_names),
                     "After=" + " ".join(generated_unit_names),
                     "",

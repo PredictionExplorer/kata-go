@@ -11340,6 +11340,7 @@ def _write_controller_status(
         "contract": "risk-score-controller-status-v1",
         "observed_at_utc": utc_timestamp(datetime.now(timezone.utc)),
         "controller_actor": runtime.controller.actor,
+        "controller_hash": runtime.controller.controller_hash,
         "source_revision_hash": runtime.controller.source_hash,
         "policy_hash": runtime.controller.policy_hash,
         "result": result,

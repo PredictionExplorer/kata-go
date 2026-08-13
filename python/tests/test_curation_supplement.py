@@ -203,6 +203,11 @@ def frozen_assets(tmp_path):
         capture_output=True,
         text=True,
     ).stdout.strip()
+    external_deployment_artifact = tmp_path / "external-deployment-artifact.bin"
+    external_deployment_artifact.write_bytes(b"bound-external-deployment-artifact")
+    files["external:deployment-artifact"] = binding(
+        external_deployment_artifact
+    )
     deployment = tmp_path / "deployment-manifest.json"
     deployment_value = {
         "schema_version": 1,
@@ -242,6 +247,7 @@ def frozen_assets(tmp_path):
         "original": original.resolve(),
         "champion": champion.resolve(),
         "policy": policy.resolve(),
+        "external_deployment_artifact": external_deployment_artifact.resolve(),
     }
 
 
@@ -322,6 +328,7 @@ def publish_spec(
     primary_per_label=1,
     targets=None,
     shards=1,
+    parallelism=1,
     game_count=3,
     round_number=1,
     prior_summaries=(),
@@ -383,7 +390,7 @@ def publish_spec(
             "shards_per_role": shards,
             "gpus": ["2", "5"],
             "selfplay_gpus": ["0", "1"],
-            "per_gpu_parallelism": 1,
+            "per_gpu_parallelism": parallelism,
         },
         "consensus_reserve_fraction": 1.0,
         "target_counts": targets or {"lead-40": 2, "lead-80": 2},
@@ -592,10 +599,12 @@ def test_production_command_and_gpu_topology_are_exact(tmp_path):
     spec_path, assets, _ = publish_spec(
         tmp_path,
         shards=2,
+        parallelism=24,
         game_count=7,
         override_args=(("-override-config", "maxMovesPerGame=1000"),),
     )
     spec = load_supplement_spec(spec_path)
+    assert spec.topology.per_gpu_parallelism == 24
     command = plan_selfplay_command(spec)
     assert command["argv"] == [
         str(assets["katago"]),
@@ -617,6 +626,66 @@ def test_production_command_and_gpu_topology_are_exact(tmp_path):
     assert plan_analysis_commands(spec)[0]["environment"] == {
         "CUDA_VISIBLE_DEVICES": "2"
     }
+
+
+def test_primary_prefilter_validation_is_cached_and_invalidated(
+    tmp_path, monkeypatch
+):
+    from risk_score import curation_supplement as supplement_module
+
+    spec_path, _, primary = publish_spec(tmp_path)
+    engine = coordinator(spec_path, FakeProcesses())
+    original = supplement_module.validate_prefilter_artifact
+    original_hash = supplement_module.file_sha256
+    calls = []
+    hash_calls = []
+
+    def validate(*args, **kwargs):
+        calls.append(args[0])
+        return original(*args, **kwargs)
+
+    def hash_file(path):
+        hash_calls.append(Path(path))
+        return original_hash(path)
+
+    monkeypatch.setattr(supplement_module, "validate_prefilter_artifact", validate)
+    monkeypatch.setattr(supplement_module, "file_sha256", hash_file)
+
+    engine._assert_frozen_inputs()
+    first_count = len(calls)
+    first_hash_count = len(hash_calls)
+    engine._assert_frozen_inputs()
+    assert first_count == len(primary)
+    assert len(calls) == first_count
+    assert first_hash_count > 0
+    assert len(hash_calls) == first_hash_count
+
+    manifest = json.loads(Path(primary[0]["path"]).read_text(encoding="utf-8"))
+    analysis = Path(manifest["analyses"][PREFILTER_ROLES[0]]["path"])
+    analysis.write_bytes(analysis.read_bytes())
+    engine._assert_frozen_inputs()
+    assert len(calls) == first_count * 2
+    assert len(hash_calls) > first_hash_count
+
+    analysis.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(
+        SupplementContradiction,
+        match="frozen input changed|primary prefilter recomputation failed",
+    ):
+        engine._assert_frozen_inputs()
+
+
+def test_frozen_input_cache_tracks_transitive_deployment_files(tmp_path):
+    spec_path, assets, _ = publish_spec(tmp_path)
+    engine = coordinator(spec_path, FakeProcesses())
+    engine._assert_frozen_inputs()
+    engine._assert_frozen_inputs()
+
+    artifact = assets["external_deployment_artifact"]
+    artifact.write_bytes(b"x" * artifact.stat().st_size)
+
+    with pytest.raises(SupplementContradiction):
+        engine._assert_frozen_inputs()
 
 
 def test_noop_is_read_only_until_canonical_summary(tmp_path):

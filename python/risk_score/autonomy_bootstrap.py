@@ -1752,6 +1752,33 @@ class AutonomyBootstrap:
             for part in self.spec.runtime.argv
         )
 
+    def _make_runtime_service_readable(self) -> None:
+        root = self.spec.runtime.output_dir
+        if root.is_symlink() or not root.is_dir():
+            raise BootstrapError("generated runtime root is missing or unsafe")
+        for current_text, directory_names, file_names in os.walk(
+            root,
+            topdown=True,
+            followlinks=False,
+        ):
+            current = Path(current_text)
+            if current.is_symlink():
+                raise BootstrapError("generated runtime contains a symlinked directory")
+            os.chmod(current, 0o755)
+            for name in directory_names:
+                child = current / name
+                if child.is_symlink() or not child.is_dir():
+                    raise BootstrapError(
+                        f"generated runtime directory is unsafe: {child}"
+                    )
+            for name in file_names:
+                child = current / name
+                if child.is_symlink() or not child.is_file():
+                    raise BootstrapError(
+                        f"generated runtime file is unsafe: {child}"
+                    )
+                os.chmod(child, 0o644)
+
     def _prepare_runtime(self, selected: int) -> Mapping[str, Any]:
         self._current_stage = "mutation-enabled-runtime"
         if self.runtime_receipt_path.exists() or self.runtime_receipt_path.is_symlink():
@@ -1764,6 +1791,7 @@ class AutonomyBootstrap:
                 raise BootstrapError(
                     "runtime builder stdout does not match generated artifact hashes"
                 )
+        self._make_runtime_service_readable()
         receipt = self._expected_runtime_receipt(selected)
         atomic_write_json(self.runtime_receipt_path, receipt)
         self._checkpoint("after-runtime-receipt")
@@ -2205,7 +2233,8 @@ def render_bootstrap_systemd_unit(
             "Description=KataGo hash-bound autonomy bootstrap",
             "Wants=network-online.target",
             "After=network-online.target",
-            f"Before={TARGET_UNIT}",
+            "# Do not order this unit before the runtime target: the final",
+            "# activation command synchronously restarts that target.",
             "RequiresMountsFor=" + _systemd_quote(str(root)),
             "StartLimitIntervalSec=600",
             "StartLimitBurst=3",

@@ -52,8 +52,13 @@ def _assert_durable_systemd_runtime(result, services):
     target_lines = target_unit.splitlines()
     wants = next(line for line in target_lines if line.startswith("Wants="))
     after = next(line for line in target_lines if line.startswith("After="))
+    conflicts = next(line for line in target_lines if line.startswith("Conflicts="))
     assert set(wants.removeprefix("Wants=").split()) == expected_units
     assert set(after.removeprefix("After=").split()) == expected_units
+    assert set(conflicts.removeprefix("Conflicts=").split()) == {
+        "katago-risk-supplement-v3.service",
+        "katago-risk-curation-pipeline-v3.service",
+    }
 
     deployment = json.loads(
         Path(result["deployment_manifest"]).read_text(encoding="utf-8")
