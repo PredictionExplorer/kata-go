@@ -1412,6 +1412,23 @@ def test_service_ownership_handoff_targets_control_state_not_immutable_inputs(
     assert promotion not in mutable_directories
     assert events in mutable_directories
     assert Path(spec.publisher_config["scheduler_directory"]) in mutable_directories
+    assert {
+        promotion / "supervisor",
+        promotion / "evaluations",
+        promotion / "reports",
+        promotion / "candidates" / "quarantined",
+        promotion / "candidates" / "superseded",
+        promotion / "candidates" / "rejected",
+        promotion / "candidates" / "deduplicated",
+        promotion / "accepted",
+        promotion / "rollouts",
+        promotion / "rollback",
+        promotion / "watermarks",
+        promotion / "ipc" / "worker-acks",
+        promotion / "ipc" / "rollout-reports",
+        promotion / "operations",
+        promotion / "provenance" / "trainer",
+    }.issubset(set(mutable_directories))
     assert lock in mutable_files
     assert spec.state_root not in mutable_directories
     assert spec.bootstrap_state_root not in mutable_directories

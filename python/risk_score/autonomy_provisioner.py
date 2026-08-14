@@ -2215,7 +2215,22 @@ def _prepare_service_ownership(spec: ProvisionerSpec) -> None:
         Path(spec.publisher_config["suite_rotation"]["registry_root"]),
         Path(spec.publisher_config["suite_rotation"]["root"]),
         Path(spec.publisher_config["promotion_drill"]["disposable_root"]),
+        spec.run_root / "promotion" / "supervisor",
         spec.run_root / "promotion" / "events",
+        spec.run_root / "promotion" / "evaluations",
+        spec.run_root / "promotion" / "reports",
+        spec.run_root / "promotion" / "candidates" / "quarantined",
+        spec.run_root / "promotion" / "candidates" / "superseded",
+        spec.run_root / "promotion" / "candidates" / "rejected",
+        spec.run_root / "promotion" / "candidates" / "deduplicated",
+        spec.run_root / "promotion" / "accepted",
+        spec.run_root / "promotion" / "rollouts",
+        spec.run_root / "promotion" / "rollback",
+        spec.run_root / "promotion" / "watermarks",
+        spec.run_root / "promotion" / "ipc" / "worker-acks",
+        spec.run_root / "promotion" / "ipc" / "rollout-reports",
+        spec.run_root / "promotion" / "operations",
+        spec.run_root / "promotion" / "provenance" / "trainer",
     }
     promotion_root = spec.run_root / "promotion"
     if promotion_root.is_symlink() or not promotion_root.is_dir():
