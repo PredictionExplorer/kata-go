@@ -1468,6 +1468,17 @@ def _systemd_quote(value: str) -> str:
     )
 
 
+def _systemd_path_value(value: Path) -> str:
+    text = str(value)
+    if not text.startswith("/") or any(
+        character.isspace() or character in {'"', "'", "\\"} for character in text
+    ):
+        raise BootstrapSpecPublicationError(
+            "systemd directive path is not safely representable"
+        )
+    return text.replace("%", "%%")
+
+
 def render_bootstrap_path_unit(*, suite_manifest: Path) -> str:
     """Render the suite-publication trigger, independent of the runtime target."""
 
@@ -1483,7 +1494,7 @@ def render_bootstrap_path_unit(*, suite_manifest: Path) -> str:
             "# Existence wakes the service; the readiness gate validates authority.",
             "",
             "[Path]",
-            "PathExists=" + _systemd_quote(str(manifest)),
+            "PathExists=" + _systemd_path_value(manifest),
             f"Unit={BOOTSTRAP_UNIT_NAME}",
             "",
             "[Install]",

@@ -394,6 +394,15 @@ def _systemd_quote(value: str) -> str:
     )
 
 
+def _systemd_path_value(value: Path) -> str:
+    text = str(value)
+    if not text.startswith("/") or any(
+        character.isspace() or character in {'"', "'", "\\"} for character in text
+    ):
+        raise HostCommandError("systemd directive path is not safely representable")
+    return text.replace("%", "%%")
+
+
 def _systemd_service(
     *,
     description: str,
@@ -446,7 +455,7 @@ def _systemd_service(
         "Wants=network-online.target",
         "PartOf=katago-risk-training.target",
         "After=" + " ".join(unit_after),
-        "RequiresMountsFor=" + _systemd_quote(str(run_root)),
+        "RequiresMountsFor=" + _systemd_path_value(run_root),
         "StartLimitIntervalSec=300",
         "StartLimitBurst=3",
     ]
@@ -460,7 +469,7 @@ def _systemd_service(
             "[Service]",
             f"Type={service_type}",
             f"User={service_user}",
-            "WorkingDirectory=" + _systemd_quote(str(working_directory)),
+            "WorkingDirectory=" + _systemd_path_value(working_directory),
             "Environment=" + _systemd_quote(f"PYTHONPATH={working_directory}"),
         ]
     )

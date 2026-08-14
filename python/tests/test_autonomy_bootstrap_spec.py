@@ -546,7 +546,7 @@ def test_missing_suite_materializes_wait_safe_spec_and_independent_path_unit(tmp
     assert "PartOf=" not in service
 
     path_unit = fixture["path_unit"].read_text(encoding="utf-8")
-    assert f'PathExists="{fixture["suite_manifest"]}"' in path_unit
+    assert f'PathExists={fixture["suite_manifest"]}' in path_unit
     assert f"Unit={autonomy_bootstrap.BOOTSTRAP_UNIT_NAME}" in path_unit
     assert "katago-risk-training.target" not in path_unit
     assert "WantedBy=multi-user.target" in path_unit

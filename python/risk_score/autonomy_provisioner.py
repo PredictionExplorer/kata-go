@@ -1450,6 +1450,15 @@ def _systemd_quote(value: str) -> str:
     )
 
 
+def _systemd_path_value(value: Path) -> str:
+    text = str(value)
+    if not text.startswith("/") or any(
+        character.isspace() or character in {'"', "'", "\\"} for character in text
+    ):
+        raise ProvisionerSpecError("systemd directive path is not safely representable")
+    return text.replace("%", "%%")
+
+
 def render_prepare_service_unit(spec: ProvisionerSpec | Path) -> str:
     loaded = spec if isinstance(spec, ProvisionerSpec) else ProvisionerSpec.load(spec)
     python = loaded.immutable_inputs["python_executable"].path
@@ -1470,14 +1479,14 @@ def render_prepare_service_unit(spec: ProvisionerSpec | Path) -> str:
             "Description=Prepare KataGo revision-bound autonomy bootstrap",
             "Wants=network-online.target",
             "After=network-online.target",
-            "RequiresMountsFor=" + _systemd_quote(str(loaded.run_root)),
+            "RequiresMountsFor=" + _systemd_path_value(loaded.run_root),
             "# Retry indefinitely: suite and final curation status may arrive",
             "# in either order and path events are not a bounded retry budget.",
             "StartLimitIntervalSec=0",
             "",
             "[Service]",
             "Type=oneshot",
-            "WorkingDirectory=" + _systemd_quote(str(loaded.repository / "python")),
+            "WorkingDirectory=" + _systemd_path_value(loaded.repository / "python"),
             "Environment="
             + _systemd_quote(f"PYTHONPATH={loaded.repository / 'python'}"),
             "ExecStart=" + " ".join(_systemd_quote(part) for part in argv),
@@ -1509,10 +1518,10 @@ def render_prepare_path_unit(spec: ProvisionerSpec | Path) -> str:
             "# Existence wakes the service; the provisioner validates authority.",
             "",
             "[Path]",
-            "PathChanged=" + _systemd_quote(str(loaded.suite_manifest.path.parent)),
-            "PathChanged=" + _systemd_quote(str(loaded.curation_status.path.parent)),
-            "PathExists=" + _systemd_quote(str(loaded.suite_manifest.path)),
-            "PathExists=" + _systemd_quote(str(loaded.curation_status.path)),
+            "PathChanged=" + _systemd_path_value(loaded.suite_manifest.path.parent),
+            "PathChanged=" + _systemd_path_value(loaded.curation_status.path.parent),
+            "PathExists=" + _systemd_path_value(loaded.suite_manifest.path),
+            "PathExists=" + _systemd_path_value(loaded.curation_status.path),
             f"Unit={PREPARE_SERVICE_UNIT_NAME}",
             "",
             "[Install]",

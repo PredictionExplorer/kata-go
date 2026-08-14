@@ -845,6 +845,11 @@ def test_missing_suite_publishes_wait_without_downstream_artifacts(tmp_path):
     assert "--apply" in service
     assert "PartOf=" not in service
     assert f"Unit={provisioner.PREPARE_SERVICE_UNIT_NAME}" in path
+    assert f"WorkingDirectory={fixture['repo'] / 'python'}" in service
+    assert f"PathExists={fixture['suite_manifest']}" in path
+    assert f"PathExists={fixture['curation_status']}" in path
+    assert 'WorkingDirectory="' not in service
+    assert 'PathExists="' not in path
     assert "katago-risk-training.target" not in path
     assert fake.calls == []
 

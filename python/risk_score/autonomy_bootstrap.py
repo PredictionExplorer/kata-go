@@ -2215,6 +2215,15 @@ def _systemd_quote(value: str) -> str:
     )
 
 
+def _systemd_path_value(value: Path) -> str:
+    text = str(value)
+    if not text.startswith("/") or any(
+        character.isspace() or character in {'"', "'", "\\"} for character in text
+    ):
+        raise BootstrapError("systemd directive path is not safely representable")
+    return text.replace("%", "%%")
+
+
 def render_bootstrap_systemd_unit(
     *,
     python_executable: Path,
@@ -2258,13 +2267,13 @@ def render_bootstrap_systemd_unit(
             "After=network-online.target",
             "# Do not order this unit before the runtime target: the final",
             "# activation command synchronously restarts that target.",
-            "RequiresMountsFor=" + _systemd_quote(str(root)),
+            "RequiresMountsFor=" + _systemd_path_value(root),
             "StartLimitIntervalSec=600",
             "StartLimitBurst=3",
             "",
             "[Service]",
             "Type=oneshot",
-            "WorkingDirectory=" + _systemd_quote(str(working)),
+            "WorkingDirectory=" + _systemd_path_value(working),
             "Environment=" + _systemd_quote(f"PYTHONPATH={working}"),
             "ExecStart=" + " ".join(_systemd_quote(item) for item in argv),
             "RemainAfterExit=yes",

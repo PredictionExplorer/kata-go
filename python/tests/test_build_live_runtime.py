@@ -614,6 +614,14 @@ def _assert_durable_systemd_runtime(result, services):
         unit_path = Path(unit["path"])
         unit_lines = unit_path.read_text(encoding="utf-8").splitlines()
         assert "PartOf=katago-risk-training.target" in unit_lines
+        requires_mounts = next(
+            line for line in unit_lines if line.startswith("RequiresMountsFor=")
+        )
+        working_directory = next(
+            line for line in unit_lines if line.startswith("WorkingDirectory=")
+        )
+        assert requires_mounts.removeprefix("RequiresMountsFor=").startswith("/")
+        assert working_directory.removeprefix("WorkingDirectory=").startswith("/")
         if service_name == "reconcile":
             assert services["services"][service_name]["restart"] == "no"
             assert unit_lines.count("Restart=no") == 1
