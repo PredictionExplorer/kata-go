@@ -1,28 +1,30 @@
 import json
+import os
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+import risk_score.build_live_runtime as live_runtime_builder
+from risk_score.adaptive_training import POLICY_HASH as AUTONOMY_POLICY_HASH
 from risk_score.build_live_runtime import (
     build_live_runtime,
     verify_deployment_manifest,
 )
-from risk_score.promotion_host import HostCommandError
-from risk_score.adaptive_training import POLICY_HASH as AUTONOMY_POLICY_HASH
 from risk_score.position_samples import (
     canonical_json,
     canonical_sha256,
     file_sha256,
 )
+from risk_score.promotion_host import HostCommandError
 from risk_score.service_activation import (
     AUTONOMY_SERVICE_SPEC_CONTRACT,
     AUTONOMY_SERVICE_UNIT_NAMES,
 )
 from risk_score.suite_rotation import publish_registry_spec
-
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -41,11 +43,555 @@ FULL_SYSTEMD_SERVICE_UNITS = {
 }
 
 
+def _minimal_runtime_build_kwargs(tmp_path):
+    run = tmp_path / "run"
+    (run / "modelstobetested").mkdir(parents=True)
+    (run / "selfplay").mkdir()
+    (run / "promotion").mkdir()
+    original = run / "original" / "model.bin.gz"
+    original.parent.mkdir()
+    original.write_bytes(b"original")
+    checkpoint = run / "train" / "riskb40" / "checkpoint.ckpt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"checkpoint")
+    katago = tmp_path / "katago"
+    katago.write_bytes(b"binary")
+    trainer_spec = run / "inputs" / "trainer-launch.json"
+    trainer_spec.parent.mkdir()
+    trainer_spec.write_text("{}\n", encoding="utf-8")
+    consumer_spec = run / "inputs" / "consumer-stop.json"
+    consumer_spec.write_text("{}\n", encoding="utf-8")
+    suites = run / "evaluation" / "promotion-suites-v2"
+    (suites / "schedules").mkdir(parents=True)
+    for relative in (
+        "manifest.json",
+        "schedules/discovery.jsonl",
+        "schedules/confirmation.jsonl",
+        "schedules/audit.jsonl",
+        "schedules/lead-40-confirmation.jsonl",
+        "schedules/lead-80-confirmation.jsonl",
+    ):
+        path = suites / relative
+        path.write_text(relative + "\n", encoding="utf-8")
+    revision = subprocess.run(
+        ["git", "-C", str(REPO), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return {
+        "repo": REPO,
+        "run_root": run,
+        "suite_dir": suites,
+        "katago_binary": katago,
+        "python_executable": Path(sys.executable),
+        "trainer_spec": trainer_spec,
+        "consumer_spec": consumer_spec,
+        "original_model": original,
+        "trainer_checkpoint": checkpoint,
+        "gpu_uuid": "GPU-test-production",
+        "actor": "controller-test",
+        "source_revision": revision,
+        "require_clean_source": False,
+    }
+
+
+def _promotion_evaluator_command():
+    example = json.loads(
+        (REPO / "python" / "risk_score" / "promotion_runtime.example.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    return example["commands"]["evaluator"]
+
+
+def _lease_evaluator_command(tmp_path):
+    return [
+        str(tmp_path / "run-promotion-evaluator-shard"),
+        "--lease-id",
+        "{lease_id}",
+        "--worker-index",
+        "{worker_index}",
+        "--gpu-index",
+        "{gpu_index}",
+        "--expected-gpu-uuid",
+        "{gpu_uuid}",
+        "--promotion-root",
+        "{promotion_root}",
+    ]
+
+
+def _ignore_ownership(**_kwargs):
+    return None
+
+
+def _root_lstat(path):
+    values = list(os.lstat(path))
+    values[4] = 0
+    values[5] = 0
+    return os.stat_result(values)
+
+
+def _ownership_lstat(control_root, uid=123, gid=456, writable_generated_ancestors=()):
+    def owned_lstat(path):
+        values = list(os.lstat(path))
+        candidate = Path(path)
+        if candidate == control_root or candidate.is_relative_to(control_root):
+            values[4] = uid
+            values[5] = gid
+        else:
+            values[4] = 0
+            values[5] = 0
+            if stat.S_ISDIR(values[0]):
+                values[0] = stat.S_IFDIR | (
+                    0o777 if candidate in writable_generated_ancestors else 0o755
+                )
+        return os.stat_result(values)
+
+    return owned_lstat
+
+
+@pytest.mark.parametrize(
+    ("selected_processes", "stage1_processes"),
+    ((4, 4), (8, 8), (16, 8)),
+)
+def test_bootstrap_deployer_topology_and_stage1_cap_are_compatible(
+    tmp_path, selected_processes, stage1_processes
+):
+    kwargs = _minimal_runtime_build_kwargs(tmp_path)
+    lease_command = _lease_evaluator_command(tmp_path)
+    result = build_live_runtime(
+        **kwargs,
+        output_dir=kwargs["run_root"] / "configs" / f"p{selected_processes}",
+        evaluator_command=lease_command,
+        evaluator_process_count=selected_processes,
+    )
+    promotion = json.loads(
+        Path(result["promotion_runtime"]).read_text(encoding="utf-8")
+    )
+    gpu = json.loads(Path(result["gpu_lease_runtime"]).read_text(encoding="utf-8"))
+    services = json.loads(Path(result["service_spec"]).read_text(encoding="utf-8"))
+    deployment = json.loads(
+        Path(result["deployment_manifest"]).read_text(encoding="utf-8")
+    )
+    expected_binding = {
+        "benchmark_selected_process_count": selected_processes,
+        "policy_maximum_evaluator_processes": 8,
+        "effective_process_count": stage1_processes,
+    }
+
+    evaluator = promotion["commands"]["evaluator"]
+    assert evaluator[evaluator.index("--shards") + 1] == str(stage1_processes)
+    assert evaluator[evaluator.index("--max-parallel") + 1] == str(stage1_processes)
+    assert gpu["evaluator"]["processCount"] == selected_processes
+    assert gpu["evaluator"]["launchCommand"] == lease_command
+    assert promotion["hashes"]["gpuLeaseConfig"] == file_sha256(
+        Path(result["gpu_lease_runtime"])
+    )
+    assert services["evaluator_process_count"] == selected_processes
+    assert services["stage1_evaluator_parallelism"] == expected_binding
+    assert deployment["evaluator_process_count"] == selected_processes
+    assert deployment["stage1_evaluator_parallelism"] == expected_binding
+    assert result["evaluator_process_count"] == selected_processes
+    assert set(result) == {
+        "promotion_runtime",
+        "promotion_runtime_sha256",
+        "gpu_lease_runtime",
+        "gpu_lease_runtime_sha256",
+        "deployment_manifest",
+        "deployment_manifest_sha256",
+        "service_spec",
+        "service_spec_sha256",
+        "systemd_units",
+        "mutation_enabled",
+        "full_autonomy",
+        "evaluator_process_count",
+    }
+    assert deployment["files"]["promotion_runtime"]["sha256"] == file_sha256(
+        Path(result["promotion_runtime"])
+    )
+    assert deployment["files"]["gpu_lease_runtime"]["sha256"] == file_sha256(
+        Path(result["gpu_lease_runtime"])
+    )
+    assert deployment["files"]["service_spec"]["sha256"] == file_sha256(
+        Path(result["service_spec"])
+    )
+    deployment_body = dict(deployment)
+    manifest_sha256 = deployment_body.pop("manifest_sha256")
+    assert manifest_sha256 == canonical_sha256(deployment_body)
+    assert verify_deployment_manifest(Path(result["deployment_manifest"])) == deployment
+
+
+def test_service_ownership_is_a_nonroot_noop(tmp_path):
+    generated = tmp_path / "generated.json"
+    generated.write_text("{}\n", encoding="utf-8")
+    control_root = tmp_path / "promotion"
+    calls = []
+
+    live_runtime_builder._ensure_service_user_ownership(
+        service_user="service-test",
+        generated_root=tmp_path,
+        generated_paths=(generated,),
+        control_root=control_root,
+        mutable_directories=(control_root / "supervisor",),
+        mutable_files=(control_root / "controller.lock",),
+        geteuid=lambda: 501,
+        user_lookup=lambda _name: pytest.fail("nonroot lookup"),
+    )
+
+    assert calls == []
+    assert not control_root.exists()
+
+
+def test_builder_scopes_injected_service_ownership(tmp_path):
+    kwargs = _minimal_runtime_build_kwargs(tmp_path)
+    output = kwargs["run_root"] / "generated-runtime"
+    captured = {}
+
+    result = build_live_runtime(
+        **kwargs,
+        output_dir=output,
+        service_user="service-test",
+        ownership_helper=lambda **values: captured.update(values),
+    )
+
+    generated_paths = set(captured["generated_paths"])
+    assert captured["service_user"] == "service-test"
+    assert captured["generated_root"] == output
+    assert captured["control_root"] == kwargs["run_root"] / "promotion"
+    assert {
+        output,
+        Path(result["promotion_runtime"]),
+        Path(result["gpu_lease_runtime"]),
+        Path(result["service_spec"]),
+        Path(result["deployment_manifest"]),
+    } <= generated_paths
+    assert {
+        kwargs["trainer_spec"],
+        kwargs["consumer_spec"],
+        kwargs["original_model"],
+        kwargs["trainer_checkpoint"],
+        kwargs["suite_dir"],
+    }.isdisjoint(generated_paths)
+    assert all(
+        directory.is_relative_to(captured["control_root"])
+        for directory in captured["mutable_directories"]
+    )
+    assert captured["control_root"] / "events" in captured["mutable_directories"]
+    assert captured["mutable_files"] == (captured["control_root"] / "controller.lock",)
+
+
+def test_verification_accepts_service_owned_mutable_paths_without_mutation(
+    tmp_path, monkeypatch
+):
+    immutable = tmp_path / "immutable"
+    immutable.mkdir(mode=0o755)
+    output = immutable / "generated"
+    output.mkdir(mode=0o755)
+    generated = output / "runtime.json"
+    generated.write_text("{}\n", encoding="utf-8")
+    generated.chmod(0o644)
+    input_path = tmp_path / "model.bin.gz"
+    input_path.write_bytes(b"model")
+    control_root = tmp_path / "promotion"
+    control_root.mkdir(mode=0o750)
+    events = control_root / "events"
+    events.mkdir(mode=0o750)
+    controller_lock = control_root / "controller.lock"
+    controller_lock.write_bytes(b"")
+    controller_lock.chmod(0o600)
+    account = type("Account", (), {"pw_uid": 123, "pw_gid": 456})()
+    monkeypatch.setattr(
+        live_runtime_builder.os,
+        "chown",
+        lambda *_args, **_kwargs: pytest.fail("unexpected chown"),
+    )
+    monkeypatch.setattr(
+        live_runtime_builder.os,
+        "chmod",
+        lambda *_args, **_kwargs: pytest.fail("unexpected chmod"),
+    )
+
+    live_runtime_builder._ensure_service_user_ownership(
+        service_user="service-test",
+        generated_root=output,
+        generated_paths=(output, generated),
+        control_root=control_root,
+        mutable_directories=(events,),
+        mutable_files=(controller_lock,),
+        geteuid=lambda: 0,
+        user_lookup=lambda name: account if name == "service-test" else None,
+        lstat=_ownership_lstat(control_root),
+    )
+
+    assert stat.S_IMODE(output.stat().st_mode) == 0o755
+    assert stat.S_IMODE(generated.stat().st_mode) == 0o644
+    assert stat.S_IMODE(events.stat().st_mode) == 0o750
+    assert stat.S_IMODE(controller_lock.stat().st_mode) == 0o600
+    assert input_path.read_bytes() == b"model"
+
+
+def test_root_ownership_rejects_unknown_service_user(tmp_path):
+    with pytest.raises(HostCommandError, match="does not exist"):
+        live_runtime_builder._ensure_service_user_ownership(
+            service_user="missing-user",
+            generated_root=tmp_path,
+            generated_paths=(),
+            control_root=tmp_path / "promotion",
+            mutable_directories=(),
+            mutable_files=(),
+            geteuid=lambda: 0,
+            user_lookup=lambda _name: (_ for _ in ()).throw(KeyError()),
+        )
+
+
+def test_root_ownership_rejects_control_directory_escape(tmp_path):
+    account = type("Account", (), {"pw_uid": 123, "pw_gid": 456})()
+    immutable = tmp_path / "immutable"
+    immutable.mkdir(mode=0o755)
+    generated = immutable / "generated"
+    generated.mkdir(mode=0o755)
+    control_root = tmp_path / "promotion"
+    control_root.mkdir(mode=0o750)
+    with pytest.raises(HostCommandError, match="escapes"):
+        live_runtime_builder._ensure_service_user_ownership(
+            service_user="service-test",
+            generated_root=generated,
+            generated_paths=(generated,),
+            control_root=control_root,
+            mutable_directories=(control_root / ".." / "outside",),
+            mutable_files=(),
+            geteuid=lambda: 0,
+            user_lookup=lambda _name: account,
+            lstat=_ownership_lstat(control_root),
+        )
+
+
+def test_verification_rejects_writable_generated_parent(tmp_path):
+    account = type("Account", (), {"pw_uid": 123, "pw_gid": 456})()
+    immutable = tmp_path / "immutable"
+    immutable.mkdir(mode=0o777)
+    immutable.chmod(0o777)
+    generated = immutable / "generated"
+    generated.mkdir(mode=0o755)
+    control_root = tmp_path / "promotion"
+    control_root.mkdir(mode=0o750)
+    with pytest.raises(HostCommandError, match="trusted ancestor"):
+        live_runtime_builder._ensure_service_user_ownership(
+            service_user="service-test",
+            generated_root=generated,
+            generated_paths=(generated,),
+            control_root=control_root,
+            mutable_directories=(),
+            mutable_files=(),
+            geteuid=lambda: 0,
+            user_lookup=lambda _name: account,
+            lstat=_ownership_lstat(
+                control_root, writable_generated_ancestors=(immutable,)
+            ),
+        )
+
+
+def test_root_generation_rejects_untrusted_ancestor_before_creation(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "generated"
+    monkeypatch.setattr(live_runtime_builder.os, "geteuid", lambda: 0)
+
+    with pytest.raises(HostCommandError, match="ancestor"):
+        live_runtime_builder._ensure_generated_directory(target)
+
+    assert not target.exists()
+
+
+def test_verification_requires_precreated_mutable_paths(tmp_path):
+    immutable = tmp_path / "immutable"
+    immutable.mkdir(mode=0o755)
+    generated = immutable / "generated"
+    generated.mkdir(mode=0o755)
+    control_root = tmp_path / "promotion"
+    control_root.mkdir(mode=0o750)
+    account = type("Account", (), {"pw_uid": 123, "pw_gid": 456})()
+
+    with pytest.raises(HostCommandError, match="pre-created"):
+        live_runtime_builder._ensure_service_user_ownership(
+            service_user="service-test",
+            generated_root=generated,
+            generated_paths=(generated,),
+            control_root=control_root,
+            mutable_directories=(control_root / "events",),
+            mutable_files=(),
+            geteuid=lambda: 0,
+            user_lookup=lambda _name: account,
+            lstat=_ownership_lstat(control_root),
+        )
+
+
+def test_root_ownership_rejects_mutable_symlink(tmp_path):
+    immutable = tmp_path / "immutable"
+    immutable.mkdir(mode=0o755)
+    generated = immutable / "generated"
+    generated.mkdir(mode=0o755)
+    control_root = tmp_path / "promotion"
+    control_root.mkdir(mode=0o750)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked = control_root / "events"
+    linked.symlink_to(outside, target_is_directory=True)
+    account = type("Account", (), {"pw_uid": 123, "pw_gid": 456})()
+
+    with pytest.raises(HostCommandError, match="unsafe"):
+        live_runtime_builder._ensure_service_user_ownership(
+            service_user="service-test",
+            generated_root=generated,
+            generated_paths=(generated,),
+            control_root=control_root,
+            mutable_directories=(linked,),
+            mutable_files=(),
+            geteuid=lambda: 0,
+            user_lookup=lambda _name: account,
+            lstat=_ownership_lstat(control_root),
+        )
+
+
+def test_verification_detects_generated_ancestor_swap(tmp_path):
+    immutable = tmp_path / "immutable"
+    immutable.mkdir(mode=0o755)
+    generated_root = immutable / "generated"
+    generated_root.mkdir(mode=0o755)
+    generated = generated_root / "runtime.json"
+    generated.write_text("{}\n", encoding="utf-8")
+    generated.chmod(0o644)
+    control_root = tmp_path / "promotion"
+    control_root.mkdir(mode=0o750)
+    account = type("Account", (), {"pw_uid": 123, "pw_gid": 456})()
+    observations = 0
+    owned_lstat = _ownership_lstat(control_root)
+
+    def swapped_lstat(path):
+        nonlocal observations
+        status = owned_lstat(path)
+        if Path(path) == immutable:
+            observations += 1
+            if observations > 1:
+                values = list(status)
+                values[1] += 1
+                status = os.stat_result(values)
+        return status
+
+    with pytest.raises(HostCommandError, match="changed during verification"):
+        live_runtime_builder._ensure_service_user_ownership(
+            service_user="service-test",
+            generated_root=generated_root,
+            generated_paths=(generated_root, generated),
+            control_root=control_root,
+            mutable_directories=(),
+            mutable_files=(),
+            geteuid=lambda: 0,
+            user_lookup=lambda _name: account,
+            lstat=swapped_lstat,
+        )
+
+
+def test_stage1_policy_process_cap_rejects_missing_bool_and_nonpositive():
+    valid = {
+        "evaluation_stages": {
+            "stage_1_cheap_paired_screen": {
+                "maximum_evaluator_processes": 8,
+            }
+        }
+    }
+    assert live_runtime_builder._stage1_evaluator_process_cap(valid) == 8
+
+    malformed = []
+    for value in (True, 0, -1):
+        candidate = json.loads(json.dumps(valid))
+        candidate["evaluation_stages"]["stage_1_cheap_paired_screen"][
+            "maximum_evaluator_processes"
+        ] = value
+        malformed.append(candidate)
+    missing = json.loads(json.dumps(valid))
+    del missing["evaluation_stages"]["stage_1_cheap_paired_screen"][
+        "maximum_evaluator_processes"
+    ]
+    malformed.append(missing)
+
+    for candidate in malformed:
+        with pytest.raises(
+            HostCommandError,
+            match="maximum_evaluator_processes",
+        ):
+            live_runtime_builder._stage1_evaluator_process_cap(candidate)
+
+
+def test_suite_rotation_spec_alias_rejects_contradictions(tmp_path):
+    rotation = tmp_path / "suite-rotation.json"
+    other = tmp_path / "other-rotation.json"
+    assert live_runtime_builder._resolve_suite_rotation_spec(None, rotation) == rotation
+    assert (
+        live_runtime_builder._resolve_suite_rotation_spec(rotation, rotation)
+        == rotation
+    )
+    with pytest.raises(HostCommandError, match="contradicts"):
+        live_runtime_builder._resolve_suite_rotation_spec(rotation, other)
+
+
+def test_stage1_policy_identity_must_match_frozen_runtime(tmp_path, monkeypatch):
+    kwargs = _minimal_runtime_build_kwargs(tmp_path)
+    policy = json.loads(
+        (REPO / "python" / "risk_score" / "promotion_policy_v3.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    policy["queue"]["important_queue_warning_depth"] += 1
+    monkeypatch.setattr(live_runtime_builder, "load_policy", lambda _path: policy)
+
+    with pytest.raises(HostCommandError, match="hash-bound frozen runtime"):
+        build_live_runtime(
+            **kwargs,
+            output_dir=kwargs["run_root"] / "configs" / "policy-mismatch",
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("missing", "exactly one --max-parallel"),
+        ("malformed", "--max-parallel must be a positive integer"),
+        ("excess", "exceeds the frozen Stage-1 policy cap"),
+        ("incoherent", "--max-parallel may not exceed --shards"),
+        ("opaque", "must invoke risk_score.promotion_evaluator"),
+    ),
+)
+def test_generated_evaluator_command_contract_fails_closed(mutation, message):
+    command = _promotion_evaluator_command()
+    if mutation == "missing":
+        index = command.index("--max-parallel")
+        del command[index : index + 2]
+    elif mutation == "malformed":
+        command[command.index("--max-parallel") + 1] = "invalid"
+    elif mutation == "excess":
+        command[command.index("--shards") + 1] = "9"
+        command[command.index("--max-parallel") + 1] = "9"
+    elif mutation == "incoherent":
+        command[command.index("--shards") + 1] = "1"
+        command[command.index("--max-parallel") + 1] = "2"
+    else:
+        command[command.index("risk_score.promotion_evaluator")] = (
+            "risk_score.unrelated"
+        )
+
+    with pytest.raises(HostCommandError, match=message):
+        live_runtime_builder._configure_promotion_evaluator_argv(
+            command,
+            effective_processes=8,
+            policy_maximum=8,
+        )
+
+
 def _assert_durable_systemd_runtime(result, services):
     expected_services = set(services["services"])
-    expected_units = {
-        FULL_SYSTEMD_SERVICE_UNITS[name] for name in expected_services
-    }
+    expected_units = {FULL_SYSTEMD_SERVICE_UNITS[name] for name in expected_services}
     target_unit = Path(services["systemd_units"]["target"]["path"]).read_text(
         encoding="utf-8"
     )
@@ -201,6 +747,7 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
         output_dir=output,
         require_clean_source=False,
         service_user="ubuntu",
+        ownership_helper=_ignore_ownership,
         shuffler_command=[sys.executable, "-c", "print('shuffle')"],
         exporter_command=[sys.executable, "-c", "print('export')"],
     )
@@ -297,13 +844,14 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
         mutation_enabled=True,
         require_clean_source=False,
         service_user="ubuntu",
+        ownership_helper=_ignore_ownership,
         shuffler_command=[sys.executable, "-c", "print('shuffle')"],
         exporter_command=[sys.executable, "-c", "print('export')"],
     )
     automatic_without_legacy_gpu = json.loads(
-        Path(
-            automatic_without_legacy_evaluator["gpu_lease_runtime"]
-        ).read_text(encoding="utf-8")
+        Path(automatic_without_legacy_evaluator["gpu_lease_runtime"]).read_text(
+            encoding="utf-8"
+        )
     )
     assert (
         automatic_without_legacy_gpu["evaluator"]["launchCommand"][-1]
@@ -327,6 +875,7 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
             mutation_enabled=True,
             require_clean_source=False,
             service_user="ubuntu",
+            ownership_helper=_ignore_ownership,
             shuffler_command=[sys.executable, "-c", "print('shuffle')"],
             exporter_command=[sys.executable, "-c", "print('export')"],
             evaluator_command=[
@@ -336,13 +885,7 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
                 "evaluator-unsupported",
             ],
         )
-    evaluator_command = [
-        sys.executable,
-        "-c",
-        "print('evaluate')",
-        "{lease_id}",
-        "{worker_index}",
-    ]
+    evaluator_command = _lease_evaluator_command(run)
     shuffler_service = run / "configs" / "shuffler-loop"
     exporter_service = run / "configs" / "exporter-loop"
     shuffler_service.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -366,6 +909,7 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
         mutation_enabled=True,
         require_clean_source=False,
         service_user="ubuntu",
+        ownership_helper=_ignore_ownership,
         shuffler_command=[str(shuffler_service)],
         exporter_command=[str(exporter_service)],
         evaluator_command=evaluator_command,
@@ -380,9 +924,7 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
         Path(automatic["deployment_manifest"]).read_text(encoding="utf-8")
     )
     assert automatic_services["mutation_enabled"] is True
-    assert set(automatic_services["services"]) == set(
-        SYSTEMD_SERVICE_UNITS
-    )
+    assert set(automatic_services["services"]) == set(SYSTEMD_SERVICE_UNITS)
     assert automatic_gpu["evaluator"]["launchCommand"] == evaluator_command
     assert "evaluator-unsupported" not in automatic_gpu["evaluator"]["launchCommand"]
     assert automatic_deployment["files"]["command:shuffler:0"] == {
@@ -439,13 +981,9 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
     assert reconcile_lines.count("Type=oneshot") == 1
     assert reconcile_lines.count("RemainAfterExit=yes") == 1
     assert reconcile_lines.count("Restart=no") == 1
-    assert len(
-        [line for line in reconcile_lines if line.startswith("ExecStart=")]
-    ) == 4
+    assert len([line for line in reconcile_lines if line.startswith("ExecStart=")]) == 4
     assert "Requires=katago-risk-promotion-host.service" in reconcile_lines
-    before = next(
-        line for line in reconcile_lines if line.startswith("Before=")
-    )
+    before = next(line for line in reconcile_lines if line.startswith("Before="))
     assert set(before.removeprefix("Before=").split()) == {
         unit_name
         for name, unit_name in SYSTEMD_SERVICE_UNITS.items()
@@ -455,12 +993,12 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
         "supervisor",
         "reconcile",
     }:
-        unit_lines = Path(
-            automatic_services["systemd_units"][name]["path"]
-        ).read_text(encoding="utf-8").splitlines()
-        requires = next(
-            line for line in unit_lines if line.startswith("Requires=")
+        unit_lines = (
+            Path(automatic_services["systemd_units"][name]["path"])
+            .read_text(encoding="utf-8")
+            .splitlines()
         )
+        requires = next(line for line in unit_lines if line.startswith("Requires="))
         assert "katago-risk-boot-reconcile.service" in (
             requires.removeprefix("Requires=").split()
         )
@@ -477,7 +1015,7 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
     ).resolve()
     executor_spec = autonomy_inputs / "cluster-executor.json"
     adaptive_spec = autonomy_inputs / "adaptive-training.json"
-    suite_registry_spec = autonomy_inputs / "suite-rotation.json"
+    suite_rotation_spec = autonomy_inputs / "suite-rotation.json"
     scheduler_directory = (autonomy_inputs / "scheduler").resolve()
     scheduler_directory.mkdir()
     guardian_prefix = [
@@ -505,9 +1043,7 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
             "schema_version": 1,
             "contract": "risk-score-cluster-executor-spec-v1",
             "scheduler_directory": str(scheduler_directory),
-            "state_directory": str(
-                (autonomy_inputs / "executor-state").resolve()
-            ),
+            "state_directory": str((autonomy_inputs / "executor-state").resolve()),
             "owner_id": "executor-test",
             "gpu_ids": [str(index) for index in range(8)],
             "gpu7_id": "7",
@@ -549,19 +1085,12 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
     registry_root = (autonomy_inputs / "suite-registry").resolve()
     registry_root.mkdir()
     registry_spec = autonomy_inputs / "suite-registry.json"
-    initial_suite_champion = (
-        autonomy_inputs / "initial-suite-champion.bin.gz"
-    )
+    initial_suite_champion = autonomy_inputs / "initial-suite-champion.bin.gz"
     initial_suite_champion.write_bytes(b"initial-suite-champion")
     registry = publish_registry_spec(
         registry_spec,
         registry_root=registry_root,
-        policy_path=(
-            REPO
-            / "python"
-            / "risk_score"
-            / "promotion_policy_v3.json"
-        ),
+        policy_path=(REPO / "python" / "risk_score" / "promotion_policy_v3.json"),
         original_model_path=original,
         initial_champion_path=initial_suite_champion,
         initial_generation_id="generation-initial",
@@ -579,9 +1108,7 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
         "manifest_sha256": suite_id,
         "manifest_identity": "c" * 64,
         "activated_at_utc": "2026-08-11T00:00:00.000000Z",
-        "activation_champion_sha256": file_sha256(
-            initial_suite_champion
-        ),
+        "activation_champion_sha256": file_sha256(initial_suite_champion),
         "activation_generation_id": "generation-initial",
         "event_sequence": 1,
         "event_sha256": "d" * 64,
@@ -592,7 +1119,7 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
         encoding="utf-8",
     )
     write_self_hashed(
-        suite_registry_spec,
+        suite_rotation_spec,
         {
             "schema_version": 1,
             "contract": "risk-score-suite-rotation-service-spec-v1",
@@ -623,6 +1150,7 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
         mutation_enabled=True,
         require_clean_source=False,
         service_user="ubuntu",
+        ownership_helper=_ignore_ownership,
         shuffler_command=[str(shuffler_service)],
         exporter_command=[str(exporter_service)],
         evaluator_command=evaluator_command,
@@ -648,25 +1176,28 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
             "-m",
             "risk_score.suite_rotation_service",
             "--spec",
-            str(suite_registry_spec),
+            str(suite_rotation_spec),
             "watch",
         ],
         autonomy_policy=autonomy_policy,
         cluster_executor_spec=executor_spec,
         adaptive_training_spec=adaptive_spec,
-        suite_registry_spec=suite_registry_spec,
+        suite_rotation_spec=suite_rotation_spec,
         evaluator_process_count=16,
     )
-    full_services = json.loads(
-        Path(full["service_spec"]).read_text(encoding="utf-8")
-    )
+    full_services = json.loads(Path(full["service_spec"]).read_text(encoding="utf-8"))
     assert full["full_autonomy"] is True
     assert full["evaluator_process_count"] == 16
+    assert "stage1_evaluator_parallelism" not in full
     assert full_services["schema_version"] == 3
     assert full_services["contract"] == AUTONOMY_SERVICE_SPEC_CONTRACT
-    assert set(full_services["services"]) == set(
-        FULL_SYSTEMD_SERVICE_UNITS
-    )
+    assert full_services["evaluator_process_count"] == 16
+    assert full_services["stage1_evaluator_parallelism"] == {
+        "benchmark_selected_process_count": 16,
+        "policy_maximum_evaluator_processes": 8,
+        "effective_process_count": 8,
+    }
+    assert set(full_services["services"]) == set(FULL_SYSTEMD_SERVICE_UNITS)
     assert set(full_services["systemd_units"]) == {
         *FULL_SYSTEMD_SERVICE_UNITS,
         "target",
@@ -677,23 +1208,27 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
         "adaptive_spec",
         "suite_registry_spec",
     }
-    full_gpu = json.loads(
-        Path(full["gpu_lease_runtime"]).read_text(encoding="utf-8")
-    )
+    assert full_services["service_inputs"]["suite_registry_spec"] == {
+        "path": str(registry_spec),
+        "sha256": file_sha256(registry_spec),
+    }
+    assert full_services["suite_rotation_spec"] == {
+        "path": str(suite_rotation_spec),
+        "sha256": file_sha256(suite_rotation_spec),
+    }
+    full_gpu = json.loads(Path(full["gpu_lease_runtime"]).read_text(encoding="utf-8"))
     assert full_gpu["evaluator"]["processCount"] == 16
     full_promotion = json.loads(
         Path(full["promotion_runtime"]).read_text(encoding="utf-8")
     )
+    full_evaluator = full_promotion["commands"]["evaluator"]
+    assert full_evaluator[full_evaluator.index("--shards") + 1] == "8"
+    assert full_evaluator[full_evaluator.index("--max-parallel") + 1] == "8"
     assert full_promotion["schemaVersion"] == 2
-    assert full_promotion["autonomy"]["activeSuitePointer"][
-        "suiteId"
-    ] == suite_id
+    assert full_promotion["autonomy"]["activeSuitePointer"]["suiteId"] == suite_id
     assert full_promotion["paths"]["suites"] == str(full_suites)
     full_reconcile = full_services["services"]["reconcile"]["commands"]
-    assert [
-        command[command.index("-m") + 1]
-        for command in full_reconcile
-    ] == [
+    assert [command[command.index("-m") + 1] for command in full_reconcile] == [
         "risk_score.promotion_feedback",
         "risk_score.gpu_lease",
         "risk_score.cluster_executor",
@@ -702,18 +1237,12 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
         "risk_score.promotion_controller",
         "risk_score.promotion_host",
     ]
-    assert all(
-        "watch" not in command
-        for command in full_reconcile[2:5]
-    )
-    assert all(
-        "once" in command
-        for command in full_reconcile[2:5]
-    )
+    assert all("watch" not in command for command in full_reconcile[2:5])
+    assert all("once" in command for command in full_reconcile[2:5])
     for name in ("adaptive", "suite_rotation"):
-        unit = Path(
-            full_services["systemd_units"][name]["path"]
-        ).read_text(encoding="utf-8")
+        unit = Path(full_services["systemd_units"][name]["path"]).read_text(
+            encoding="utf-8"
+        )
         expected_dependencies = [
             "katago-risk-promotion-host.service",
             "katago-risk-boot-reconcile.service",
@@ -721,13 +1250,8 @@ def test_live_runtime_builder_materializes_real_hashes_with_mutation_off(tmp_pat
             "katago-risk-promotion-controller.service",
         ]
         if name == "suite_rotation":
-            expected_dependencies.append(
-                "katago-risk-promotion-auditor.service"
-            )
-        assert (
-            "Requires="
-            + " ".join(expected_dependencies)
-        ) in unit
+            expected_dependencies.append("katago-risk-promotion-auditor.service")
+        assert ("Requires=" + " ".join(expected_dependencies)) in unit
     _assert_durable_systemd_runtime(full, full_services)
     deployment = verify_deployment_manifest(Path(result["deployment_manifest"]))
     assert deployment["source_revision"] == revision

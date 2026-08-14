@@ -51,7 +51,8 @@ from risk_score.autonomy_bootstrap import (
 )
 from risk_score.position_samples import canonical_json, canonical_sha256, file_sha256
 
-PUBLISHER_SPEC_CONTRACT = "risk-score-autonomy-bootstrap-publisher-spec-v1"
+LEGACY_PUBLISHER_SPEC_CONTRACT = "risk-score-autonomy-bootstrap-publisher-spec-v1"
+PUBLISHER_SPEC_CONTRACT = "risk-score-autonomy-bootstrap-publisher-spec-v2"
 PUBLICATION_CONTRACT = "risk-score-autonomy-bootstrap-publication-v1"
 BOOTSTRAP_PATH_UNIT_NAME = "katago-risk-autonomy-bootstrap.path"
 PATH_UNIT_NAME = BOOTSTRAP_PATH_UNIT_NAME
@@ -75,6 +76,7 @@ _REQUIRED_FILES = frozenset(
         "cluster_executor_spec",
         "adaptive_training_spec",
         "suite_registry_spec",
+        "suite_rotation_spec",
     }
 )
 _RUNTIME_COMMANDS = (
@@ -458,8 +460,13 @@ class BootstrapPublisherSpec:
         if not source.is_absolute():
             source = source.resolve()
         raw = _load_canonical_object(source, "bootstrap publisher specification")
+        if raw.get("contract") == LEGACY_PUBLISHER_SPEC_CONTRACT:
+            raise BootstrapSpecPublicationError(
+                "bootstrap publisher specification v1 is legacy-unsatisfiable: "
+                "it cannot bind separate readiness registry and suite service specs"
+            )
         _exact_keys(raw, _TOP_LEVEL_KEYS, "bootstrap publisher specification")
-        if raw["schema_version"] != 1 or raw["contract"] != PUBLISHER_SPEC_CONTRACT:
+        if raw["schema_version"] != 2 or raw["contract"] != PUBLISHER_SPEC_CONTRACT:
             raise BootstrapSpecPublicationError(
                 "bootstrap publisher specification contract is unsupported"
             )
@@ -547,6 +554,16 @@ class BootstrapPublisherSpec:
             name: InputBinding.from_value(value, f"files.{name}")
             for name, value in raw_files.items()
         }
+        _validate_named_service_spec(
+            files["suite_registry_spec"],
+            role="suite registry specification",
+            contract="risk-score-evaluation-suite-registry-spec-v1",
+        )
+        _validate_named_service_spec(
+            files["suite_rotation_spec"],
+            role="suite rotation service specification",
+            contract="risk-score-suite-rotation-service-spec-v1",
+        )
 
         raw_models = raw["models"]
         if not isinstance(raw_models, list) or not raw_models:
@@ -643,13 +660,10 @@ class BootstrapPublisherSpec:
                     else argument
                 )
                 candidate = Path(candidate_text)
-                if (
-                    not candidate.is_absolute()
-                    and (
-                        candidate_text.startswith((".", "~"))
-                        or "/" in candidate_text
-                        or "\\" in candidate_text
-                    )
+                if not candidate.is_absolute() and (
+                    candidate_text.startswith((".", "~"))
+                    or "/" in candidate_text
+                    or "\\" in candidate_text
                 ):
                     raise BootstrapSpecPublicationError(
                         f"runtime_commands.{name}[{index}] contains an "
@@ -668,7 +682,7 @@ class BootstrapPublisherSpec:
         command_spec_requirements = {
             "cluster_executor": files["cluster_executor_spec"].path,
             "adaptive_training": files["adaptive_training_spec"].path,
-            "suite_rotation": files["suite_registry_spec"].path,
+            "suite_rotation": files["suite_rotation_spec"].path,
         }
         for name, required_path in command_spec_requirements.items():
             if str(required_path) not in runtime_commands[name]:
@@ -880,6 +894,20 @@ def _bound_input_hash(spec: BootstrapPublisherSpec, path: Path, role: str) -> st
     return digest
 
 
+def _validate_named_service_spec(
+    binding: InputBinding, *, role: str, contract: str
+) -> None:
+    value = _load_canonical_object(binding.path, role)
+    payload = dict(value)
+    supplied = payload.pop("spec_sha256", None)
+    if (
+        value.get("schema_version") != 1
+        or value.get("contract") != contract
+        or supplied != canonical_sha256(payload)
+    ):
+        raise BootstrapSpecPublicationError(f"{role} contract or self-hash is invalid")
+
+
 def _validate_spec_driven_gate(
     spec: BootstrapPublisherSpec,
     gate_id: str,
@@ -1006,9 +1034,7 @@ def _validate_direct_gate_cli(
         expected = {
             "--curation-status": str(spec.curation_status),
             "--suite-manifest": str(spec.suite_manifest),
-            "--suite-registry-spec": str(
-                spec.files["suite_registry_spec"].path
-            ),
+            "--suite-registry-spec": str(spec.files["suite_registry_spec"].path),
         }
     elif gate_id == "filesystem-rename-fsync":
         expected = {"--root": str(spec.run_root)}
@@ -1344,8 +1370,8 @@ def _runtime_argv(spec: BootstrapPublisherSpec, output_dir: Path) -> List[str]:
             str(files["cluster_executor_spec"].path),
             "--adaptive-training-spec",
             str(files["adaptive_training_spec"].path),
-            "--suite-registry-spec",
-            str(files["suite_registry_spec"].path),
+            "--suite-rotation-spec",
+            str(files["suite_rotation_spec"].path),
         ]
     )
     return argv

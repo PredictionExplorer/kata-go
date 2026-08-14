@@ -6,21 +6,30 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import pwd
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
 from risk_score.paired_stats import canonical_sha256 as policy_sha256
 from risk_score.paired_stats import load_policy
 from risk_score.position_samples import canonical_json, file_sha256
-from risk_score.promotion_host import HostCommandError, atomic_write_json
+from risk_score.promotion_host import HostCommandError
 from risk_score.promotion_state import atomic_write_bytes
 from risk_score.service_activation import (
     AUTONOMY_SERVICE_SPEC_CONTRACT,
     AUTONOMY_SERVICE_UNIT_NAMES,
 )
+
+
+_STAGE1_EVALUATOR_POLICY_FIELD = (
+    "evaluation_stages.stage_1_cheap_paired_screen.maximum_evaluator_processes"
+)
+_PROMOTION_EVALUATOR_MODULE = "risk_score.promotion_evaluator"
 
 
 def _replace(value: Any, replacements: Mapping[str, str]) -> Any:
@@ -53,9 +62,8 @@ def _canonical_json_file(path: Path, role: str) -> Mapping[str, Any]:
         value = json.loads(data)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise HostCommandError(f"{role} is invalid JSON: {exc}") from exc
-    if (
-        not isinstance(value, dict)
-        or data != (canonical_json(value) + "\n").encode("utf-8")
+    if not isinstance(value, dict) or data != (canonical_json(value) + "\n").encode(
+        "utf-8"
     ):
         raise HostCommandError(f"{role} must be canonical JSON")
     return value
@@ -90,6 +98,283 @@ def _service_argv(value: Optional[Sequence[str]], role: str) -> list[str]:
     if not Path(result[0]).is_absolute():
         raise HostCommandError(f"{role} service executable must be absolute")
     return result
+
+
+def _resolve_suite_rotation_spec(
+    suite_rotation_spec: Optional[Path],
+    suite_registry_spec: Optional[Path],
+) -> Optional[Path]:
+    if suite_rotation_spec is None:
+        return suite_registry_spec
+    if suite_registry_spec is None:
+        return suite_rotation_spec
+    primary = Path(suite_rotation_spec).resolve()
+    deprecated = Path(suite_registry_spec).resolve()
+    if primary != deprecated:
+        raise HostCommandError(
+            "suite rotation specification contradicts deprecated "
+            "suite_registry_spec alias"
+        )
+    return suite_rotation_spec
+
+
+def _stage1_evaluator_process_cap(policy: Mapping[str, Any]) -> int:
+    value: Any = policy
+    for key in (
+        "evaluation_stages",
+        "stage_1_cheap_paired_screen",
+        "maximum_evaluator_processes",
+    ):
+        if not isinstance(value, Mapping) or key not in value:
+            raise HostCommandError(
+                f"promotion policy is missing {_STAGE1_EVALUATOR_POLICY_FIELD}"
+            )
+        value = value[key]
+    if type(value) is not int or value <= 0:
+        raise HostCommandError(
+            f"promotion policy {_STAGE1_EVALUATOR_POLICY_FIELD} "
+            "must be a positive integer"
+        )
+    return value
+
+
+def _positive_argv_limit(
+    argv: Sequence[str],
+    flag: str,
+    role: str,
+) -> tuple[int, int]:
+    indexes = [index for index, argument in enumerate(argv) if argument == flag]
+    if len(indexes) != 1:
+        raise HostCommandError(f"{role} must contain exactly one {flag}")
+    value_index = indexes[0] + 1
+    if (
+        value_index >= len(argv)
+        or re.fullmatch(r"[1-9][0-9]*", argv[value_index]) is None
+    ):
+        raise HostCommandError(f"{role} {flag} must be a positive integer")
+    return value_index, int(argv[value_index], 10)
+
+
+def _configure_promotion_evaluator_argv(
+    value: Any,
+    *,
+    effective_processes: int,
+    policy_maximum: int,
+) -> list[str]:
+    if not isinstance(value, list) or any(
+        not isinstance(argument, str) or not argument for argument in value
+    ):
+        raise HostCommandError(
+            "promotion evaluator command must be a nonempty argv array"
+        )
+    result = list(value)
+    if (
+        len(result) < 3
+        or not Path(result[0]).is_absolute()
+        or result[1:3] != ["-m", _PROMOTION_EVALUATOR_MODULE]
+    ):
+        raise HostCommandError(
+            f"promotion evaluator command must invoke {_PROMOTION_EVALUATOR_MODULE}"
+        )
+    shards_index, shards = _positive_argv_limit(
+        result, "--shards", "promotion evaluator command"
+    )
+    parallel_index, max_parallel = _positive_argv_limit(
+        result, "--max-parallel", "promotion evaluator command"
+    )
+    if max_parallel > shards:
+        raise HostCommandError(
+            "promotion evaluator command --max-parallel may not exceed --shards"
+        )
+    if shards > policy_maximum or max_parallel > policy_maximum:
+        raise HostCommandError(
+            "promotion evaluator command exceeds the frozen Stage-1 policy cap"
+        )
+    result[shards_index] = str(effective_processes)
+    result[parallel_index] = str(effective_processes)
+    return result
+
+
+def _ensure_service_user_ownership(
+    *,
+    service_user: str,
+    generated_root: Path,
+    generated_paths: Sequence[Path],
+    control_root: Path,
+    mutable_directories: Sequence[Path],
+    mutable_files: Sequence[Path],
+    geteuid: Callable[[], int] = os.geteuid,
+    user_lookup: Callable[[str], Any] = pwd.getpwnam,
+    lstat: Callable[[Path], os.stat_result] = os.lstat,
+) -> None:
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", service_user) is None:
+        raise HostCommandError("systemd service user is invalid")
+    if geteuid() != 0:
+        return
+    try:
+        account = user_lookup(service_user)
+    except KeyError as exc:
+        raise HostCommandError("systemd service user does not exist") from exc
+    uid = getattr(account, "pw_uid", None)
+    gid = getattr(account, "pw_gid", None)
+    if type(uid) is not int or uid < 0 or type(gid) is not int or gid < 0:
+        raise HostCommandError("systemd service user identity is invalid")
+
+    def status_identity(status: os.stat_result) -> tuple[int, ...]:
+        return (
+            status.st_dev,
+            status.st_ino,
+            status.st_mode,
+            status.st_uid,
+            status.st_gid,
+        )
+
+    snapshots: Dict[Path, tuple[int, ...]] = {}
+
+    def read_status(path: Path, role: str) -> os.stat_result:
+        try:
+            return lstat(path)
+        except FileNotFoundError as exc:
+            raise HostCommandError(
+                f"{role} must be pre-created by the provisioner: {path}"
+            ) from exc
+
+    def remember(path: Path, status: os.stat_result) -> None:
+        previous = snapshots.setdefault(path, status_identity(status))
+        if previous != status_identity(status):
+            raise HostCommandError(f"service path changed during verification: {path}")
+
+    generated = Path(generated_root)
+    if not generated.is_absolute():
+        raise HostCommandError("generated runtime root must be absolute")
+    trusted_ancestor = generated.parent
+    while True:
+        trusted_status = read_status(
+            trusted_ancestor, "generated runtime trusted ancestor"
+        )
+        trusted_mode = stat.S_IMODE(trusted_status.st_mode)
+        if (
+            not stat.S_ISDIR(trusted_status.st_mode)
+            or trusted_status.st_uid != 0
+            or trusted_mode & 0o022
+            or trusted_mode & 0o001 != 0o001
+        ):
+            raise HostCommandError(
+                "generated runtime trusted ancestor is writable, unreadable, "
+                "or not root-owned"
+            )
+        remember(trusted_ancestor, trusted_status)
+        if trusted_ancestor.parent == trusted_ancestor:
+            break
+        trusted_ancestor = trusted_ancestor.parent
+    generated_status = read_status(generated, "generated runtime root")
+    if (
+        not stat.S_ISDIR(generated_status.st_mode)
+        or generated_status.st_uid != 0
+        or stat.S_IMODE(generated_status.st_mode) != 0o755
+    ):
+        raise HostCommandError(
+            "generated runtime root is unsafe, unreadable, or not root-owned"
+        )
+    remember(generated, generated_status)
+
+    for raw_path in generated_paths:
+        path = Path(raw_path)
+        try:
+            relative = path.relative_to(generated)
+        except ValueError as exc:
+            raise HostCommandError(
+                "generated service path escapes the generated runtime root"
+            ) from exc
+        if ".." in relative.parts:
+            raise HostCommandError(
+                "generated service path escapes the generated runtime root"
+            )
+        current = generated
+        chain = (generated,) if not relative.parts else ()
+        for part in relative.parts:
+            current = current / part
+            chain = (*chain, current)
+        for candidate in chain:
+            status = read_status(candidate, "generated service path")
+            mode = stat.S_IMODE(status.st_mode)
+            if status.st_uid != 0 or (
+                stat.S_ISDIR(status.st_mode)
+                and mode != 0o755
+                or stat.S_ISREG(status.st_mode)
+                and mode != 0o644
+                or not (stat.S_ISDIR(status.st_mode) or stat.S_ISREG(status.st_mode))
+            ):
+                raise HostCommandError(
+                    "generated service path is unsafe, unreadable, or not "
+                    f"root-owned: {candidate}"
+                )
+            remember(candidate, status)
+
+    root = Path(control_root)
+    if not root.is_absolute():
+        raise HostCommandError("service control root must be absolute")
+    mutable_directory_paths = {root, *map(Path, mutable_directories)}
+    for directory in sorted(
+        mutable_directory_paths, key=lambda path: (len(path.parts), str(path))
+    ):
+        try:
+            relative = directory.relative_to(root)
+        except ValueError:
+            if not directory.is_absolute():
+                raise HostCommandError("mutable service directory must be absolute")
+            chain = (directory,)
+        else:
+            if ".." in relative.parts:
+                raise HostCommandError(
+                    "service control directory escapes the promotion root"
+                )
+            current = root
+            chain = (root,) if not relative.parts else ()
+            for part in relative.parts:
+                current = current / part
+                chain = (*chain, current)
+        for candidate in chain:
+            status = read_status(candidate, "mutable service directory")
+            mode = stat.S_IMODE(status.st_mode)
+            if (
+                not stat.S_ISDIR(status.st_mode)
+                or (status.st_uid, status.st_gid) != (uid, gid)
+                or mode & 0o700 != 0o700
+                or mode & 0o022
+            ):
+                raise HostCommandError(
+                    "mutable service directory has unsafe ownership or mode: "
+                    f"{candidate}"
+                )
+            remember(candidate, status)
+
+    mutable_file_paths = set(map(Path, mutable_files))
+    for path in mutable_file_paths:
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise HostCommandError(
+                "service control file escapes the promotion root"
+            ) from exc
+        if ".." in path.relative_to(root).parts:
+            raise HostCommandError("service control file escapes the promotion root")
+        status = read_status(path, "mutable service file")
+        mode = stat.S_IMODE(status.st_mode)
+        if (
+            not stat.S_ISREG(status.st_mode)
+            or (status.st_uid, status.st_gid) != (uid, gid)
+            or mode & 0o600 != 0o600
+            or mode & 0o077
+        ):
+            raise HostCommandError(
+                f"mutable service file has unsafe ownership or mode: {path}"
+            )
+        remember(path, status)
+
+    for path, expected in snapshots.items():
+        if status_identity(read_status(path, "service path")) != expected:
+            raise HostCommandError(f"service path changed during verification: {path}")
 
 
 def _reconcile_argv(value: Sequence[str], role: str) -> list[str]:
@@ -220,6 +505,78 @@ def _write_text_file(path: Path, data: str) -> None:
     atomic_write_bytes(path, encoded)
 
 
+def _write_json_file(path: Path, value: Mapping[str, Any]) -> None:
+    _write_text_file(path, canonical_json(value) + "\n")
+
+
+def _ensure_generated_directory(path: Path) -> None:
+    directory = Path(path)
+    if os.geteuid() != 0:
+        directory.mkdir(mode=0o755, parents=True, exist_ok=True)
+        return
+    ancestor = directory.parent
+    parent_status = None
+    while True:
+        ancestor_status = os.lstat(ancestor)
+        ancestor_mode = stat.S_IMODE(ancestor_status.st_mode)
+        if (
+            not stat.S_ISDIR(ancestor_status.st_mode)
+            or ancestor_status.st_uid != 0
+            or ancestor_mode & 0o022
+            or ancestor_mode & 0o001 != 0o001
+        ):
+            raise HostCommandError(
+                "generated directory ancestor is writable, unreadable, or "
+                "not root-owned"
+            )
+        if ancestor == directory.parent:
+            parent_status = ancestor_status
+        if ancestor.parent == ancestor:
+            break
+        ancestor = ancestor.parent
+    if parent_status is None:
+        raise HostCommandError("generated directory parent is unavailable")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    parent_fd = os.open(directory.parent, flags)
+    try:
+        opened_parent = os.fstat(parent_fd)
+        if (
+            opened_parent.st_dev,
+            opened_parent.st_ino,
+            stat.S_IFMT(opened_parent.st_mode),
+        ) != (
+            parent_status.st_dev,
+            parent_status.st_ino,
+            stat.S_IFMT(parent_status.st_mode),
+        ):
+            raise HostCommandError("generated directory parent changed")
+        created = False
+        try:
+            child_fd = os.open(directory.name, flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            os.mkdir(directory.name, 0o755, dir_fd=parent_fd)
+            child_fd = os.open(directory.name, flags, dir_fd=parent_fd)
+            created = True
+        try:
+            child_status = os.fstat(child_fd)
+            if not stat.S_ISDIR(child_status.st_mode) or child_status.st_uid != 0:
+                raise HostCommandError(
+                    "generated directory is unsafe or not root-owned"
+                )
+            if created:
+                os.fchmod(child_fd, 0o755)
+            elif stat.S_IMODE(child_status.st_mode) != 0o755:
+                raise HostCommandError("generated directory mode is unsafe")
+        finally:
+            os.close(child_fd)
+    finally:
+        os.close(parent_fd)
+
+
 def _parse_command_json(value: Optional[str], role: str) -> Optional[Sequence[str]]:
     if value is None:
         return None
@@ -260,8 +617,10 @@ def build_live_runtime(
     autonomy_policy: Optional[Path] = None,
     cluster_executor_spec: Optional[Path] = None,
     adaptive_training_spec: Optional[Path] = None,
+    suite_rotation_spec: Optional[Path] = None,
     suite_registry_spec: Optional[Path] = None,
     evaluator_process_count: int = 8,
+    ownership_helper: Optional[Callable[..., None]] = None,
 ) -> Mapping[str, Any]:
     repository = Path(repo).resolve()
     root = Path(run_root).resolve()
@@ -276,46 +635,58 @@ def build_live_runtime(
     if not actor or not gpu_uuid.startswith("GPU-"):
         raise HostCommandError("actor and verified GPU UUID are required")
     if (
-        type(evaluator_process_count) is not int
-        or evaluator_process_count not in {4, 8, 16}
+        service_user is not None
+        and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", service_user) is None
     ):
+        raise HostCommandError("systemd service user is invalid")
+    if type(evaluator_process_count) is not int or evaluator_process_count not in {
+        4,
+        8,
+        16,
+    }:
         raise HostCommandError(
             "evaluator process count must be benchmarked at 4, 8, or 16"
         )
+    policy_path = repository / "python" / "risk_score" / "promotion_policy_v3.json"
+    _required_file(policy_path, "promotion policy")
+    try:
+        promotion_policy_value = load_policy(policy_path)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HostCommandError(f"promotion policy is invalid: {exc}") from exc
+    policy_process_cap = _stage1_evaluator_process_cap(promotion_policy_value)
+    stage1_evaluator_process_count = min(evaluator_process_count, policy_process_cap)
+    stage1_parallelism = {
+        "benchmark_selected_process_count": evaluator_process_count,
+        "policy_maximum_evaluator_processes": policy_process_cap,
+        "effective_process_count": stage1_evaluator_process_count,
+    }
     shuffler_argv = _service_argv(shuffler_command, "shuffler")
     exporter_argv = _service_argv(exporter_command, "exporter")
     evaluator_argv = _service_argv(evaluator_command, "evaluator")
-    executor_argv = _service_argv(
-        cluster_executor_command, "cluster executor"
-    )
-    adaptive_argv = _service_argv(
-        adaptive_training_command, "adaptive training"
-    )
-    suite_rotation_argv = _service_argv(
-        suite_rotation_command, "suite rotation"
-    )
+    executor_argv = _service_argv(cluster_executor_command, "cluster executor")
+    adaptive_argv = _service_argv(adaptive_training_command, "adaptive training")
+    suite_rotation_argv = _service_argv(suite_rotation_command, "suite rotation")
     autonomy_commands = (executor_argv, adaptive_argv, suite_rotation_argv)
     runtime_autonomy: Optional[Mapping[str, Any]] = None
+    autonomy_mutable_directories: tuple[Path, ...] = ()
+    resolved_suite_rotation_spec = _resolve_suite_rotation_spec(
+        suite_rotation_spec, suite_registry_spec
+    )
     if type(full_autonomy) is not bool:
         raise HostCommandError("full autonomy flag must be boolean")
-    if full_autonomy and (
-        not mutation_enabled
-        or not all(autonomy_commands)
-    ):
+    if full_autonomy and (not mutation_enabled or not all(autonomy_commands)):
         raise HostCommandError(
             "full autonomy requires mutation mode and every autonomy service command"
         )
     if not full_autonomy and any(autonomy_commands):
-        raise HostCommandError(
-            "autonomy service commands require full autonomy mode"
-        )
+        raise HostCommandError("autonomy service commands require full autonomy mode")
     autonomy_input_paths: Dict[str, Path] = {}
     if full_autonomy:
         raw_inputs = {
             "autonomy_policy": autonomy_policy,
             "executor_spec": cluster_executor_spec,
             "adaptive_spec": adaptive_training_spec,
-            "suite_registry_spec": suite_registry_spec,
+            "suite_rotation_spec": resolved_suite_rotation_spec,
         }
         if any(path is None for path in raw_inputs.values()):
             raise HostCommandError(
@@ -328,7 +699,7 @@ def build_live_runtime(
         for role, command, spec_name in (
             ("cluster executor", executor_argv, "executor_spec"),
             ("adaptive training", adaptive_argv, "adaptive_spec"),
-            ("suite rotation", suite_rotation_argv, "suite_registry_spec"),
+            ("suite rotation", suite_rotation_argv, "suite_rotation_spec"),
         ):
             if str(autonomy_input_paths[spec_name]) not in command:
                 raise HostCommandError(
@@ -355,7 +726,7 @@ def build_live_runtime(
             contract="risk-score-adaptive-training-service-spec-v1",
         )
         suite_service_value = _self_hashed_spec(
-            autonomy_input_paths["suite_registry_spec"],
+            autonomy_input_paths["suite_rotation_spec"],
             role="suite rotation service specification",
             contract="risk-score-suite-rotation-service-spec-v1",
         )
@@ -366,11 +737,7 @@ def build_live_runtime(
         }
         guardian_prefixes = {
             canonical_json(executor_spec_value.get("gpu7_guardian_prefix")),
-            canonical_json(
-                adaptive_spec_value.get(
-                    "gpu_lease_guardian_argv_prefix"
-                )
-            ),
+            canonical_json(adaptive_spec_value.get("gpu_lease_guardian_argv_prefix")),
             canonical_json(suite_service_value.get("guardian_argv_prefix")),
         }
         if (
@@ -391,12 +758,27 @@ def build_live_runtime(
         if (
             adaptive_spec_value.get("autonomy_policy_path")
             != str(autonomy_input_paths["autonomy_policy"])
-            or adaptive_spec_value.get("autonomy_policy_sha256")
-            != AUTONOMY_POLICY_HASH
+            or adaptive_spec_value.get("autonomy_policy_sha256") != AUTONOMY_POLICY_HASH
         ):
             raise HostCommandError(
                 "adaptive service does not bind the frozen autonomy policy"
             )
+        mutable_service_paths = (
+            executor_spec_value.get("state_directory"),
+            adaptive_spec_value.get("root"),
+            suite_service_value.get("root"),
+            next(iter(scheduler_paths)),
+        )
+        if any(
+            not isinstance(path, str) or not Path(path).is_absolute()
+            for path in mutable_service_paths
+        ):
+            raise HostCommandError(
+                "autonomy mutable service directories must be absolute"
+            )
+        autonomy_mutable_directories = tuple(
+            Path(path) for path in mutable_service_paths
+        )
         registry_binding = suite_service_value.get("registry_spec")
         if not isinstance(registry_binding, Mapping):
             raise HostCommandError(
@@ -409,33 +791,26 @@ def build_live_runtime(
             or not registry_path.is_file()
             or file_sha256(registry_path) != registry_binding.get("sha256")
         ):
-            raise HostCommandError(
-                "suite registry specification changed or is unsafe"
-            )
+            raise HostCommandError("suite registry specification changed or is unsafe")
         registry_value = _self_hashed_spec(
             registry_path,
             role="suite registry specification",
             contract="risk-score-evaluation-suite-registry-spec-v1",
         )
+        autonomy_input_paths["suite_registry_spec"] = registry_path
         active_suite_path = (
-            Path(str(registry_value.get("registry_root", "")))
-            / "active-suite.json"
+            Path(str(registry_value.get("registry_root", ""))) / "active-suite.json"
         )
-        active_suite = _canonical_json_file(
-            active_suite_path, "active suite pointer"
-        )
+        active_suite = _canonical_json_file(active_suite_path, "active suite pointer")
         active_body = dict(active_suite)
         active_record_hash = active_body.pop("record_sha256", None)
         manifest_path = suites / "manifest.json"
         if (
-            active_suite.get("contract")
-            != "risk-score-active-evaluation-suite-v1"
+            active_suite.get("contract") != "risk-score-active-evaluation-suite-v1"
             or active_record_hash != policy_sha256(active_body)
-            or active_suite.get("spec_sha256")
-            != registry_value.get("spec_sha256")
+            or active_suite.get("spec_sha256") != registry_value.get("spec_sha256")
             or active_suite.get("manifest_path") != str(manifest_path)
-            or active_suite.get("manifest_sha256")
-            != file_sha256(manifest_path)
+            or active_suite.get("manifest_sha256") != file_sha256(manifest_path)
             or suites.name != active_suite.get("suite_id")
         ):
             raise HostCommandError(
@@ -459,9 +834,7 @@ def build_live_runtime(
             },
         }
     if mutation_enabled and (
-        service_user is None
-        or not shuffler_argv
-        or not exporter_argv
+        service_user is None or not shuffler_argv or not exporter_argv
     ):
         raise HostCommandError(
             "automatic runtime requires service user, shuffler, and exporter commands"
@@ -479,18 +852,14 @@ def build_live_runtime(
     trainer_spec_path = _required_file(trainer_spec, "trainer launch spec")
     consumer_spec_path = _required_file(consumer_spec, "consumer stop spec")
     try:
-        trainer_spec_value = json.loads(
-            trainer_spec_path.read_text(encoding="utf-8")
-        )
+        trainer_spec_value = json.loads(trainer_spec_path.read_text(encoding="utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise HostCommandError(f"trainer launch spec is invalid: {exc}") from exc
     if not isinstance(trainer_spec_value, dict):
         raise HostCommandError("trainer launch spec must be an object")
     if mutation_enabled:
         trainer_argv = trainer_spec_value.get("argv")
-        provenance_root = str(
-            root / "promotion" / "provenance" / "trainer"
-        )
+        provenance_root = str(root / "promotion" / "provenance" / "trainer")
         provenance_index = (
             trainer_argv.index("-generation-provenance-dir")
             if isinstance(trainer_argv, list)
@@ -539,6 +908,17 @@ def build_live_runtime(
     )
     promotion = json.loads(promotion_example.read_text(encoding="utf-8"))
     gpu = json.loads(gpu_example.read_text(encoding="utf-8"))
+    policy_identity = policy_sha256(promotion_policy_value)
+    promotion_hashes = (
+        promotion.get("hashes") if isinstance(promotion, Mapping) else None
+    )
+    if (
+        not isinstance(promotion_hashes, Mapping)
+        or promotion_hashes.get("policy") != policy_identity
+    ):
+        raise HostCommandError(
+            "promotion policy does not match the hash-bound frozen runtime"
+        )
     replacements = {
         "/replace/me/katago-run": str(root),
         "/replace/me/kata-go": str(repository),
@@ -548,6 +928,11 @@ def build_live_runtime(
     for command in promotion["commands"].values():
         if command and command[0].endswith("/python/.venv/bin/python"):
             command[0] = str(python)
+    promotion["commands"]["evaluator"] = _configure_promotion_evaluator_argv(
+        promotion["commands"].get("evaluator"),
+        effective_processes=stage1_evaluator_process_count,
+        policy_maximum=policy_process_cap,
+    )
     for key in ("launchCommand", "gracefulCommand"):
         gpu["trainer"][key][0] = str(python)
     promotion_root = root / "promotion"
@@ -577,12 +962,15 @@ def build_live_runtime(
         "evaluator-unsupported",
     ]
     gpu_path = output / "gpu-lease-runtime.json"
-    output.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(gpu_path, gpu)
+    _ensure_generated_directory(output)
+    _write_json_file(gpu_path, gpu)
 
-    policy_path = repository / "python" / "risk_score" / "promotion_policy_v3.json"
-    powered = repository / "cpp" / "configs" / "risk_score" / "promotion_powered_match.cfg"
-    standard = repository / "cpp" / "configs" / "risk_score" / "promotion_standard_match.cfg"
+    powered = (
+        repository / "cpp" / "configs" / "risk_score" / "promotion_powered_match.cfg"
+    )
+    standard = (
+        repository / "cpp" / "configs" / "risk_score" / "promotion_standard_match.cfg"
+    )
     analysis_config = (
         repository
         / "cpp"
@@ -605,19 +993,13 @@ def build_live_runtime(
         if standard_confirmation.read_bytes() != confirmation_bytes:
             raise HostCommandError("standard confirmation copy conflicts")
     else:
-        standard_confirmation.write_bytes(confirmation_bytes)
+        atomic_write_bytes(standard_confirmation, confirmation_bytes, mode=0o644)
     schedules = {
         "discoveryOrdinarySchedule": suites / "schedules" / "discovery.jsonl",
-        "confirmationOrdinarySchedule": suites
-        / "schedules"
-        / "confirmation.jsonl",
+        "confirmationOrdinarySchedule": suites / "schedules" / "confirmation.jsonl",
         "auditSchedule": suites / "schedules" / "audit.jsonl",
-        "lead40Schedule": suites
-        / "schedules"
-        / "lead-40-confirmation.jsonl",
-        "lead80Schedule": suites
-        / "schedules"
-        / "lead-80-confirmation.jsonl",
+        "lead40Schedule": suites / "schedules" / "lead-40-confirmation.jsonl",
+        "lead80Schedule": suites / "schedules" / "lead-80-confirmation.jsonl",
         "standardConfirmationSchedule": standard_confirmation,
     }
     for path, role in (
@@ -633,9 +1015,7 @@ def build_live_runtime(
     promotion["mutationEnabled"] = mutation_enabled
     if full_autonomy:
         if runtime_autonomy is None:
-            raise HostCommandError(
-                "full-autonomy runtime has no control-plane binding"
-            )
+            raise HostCommandError("full-autonomy runtime has no control-plane binding")
         promotion["schemaVersion"] = 2
         promotion["autonomy"] = dict(runtime_autonomy)
     promotion["actor"] = actor
@@ -656,12 +1036,8 @@ def build_live_runtime(
             "controllerLock": str(promotion_root / "controller.lock"),
             "champion": str(promotion_root / "champion.json"),
             "candidateInbox": str(root / "modelstobetested"),
-            "candidateQuarantine": str(
-                promotion_root / "candidates" / "quarantined"
-            ),
-            "candidateSuperseded": str(
-                promotion_root / "candidates" / "superseded"
-            ),
+            "candidateQuarantine": str(promotion_root / "candidates" / "quarantined"),
+            "candidateSuperseded": str(promotion_root / "candidates" / "superseded"),
             "candidateRejected": str(promotion_root / "candidates" / "rejected"),
             "candidateDeduplicated": str(
                 promotion_root / "candidates" / "deduplicated"
@@ -680,9 +1056,7 @@ def build_live_runtime(
             "selfplayConfig": str(selfplay),
             "gpuLeaseConfig": str(gpu_path),
             "dataWatermark": str(promotion_root / "watermarks" / "data.json"),
-            "shuffleWatermark": str(
-                promotion_root / "watermarks" / "shuffle.json"
-            ),
+            "shuffleWatermark": str(promotion_root / "watermarks" / "shuffle.json"),
             "workerAckInbox": str(promotion_root / "ipc" / "worker-acks"),
             "rolloutReportInbox": str(promotion_root / "ipc" / "rollout-reports"),
             "originalModel": str(original),
@@ -695,7 +1069,7 @@ def build_live_runtime(
         ),
         "source": _sha256_text(source_revision),
         "original": file_sha256(original),
-        "policy": policy_sha256(load_policy(policy_path)),
+        "policy": policy_identity,
         "poweredConfig": file_sha256(powered),
         "standardConfig": file_sha256(standard),
         **{name: file_sha256(path) for name, path in schedules.items()},
@@ -704,7 +1078,7 @@ def build_live_runtime(
         "suiteManifest": file_sha256(manifest),
     }
     promotion_path = output / "promotion-runtime.json"
-    atomic_write_json(promotion_path, promotion)
+    _write_json_file(promotion_path, promotion)
     boot_ready_path = promotion_root / "supervisor" / "boot-ready.json"
     supervisor_argv = [
         str(python),
@@ -826,12 +1200,8 @@ def build_live_runtime(
         "7",
     ]
     shuffler_environment = {
-        "KATAGO_DATA_WATERMARK": str(
-            promotion_root / "watermarks" / "data.json"
-        ),
-        "KATAGO_STRICT_SHUFFLE_PROVENANCE": (
-            "1" if mutation_enabled else "0"
-        ),
+        "KATAGO_DATA_WATERMARK": str(promotion_root / "watermarks" / "data.json"),
+        "KATAGO_STRICT_SHUFFLE_PROVENANCE": ("1" if mutation_enabled else "0"),
     }
     exporter_environment = {
         "KATAGO_HARDENED_EXPORTER": str(
@@ -876,15 +1246,9 @@ def build_live_runtime(
         if full_autonomy:
             reconcile_commands.extend(
                 [
-                    _reconcile_argv(
-                        executor_argv, "cluster executor"
-                    ),
-                    _reconcile_argv(
-                        adaptive_argv, "adaptive training"
-                    ),
-                    _reconcile_argv(
-                        suite_rotation_argv, "suite rotation"
-                    ),
+                    _reconcile_argv(executor_argv, "cluster executor"),
+                    _reconcile_argv(adaptive_argv, "adaptive training"),
+                    _reconcile_argv(suite_rotation_argv, "suite rotation"),
                 ]
             )
         reconcile_commands.extend(
@@ -953,9 +1317,8 @@ def build_live_runtime(
 
     systemd_units: Dict[str, Mapping[str, str]] = {}
     if service_user is not None:
-        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", service_user) is None:
-            raise HostCommandError("systemd service user is invalid")
         units_dir = output / "systemd"
+        _ensure_generated_directory(units_dir)
         unit_names = {
             "supervisor": "katago-risk-promotion-host.service",
             "controller": "katago-risk-promotion-controller.service",
@@ -964,11 +1327,7 @@ def build_live_runtime(
             "shuffler": "katago-risk-shuffler.service",
             "exporter": "katago-risk-exporter.service",
             "reconcile": "katago-risk-boot-reconcile.service",
-            **(
-                AUTONOMY_SERVICE_UNIT_NAMES
-                if full_autonomy
-                else {}
-            ),
+            **(AUTONOMY_SERVICE_UNIT_NAMES if full_autonomy else {}),
         }
         for name, spec in services.items():
             dependencies = []
@@ -985,16 +1344,10 @@ def build_live_runtime(
             if mutation_enabled and name not in {"supervisor", "reconcile"}:
                 dependencies.append("katago-risk-boot-reconcile.service")
             if name in {"adaptive", "suite_rotation"}:
-                dependencies.append(
-                    AUTONOMY_SERVICE_UNIT_NAMES["executor"]
-                )
-                dependencies.append(
-                    "katago-risk-promotion-controller.service"
-                )
+                dependencies.append(AUTONOMY_SERVICE_UNIT_NAMES["executor"])
+                dependencies.append("katago-risk-promotion-controller.service")
             if name == "suite_rotation":
-                dependencies.append(
-                    "katago-risk-promotion-auditor.service"
-                )
+                dependencies.append("katago-risk-promotion-auditor.service")
             before = (
                 tuple(
                     unit_names[service_name]
@@ -1071,17 +1424,25 @@ def build_live_runtime(
         "mutation_enabled": mutation_enabled,
         "full_autonomy": full_autonomy,
         "evaluator_process_count": evaluator_process_count,
+        "stage1_evaluator_parallelism": dict(stage1_parallelism),
         **(
             {
                 "service_inputs": {
                     name: {
-                        "path": str(path),
-                        "sha256": file_sha256(path),
+                        "path": str(autonomy_input_paths[name]),
+                        "sha256": file_sha256(autonomy_input_paths[name]),
                     }
-                    for name, path in sorted(
-                        autonomy_input_paths.items()
+                    for name in (
+                        "adaptive_spec",
+                        "autonomy_policy",
+                        "executor_spec",
+                        "suite_registry_spec",
                     )
-                }
+                },
+                "suite_rotation_spec": {
+                    "path": str(autonomy_input_paths["suite_rotation_spec"]),
+                    "sha256": file_sha256(autonomy_input_paths["suite_rotation_spec"]),
+                },
             }
             if full_autonomy
             else {}
@@ -1093,7 +1454,7 @@ def build_live_runtime(
         "controller_argv": controller_argv,
     }
     service_path = output / "promotion-services.json"
-    atomic_write_json(service_path, service_spec)
+    _write_json_file(service_path, service_spec)
     from risk_score.promotion_controller import RuntimeConfig
 
     RuntimeConfig.load(promotion_path)
@@ -1118,10 +1479,7 @@ def build_live_runtime(
         / "python"
         / "risk_score"
         / "promotion_evidence.py",
-        "promotion_gate": repository
-        / "python"
-        / "risk_score"
-        / "promotion_gate.py",
+        "promotion_gate": repository / "python" / "risk_score" / "promotion_gate.py",
         "hardened_exporter": repository
         / "python"
         / "risk_score"
@@ -1147,10 +1505,7 @@ def build_live_runtime(
         "promotion_runtime": promotion_path,
         "gpu_lease_runtime": gpu_path,
         "service_spec": service_path,
-        **{
-            f"autonomy:{name}": path
-            for name, path in autonomy_input_paths.items()
-        },
+        **{f"autonomy:{name}": path for name, path in autonomy_input_paths.items()},
     }
     command_bindings = {
         "trainer": tuple(trainer_spec_value.get("argv", ())),
@@ -1177,15 +1532,15 @@ def build_live_runtime(
             deployment_files[f"command:{command_name}:{index}"] = resolved
     for name, unit in systemd_units.items():
         deployment_files[f"systemd:{name}"] = Path(unit["path"])
-    for module_path in sorted(
-        (repository / "python" / "risk_score").glob("*.py")
-    ):
+    for module_path in sorted((repository / "python" / "risk_score").glob("*.py")):
         deployment_files[f"module:{module_path.name}"] = module_path
     deployment = {
         "schema_version": 1,
         "contract": "risk-score-live-runtime-deployment-v1",
         "source_revision": actual_revision,
         "source_sha256": _sha256_text(actual_revision),
+        "evaluator_process_count": evaluator_process_count,
+        "stage1_evaluator_parallelism": dict(stage1_parallelism),
         "files": {
             name: {"path": str(path), "sha256": file_sha256(path)}
             for name, path in sorted(deployment_files.items())
@@ -1193,7 +1548,46 @@ def build_live_runtime(
     }
     deployment["manifest_sha256"] = policy_sha256(deployment)
     deployment_path = output / "deployment-manifest.json"
-    atomic_write_json(deployment_path, deployment)
+    _write_json_file(deployment_path, deployment)
+    if service_user is not None:
+        generated_paths = {
+            output,
+            standard_confirmation,
+            gpu_path,
+            promotion_path,
+            service_path,
+            deployment_path,
+            *(Path(unit["path"]) for unit in systemd_units.values()),
+            *(Path(unit["path"]).parent for unit in systemd_units.values()),
+        }
+        mutable_directories = (
+            promotion_root / "supervisor",
+            promotion_root / "events",
+            promotion_root / "evaluations",
+            promotion_root / "reports",
+            promotion_root / "candidates" / "quarantined",
+            promotion_root / "candidates" / "superseded",
+            promotion_root / "candidates" / "rejected",
+            promotion_root / "candidates" / "deduplicated",
+            promotion_root / "accepted",
+            promotion_root / "rollouts",
+            promotion_root / "rollback",
+            promotion_root / "watermarks",
+            promotion_root / "ipc" / "worker-acks",
+            promotion_root / "ipc" / "rollout-reports",
+            promotion_root / "operations",
+            promotion_root / "provenance" / "trainer",
+            *((promotion_root / "adaptive",) if full_autonomy else ()),
+            *autonomy_mutable_directories,
+        )
+        (ownership_helper or _ensure_service_user_ownership)(
+            service_user=service_user,
+            generated_root=output,
+            generated_paths=tuple(sorted(generated_paths, key=str)),
+            control_root=promotion_root,
+            mutable_directories=mutable_directories,
+            mutable_files=(promotion_root / "controller.lock",),
+        )
     return {
         "promotion_runtime": str(promotion_path),
         "promotion_runtime_sha256": file_sha256(promotion_path),
@@ -1268,7 +1662,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--autonomy-policy", type=Path)
     parser.add_argument("--cluster-executor-spec", type=Path)
     parser.add_argument("--adaptive-training-spec", type=Path)
-    parser.add_argument("--suite-registry-spec", type=Path)
+    parser.add_argument("--suite-rotation-spec", type=Path)
+    parser.add_argument("--suite-registry-spec", type=Path, help=argparse.SUPPRESS)
     parser.add_argument(
         "--evaluator-process-count",
         type=int,
@@ -1321,6 +1716,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             autonomy_policy=args.autonomy_policy,
             cluster_executor_spec=args.cluster_executor_spec,
             adaptive_training_spec=args.adaptive_training_spec,
+            suite_rotation_spec=args.suite_rotation_spec,
             suite_registry_spec=args.suite_registry_spec,
             evaluator_process_count=args.evaluator_process_count,
         )

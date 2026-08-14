@@ -504,6 +504,7 @@ class BootstrapSpec:
                 "--autonomy-policy",
                 "--cluster-executor-spec",
                 "--adaptive-training-spec",
+                "--suite-rotation-spec",
                 "--suite-registry-spec",
             },
             switch_flags={"--mutation-enabled", "--full-autonomy"},
@@ -530,10 +531,29 @@ class BootstrapSpec:
                 "--autonomy-policy",
                 "--cluster-executor-spec",
                 "--adaptive-training-spec",
-                "--suite-registry-spec",
             },
             required_switch_flags={"--mutation-enabled", "--full-autonomy"},
             role="runtime.argv",
+        )
+        suite_rotation_spec = runtime_flags.get("--suite-rotation-spec")
+        deprecated_suite_registry_spec = runtime_flags.pop(
+            "--suite-registry-spec", None
+        )
+        if suite_rotation_spec is None and deprecated_suite_registry_spec is None:
+            raise BootstrapError(
+                "runtime.argv is incomplete; missing=['--suite-rotation-spec']"
+            )
+        if (
+            suite_rotation_spec is not None
+            and deprecated_suite_registry_spec is not None
+            and suite_rotation_spec != deprecated_suite_registry_spec
+        ):
+            raise BootstrapError(
+                "runtime suite rotation specification contradicts deprecated "
+                "--suite-registry-spec alias"
+            )
+        runtime_flags["--suite-rotation-spec"] = (
+            suite_rotation_spec or deprecated_suite_registry_spec
         )
         if runtime_flags["--output-dir"] != str(output_dir):
             raise BootstrapError("runtime argv output directory contradicts the spec")
@@ -546,6 +566,7 @@ class BootstrapSpec:
                 "runtime evaluator process count must use the "
                 "selected-topology placeholder"
             )
+        runtime_commands: Dict[str, Sequence[str]] = {}
         for command_flag in (
             "--shuffler-command-json",
             "--exporter-command-json",
@@ -567,15 +588,23 @@ class BootstrapSpec:
                 or not Path(command[0]).is_absolute()
             ):
                 raise BootstrapError(f"{command_flag} must encode an absolute argv")
+            runtime_commands[command_flag] = command
         for input_flag in (
             "--autonomy-policy",
             "--cluster-executor-spec",
             "--adaptive-training-spec",
-            "--suite-registry-spec",
+            "--suite-rotation-spec",
         ):
             input_path = _absolute_path(runtime_flags[input_flag], input_flag)
             if input_path.is_symlink() or not input_path.is_file():
                 raise BootstrapError(f"{input_flag} must name a regular file")
+        if (
+            runtime_flags["--suite-rotation-spec"]
+            not in runtime_commands["--suite-rotation-command-json"]
+        ):
+            raise BootstrapError(
+                "suite rotation command does not bind --suite-rotation-spec"
+            )
 
         activation_raw = raw["activation"]
         if not isinstance(activation_raw, Mapping):
@@ -1262,7 +1291,9 @@ class AutonomyBootstrap:
         sleep: Callable[[float], None] = time.sleep,
         failure_hook: Optional[FailureHook] = None,
     ) -> None:
-        self.spec = spec if isinstance(spec, BootstrapSpec) else BootstrapSpec.load(spec)
+        self.spec = (
+            spec if isinstance(spec, BootstrapSpec) else BootstrapSpec.load(spec)
+        )
         if expected_spec_sha256 is not None:
             expected = _require_sha256(
                 expected_spec_sha256, "expected bootstrap specification hash"
@@ -1774,9 +1805,7 @@ class AutonomyBootstrap:
             for name in file_names:
                 child = current / name
                 if child.is_symlink() or not child.is_file():
-                    raise BootstrapError(
-                        f"generated runtime file is unsafe: {child}"
-                    )
+                    raise BootstrapError(f"generated runtime file is unsafe: {child}")
                 os.chmod(child, 0o644)
 
     def _prepare_runtime(self, selected: int) -> Mapping[str, Any]:
@@ -2182,9 +2211,7 @@ BootstrapRunner = AutonomyBootstrap
 
 def _systemd_quote(value: str) -> str:
     return (
-        '"'
-        + value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
-        + '"'
+        '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"'
     )
 
 
@@ -2195,12 +2222,8 @@ def render_bootstrap_systemd_unit(
     spec_path: Path,
     run_root: Path,
 ) -> str:
-    python = _absolute_path(
-        str(python_executable), "bootstrap Python executable"
-    )
-    working = _absolute_path(
-        str(working_directory), "bootstrap working directory"
-    )
+    python = _absolute_path(str(python_executable), "bootstrap Python executable")
+    working = _absolute_path(str(working_directory), "bootstrap working directory")
     spec = _absolute_path(str(spec_path), "bootstrap specification")
     root = _absolute_path(str(run_root), "bootstrap run root")
     if (

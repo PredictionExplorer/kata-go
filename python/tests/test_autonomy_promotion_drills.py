@@ -536,6 +536,21 @@ def test_shadow_replays_are_independent_identical_and_read_only(
     assert_bootstrap_accepts(evidence_root, "shadow-controller-replay")
 
 
+def test_shadow_replay_projection_ignores_volatile_disk_telemetry():
+    first = {
+        "mode": "recommend-only",
+        "backpressure": {"diskFreeBytes": 100, "exportPaused": False},
+    }
+    second = {
+        "mode": "recommend-only",
+        "backpressure": {"diskFreeBytes": 99, "exportPaused": False},
+    }
+
+    assert drills._shadow_recommendation_projection(
+        first
+    ) == drills._shadow_recommendation_projection(second)
+
+
 def test_lease_updated_checkpoint_becomes_dynamic_drill_baseline(
     tmp_path, production_runtime
 ):

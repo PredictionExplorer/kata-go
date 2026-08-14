@@ -2397,6 +2397,16 @@ def _run_rollback_after_gate(
     }
 
 
+def _shadow_recommendation_projection(value: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Remove host telemetry that is not part of a controller recommendation."""
+
+    projected = json.loads(canonical_json_bytes(value))
+    backpressure = projected.get("backpressure")
+    if isinstance(backpressure, dict):
+        backpressure.pop("diskFreeBytes", None)
+    return projected
+
+
 def _run_shadow_gate(
     spec: DrillSpec,
     production: RuntimeConfig,
@@ -2427,9 +2437,11 @@ def _run_shadow_gate(
         now=frozen_now,
     )
     first = first_controller.run_once()
-    first_hash = canonical_sha256(first)
+    first_projection = _shadow_recommendation_projection(first)
+    first_hash = canonical_sha256(first_projection)
     second = second_controller.run_once()
-    second_hash = canonical_sha256(second)
+    second_projection = _shadow_recommendation_projection(second)
+    second_hash = canonical_sha256(second_projection)
     after = _snapshot_path(scenario.root)
     event_log = _snapshot_path(shadow.promotion_root / "events")
     if (
@@ -2450,6 +2462,8 @@ def _run_shadow_gate(
     return checks, {
         "first_replay": first,
         "second_replay": second,
+        "first_recommendation_projection": first_projection,
+        "second_recommendation_projection": second_projection,
         "disposable_tree_before": before,
         "disposable_tree_after": after,
         "event_log": event_log,

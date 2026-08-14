@@ -247,6 +247,19 @@ def make_fixture(tmp_path, *, suite_present=False):
             path.write_bytes((name + "\n").encode("utf-8"))
         file_paths[name] = path
     os.chmod(file_paths["katago_binary"], 0o755)
+    for name, contract in (
+        (
+            "suite_registry_spec",
+            "risk-score-evaluation-suite-registry-spec-v1",
+        ),
+        (
+            "suite_rotation_spec",
+            "risk-score-suite-rotation-service-spec-v1",
+        ),
+    ):
+        value = {"schema_version": 1, "contract": contract, "name": name}
+        value["spec_sha256"] = canonical_sha256(value)
+        write_canonical(file_paths[name], value)
 
     run_root = tmp_path / "run"
     candidate_inbox = run_root / "modelstobetested"
@@ -359,11 +372,11 @@ def make_fixture(tmp_path, *, suite_present=False):
             "-m",
             "risk_score.suite_rotation",
             "--spec",
-            str(file_paths["suite_registry_spec"]),
+            str(file_paths["suite_rotation_spec"]),
         ],
     }
     value = {
-        "schema_version": 1,
+        "schema_version": 2,
         "contract": publisher.PUBLISHER_SPEC_CONTRACT,
         "repository": str(repo),
         "source_revision": source_revision,
@@ -433,6 +446,23 @@ def rewrite_input(fixture, mutate):
     fixture["input_value"] = value
 
 
+def test_legacy_v1_publisher_spec_is_rejected_as_unsatisfiable(tmp_path):
+    fixture = make_fixture(tmp_path)
+    value = json.loads(fixture["input_spec"].read_text(encoding="utf-8"))
+    value["schema_version"] = 1
+    value["contract"] = publisher.LEGACY_PUBLISHER_SPEC_CONTRACT
+    value["files"].pop("suite_rotation_spec")
+    value.pop("spec_sha256")
+    value["spec_sha256"] = canonical_sha256(value)
+    write_canonical(fixture["input_spec"], value)
+
+    with pytest.raises(
+        publisher.BootstrapSpecPublicationError,
+        match="legacy-unsatisfiable",
+    ):
+        publisher.BootstrapPublisherSpec.load(fixture["input_spec"])
+
+
 def test_missing_suite_materializes_wait_safe_spec_and_independent_path_unit(tmp_path):
     fixture = make_fixture(tmp_path)
 
@@ -493,9 +523,10 @@ def test_missing_suite_materializes_wait_safe_spec_and_independent_path_unit(tmp
         "--autonomy-policy",
         "--cluster-executor-spec",
         "--adaptive-training-spec",
-        "--suite-registry-spec",
+        "--suite-rotation-spec",
     ):
         assert Path(flag(runtime, input_flag)).is_file()
+    assert "--suite-registry-spec" not in runtime
 
     assert spec.activation.required_units == (
         autonomy_bootstrap.REQUIRED_ACTIVATION_UNITS

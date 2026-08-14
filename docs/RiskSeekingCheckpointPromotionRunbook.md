@@ -155,6 +155,52 @@ services start. Every generated service is `PartOf=katago-risk-training.target`
 so applying a new verified service specification restarts the complete ordered
 unit set rather than leaving old processes on updated unit files.
 
+### Evidence-gated first activation
+
+Use `risk_score.autonomy_provisioner` for the first mutation-enabled,
+full-autonomy activation. The provisioner may be armed while the authoritative
+suite is absent. Its independent path watches both the completed
+curation status and suite manifest, then freezes the host-specific registry,
+benchmark, lease, disposable-drill, scheduler, and bootstrap specifications.
+It never starts training or admits a candidate itself.
+
+The host-specific provisioner specification is canonical, self-hashed, stored
+under `$RUN_DIR/configs`, and binds the clean deployment revision, deployment
+manifest, trainer/consumer specs, models, policies, GPU UUID, command argv,
+candidate inbox, and all output roots. Plan before applying:
+
+```bash
+sudo -n "$DEPLOY_REPO/python/.venv/bin/python" \
+  -m risk_score.autonomy_provisioner plan \
+  --spec "$RUN_DIR/configs/autonomy-provisioner.json" \
+  --expected-spec-sha256 "$PROVISIONER_FILE_SHA256"
+
+sudo -n "$DEPLOY_REPO/python/.venv/bin/python" \
+  -m risk_score.autonomy_provisioner materialize \
+  --spec "$RUN_DIR/configs/autonomy-provisioner.json" \
+  --expected-spec-sha256 "$PROVISIONER_FILE_SHA256" \
+  --apply
+```
+
+Before suite publication, `materialize` returns `WAIT`, installs only
+`katago-risk-autonomy-prepare.path` plus its service, and disables the
+legacy shadow trigger. Once readiness is authoritative it materializes
+`katago-risk-autonomy-bootstrap.path` and runs these fixed gates:
+
+1. curation/suite readiness;
+2. rename/fsync, deployment, inventory, and CUDA checks;
+3. deterministic p4/p8/p16 evaluator benchmark;
+4. live trainer/evaluator lease handoff;
+5. disposable canary, crash-replay, rollback, and shadow-controller drills;
+6. stable backlog/backpressure bound.
+
+Only complete PASS evidence builds the mutation-enabled runtime and invokes
+the verified activation below. WAIT or FAIL leaves
+`katago-risk-training.target` inactive and export denied. Do not enable the
+bootstrap service directly. If cutover fails, disable both replacement path
+and service before restoring the legacy path; preserve gate and forensic
+artifacts.
+
 Plan and verify the hash-bound unit installation before applying it. The apply
 step atomically installs only the exact generated KataGo units, reloads systemd,
 starts the aggregate target, and refuses to publish a receipt unless every

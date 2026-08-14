@@ -1160,7 +1160,7 @@ def _validate_command_receipt(
         process_count=process_count,
         repetition=repetition,
         completed_work_count=completed,
-        elapsed_seconds=wall_elapsed_seconds,
+        elapsed_seconds=elapsed,
         output_manifest_sha256=manifest_hash,
         receipt_sha256=supplied_receipt_hash,
     )

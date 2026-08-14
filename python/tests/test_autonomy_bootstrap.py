@@ -245,7 +245,7 @@ class RecordingRunner:
             "autonomy_policy": binding(Path(flag(argv, "--autonomy-policy"))),
             "executor_spec": binding(Path(flag(argv, "--cluster-executor-spec"))),
             "adaptive_spec": binding(Path(flag(argv, "--adaptive-training-spec"))),
-            "suite_registry_spec": binding(Path(flag(argv, "--suite-registry-spec"))),
+            "suite_registry_spec": binding(self.fixture["suite_registry_spec"]),
         }
         service = {
             "schema_version": 3,
@@ -255,6 +255,7 @@ class RecordingRunner:
             "evaluator_process_count": selected_process_count,
             "service_user": "test",
             "service_inputs": service_inputs,
+            "suite_rotation_spec": binding(Path(flag(argv, "--suite-rotation-spec"))),
             "services": {
                 key: {"argv": ["/bin/true"]} for key in FULL_SERVICE_UNIT_NAMES
             },
@@ -438,6 +439,7 @@ def make_fixture(tmp_path):
         "cluster-executor-spec",
         "adaptive-training-spec",
         "suite-registry-spec",
+        "suite-rotation-spec",
     ):
         path = autonomy_input_dir / f"{name}.json"
         write_canonical(path, {"name": name})
@@ -488,15 +490,22 @@ def make_fixture(tmp_path):
         "--adaptive-training-command-json",
         canonical_json([executable, "adaptive-training"]),
         "--suite-rotation-command-json",
-        canonical_json([executable, "suite-rotation"]),
+        canonical_json(
+            [
+                executable,
+                "suite-rotation",
+                "--spec",
+                str(autonomy_inputs["suite-rotation-spec"]),
+            ]
+        ),
         "--autonomy-policy",
         str(autonomy_inputs["autonomy-policy"]),
         "--cluster-executor-spec",
         str(autonomy_inputs["cluster-executor-spec"]),
         "--adaptive-training-spec",
         str(autonomy_inputs["adaptive-training-spec"]),
-        "--suite-registry-spec",
-        str(autonomy_inputs["suite-registry-spec"]),
+        "--suite-rotation-spec",
+        str(autonomy_inputs["suite-rotation-spec"]),
     ]
     activation_receipt = state_root / "activation.json"
     activation_argv = [
@@ -537,6 +546,8 @@ def make_fixture(tmp_path):
         "state_root": state_root,
         "gates": gate_map,
         "systemd": systemd,
+        "suite_registry_spec": autonomy_inputs["suite-registry-spec"],
+        "suite_rotation_spec": autonomy_inputs["suite-rotation-spec"],
     }
 
 
@@ -557,6 +568,8 @@ def test_spec_is_strict_canonical_and_hash_bound(tmp_path):
     loaded = bootstrap.load_bootstrap_spec(fixture["spec_path"])
     assert loaded.identity == fixture["spec_value"]["spec_sha256"]
     assert [gate.gate_id for gate in loaded.gates] == list(bootstrap.GATE_ORDER)
+    assert "--suite-rotation-spec" in loaded.runtime.argv
+    assert "--suite-registry-spec" not in loaded.runtime.argv
 
     fixture["spec_path"].write_text(
         json.dumps(fixture["spec_value"], indent=2) + "\n",
@@ -569,6 +582,60 @@ def test_spec_is_strict_canonical_and_hash_bound(tmp_path):
     changed["poll_interval_seconds"] = 1.0
     write_canonical(fixture["spec_path"], changed)
     with pytest.raises(bootstrap.BootstrapError, match="self-hash"):
+        bootstrap.load_bootstrap_spec(fixture["spec_path"])
+
+
+def test_runtime_requires_suite_rotation_service_spec(tmp_path):
+    fixture = make_fixture(tmp_path)
+    value = json.loads(json.dumps(fixture["spec_value"]))
+    argv = value["runtime"]["argv"]
+    index = argv.index("--suite-rotation-spec")
+    del argv[index : index + 2]
+    value.pop("spec_sha256")
+    value["spec_sha256"] = canonical_sha256(value)
+    write_canonical(fixture["spec_path"], value)
+
+    with pytest.raises(bootstrap.BootstrapError, match="missing=.*suite-rotation-spec"):
+        bootstrap.load_bootstrap_spec(fixture["spec_path"])
+
+
+def test_runtime_accepts_deprecated_suite_registry_alias(tmp_path):
+    fixture = make_fixture(tmp_path)
+    value = json.loads(json.dumps(fixture["spec_value"]))
+    argv = value["runtime"]["argv"]
+    argv[argv.index("--suite-rotation-spec")] = "--suite-registry-spec"
+    value.pop("spec_sha256")
+    value["spec_sha256"] = canonical_sha256(value)
+    write_canonical(fixture["spec_path"], value)
+
+    bootstrap.load_bootstrap_spec(fixture["spec_path"])
+
+
+def test_runtime_rejects_contradictory_suite_spec_aliases(tmp_path):
+    fixture = make_fixture(tmp_path)
+    value = json.loads(json.dumps(fixture["spec_value"]))
+    value["runtime"]["argv"].extend(
+        ["--suite-registry-spec", str(fixture["suite_registry_spec"])]
+    )
+    value.pop("spec_sha256")
+    value["spec_sha256"] = canonical_sha256(value)
+    write_canonical(fixture["spec_path"], value)
+
+    with pytest.raises(bootstrap.BootstrapError, match="contradicts"):
+        bootstrap.load_bootstrap_spec(fixture["spec_path"])
+
+
+def test_runtime_suite_rotation_command_must_bind_service_spec(tmp_path):
+    fixture = make_fixture(tmp_path)
+    value = json.loads(json.dumps(fixture["spec_value"]))
+    argv = value["runtime"]["argv"]
+    index = argv.index("--suite-rotation-command-json")
+    argv[index + 1] = canonical_json([str(Path(sys.executable).resolve()), "rotate"])
+    value.pop("spec_sha256")
+    value["spec_sha256"] = canonical_sha256(value)
+    write_canonical(fixture["spec_path"], value)
+
+    with pytest.raises(bootstrap.BootstrapError, match="does not bind"):
         bootstrap.load_bootstrap_spec(fixture["spec_path"])
 
 
@@ -716,11 +783,7 @@ def test_all_pass_activation_is_exactly_once_and_topology_is_applied(tmp_path):
     status_value = json.loads(status_path.read_text(encoding="utf-8"))
     assert status_value == first
     assert status_value["status_sha256"] == canonical_sha256(
-        {
-            key: value
-            for key, value in status_value.items()
-            if key != "status_sha256"
-        }
+        {key: value for key, value in status_value.items() if key != "status_sha256"}
     )
     assert command_roles(commands.commands).count("activation") == 1
     runtime_command = next(
@@ -778,9 +841,7 @@ def test_bootstrap_spec_file_hash_is_pinned(tmp_path):
 
 def test_root_bootstrap_unit_is_separate_and_hash_pinned(tmp_path):
     fixture = make_fixture(tmp_path)
-    destination = (
-        tmp_path / "generated" / bootstrap.BOOTSTRAP_UNIT_NAME
-    ).resolve()
+    destination = (tmp_path / "generated" / bootstrap.BOOTSTRAP_UNIT_NAME).resolve()
 
     record = bootstrap.publish_bootstrap_systemd_unit(
         destination,
