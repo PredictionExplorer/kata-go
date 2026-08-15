@@ -399,6 +399,33 @@ def test_harvest_plan_is_shell_free_and_content_bound(tmp_path):
     assert argv[:2] == (str(katago.resolve()), "samplesgfs")
     assert argv[argv.index("-sample-prob") + 1] == "1"
     assert "-for-testing" in argv
+    targeted = build_harvest_argv(
+        katago=katago,
+        sgfs_dirs=[sgfs],
+        sgf_dirs=[],
+        training_input_roots=[training_input],
+        output_dir=output,
+        threads=1,
+        max_handicap=10,
+        min_turn_number_board_area_prop=0.05,
+        max_turn_number_board_area_prop=0.75,
+    )
+    assert targeted[targeted.index("-max-handicap") + 1] == "10"
+    assert (
+        targeted[targeted.index("-max-turn-number-board-area-prop") + 1]
+        == "0.75"
+    )
+    with pytest.raises(ValueError, match="minimum < maximum"):
+        build_harvest_argv(
+            katago=katago,
+            sgfs_dirs=[sgfs],
+            sgf_dirs=[],
+            training_input_roots=[training_input],
+            output_dir=output,
+            threads=1,
+            min_turn_number_board_area_prop=0.8,
+            max_turn_number_board_area_prop=0.7,
+        )
 
     manifest_path = tmp_path / "harvest.json"
     manifest = publish_harvest_plan(

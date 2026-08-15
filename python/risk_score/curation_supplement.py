@@ -149,6 +149,12 @@ _SPEC_KEYS = {
     "downstream_accepted_counts",
     "spec_sha256",
 }
+_TARGETED_HARVEST_SPEC_KEYS = _SPEC_KEYS | {"harvest"}
+_HARVEST_KEYS = {
+    "max_handicap",
+    "min_turn_number_board_area_prop",
+    "max_turn_number_board_area_prop",
+}
 _LEGACY_READ_ONLY_SPEC_KEYS = {
     "schema_version",
     "contract",
@@ -223,6 +229,13 @@ class Topology:
 
 
 @dataclass(frozen=True)
+class HarvestSettings:
+    max_handicap: int
+    min_turn_number_board_area_prop: float
+    max_turn_number_board_area_prop: float
+
+
+@dataclass(frozen=True)
 class SupplementSpec:
     path: Path
     file_sha256: str
@@ -242,6 +255,7 @@ class SupplementSpec:
     models: Mapping[str, FileBinding]
     game_count: int
     topology: Topology
+    harvest: HarvestSettings
     policy_minima: Mapping[str, int]
     consensus_reserve_fraction: float
     target_counts: Mapping[str, int]
@@ -600,6 +614,37 @@ def _validate_selfplay_gpu_mapping(
         )
 
 
+def _harvest_settings(value: Any | None) -> HarvestSettings:
+    if value is None:
+        return HarvestSettings(0, 0.05, 0.95)
+    checked = _require_exact_keys(value, _HARVEST_KEYS, "harvest settings")
+    max_handicap = checked["max_handicap"]
+    if type(max_handicap) is not int or not 0 <= max_handicap <= 100:
+        raise SupplementSpecError(
+            "harvest max_handicap must be an integer in [0, 100]"
+        )
+    minimum_turn = checked["min_turn_number_board_area_prop"]
+    maximum_turn = checked["max_turn_number_board_area_prop"]
+    if (
+        isinstance(minimum_turn, bool)
+        or not isinstance(minimum_turn, (int, float))
+        or not math.isfinite(float(minimum_turn))
+        or isinstance(maximum_turn, bool)
+        or not isinstance(maximum_turn, (int, float))
+        or not math.isfinite(float(maximum_turn))
+        or not 0 <= float(minimum_turn) < float(maximum_turn) <= 1
+    ):
+        raise SupplementSpecError(
+            "harvest turn-number board-area proportions must satisfy "
+            "0 <= minimum < maximum <= 1"
+        )
+    return HarvestSettings(
+        max_handicap,
+        float(minimum_turn),
+        float(maximum_turn),
+    )
+
+
 def _git_revision(repository: Path) -> str:
     result = subprocess.run(
         ["git", "-C", str(repository), "rev-parse", "HEAD"],
@@ -941,6 +986,7 @@ def _load_legacy_read_only_spec(
         models=models,
         game_count=int(raw["game_count"]),
         topology=topology,
+        harvest=_harvest_settings(None),
         policy_minima={label: int(minima[label]) for label in LEAD_LABELS},
         consensus_reserve_fraction=0.0,
         target_counts=targets,
@@ -973,7 +1019,11 @@ def load_supplement_spec(
         raise SupplementSpecError(str(exc)) from exc
     if set(raw) == _LEGACY_READ_ONLY_SPEC_KEYS:
         return _load_legacy_read_only_spec(requested, raw)
-    _require_exact_keys(raw, _SPEC_KEYS, "supplement specification")
+    _require_exact_keys(
+        raw,
+        _TARGETED_HARVEST_SPEC_KEYS if "harvest" in raw else _SPEC_KEYS,
+        "supplement specification",
+    )
     if raw.get("schema_version") != SPEC_SCHEMA_VERSION:
         raise SupplementSpecError("supplement schema_version must be 1")
     if raw.get("contract") != SPEC_CONTRACT:
@@ -1105,6 +1155,7 @@ def load_supplement_spec(
         shards, parsed_gpus["gpus"], parsed_gpus["selfplay_gpus"], parallelism
     )
     _validate_selfplay_gpu_mapping(selfplay_config, topology.selfplay_gpus)
+    harvest = _harvest_settings(raw.get("harvest"))
 
     reserve_fraction = raw["consensus_reserve_fraction"]
     if (
@@ -1300,6 +1351,7 @@ def load_supplement_spec(
         models=models,
         game_count=game_count,
         topology=topology,
+        harvest=harvest,
         policy_minima=policy_minima,
         consensus_reserve_fraction=reserve_fraction,
         target_counts=target_counts,
@@ -1753,6 +1805,13 @@ def _expected_harvest_plan(spec: SupplementSpec) -> Mapping[str, Any]:
         training_input_roots=[spec.training_input_root],
         output_dir=layout.harvest_directory,
         threads=1,
+        max_handicap=spec.harvest.max_handicap,
+        min_turn_number_board_area_prop=(
+            spec.harvest.min_turn_number_board_area_prop
+        ),
+        max_turn_number_board_area_prop=(
+            spec.harvest.max_turn_number_board_area_prop
+        ),
     )
     value: dict[str, Any] = {
         "schema_version": 1,
@@ -3677,6 +3736,13 @@ class CurationSupplement:
             output_dir=self.layout.harvest_directory,
             manifest_path=self.layout.harvest_plan,
             threads=1,
+            max_handicap=self.spec.harvest.max_handicap,
+            min_turn_number_board_area_prop=(
+                self.spec.harvest.min_turn_number_board_area_prop
+            ),
+            max_turn_number_board_area_prop=(
+                self.spec.harvest.max_turn_number_board_area_prop
+            ),
         )
 
     def _execute_harvest(self) -> None:
@@ -4159,7 +4225,11 @@ def main(
     print(canonical_json(status))
     if args.mode == "status":
         return 0
-    return 0 if status["state"] in {"complete", "noop"} else 1
+    return (
+        0
+        if status["state"] in {"complete", "noop", "insufficient_candidates"}
+        else 1
+    )
 
 
 if __name__ == "__main__":

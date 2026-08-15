@@ -464,6 +464,22 @@ supplement and run the same complete `queries-consensus` and `label-consensus`
 workflow with the same frozen policy, original hash, champion hash, and
 stability margin.
 
+If uncompensated playout asymmetry alone has low yield, freeze separate
+curation-only handicap profiles rather than increasing visits blindly:
+
+- Lead-40 source discovery: `handicapProb=1,numExtraBlackFixed=4`, harvested
+  with `--max-handicap 5`;
+- Lead-80 source discovery: `handicapProb=1,numExtraBlackFixed=9`, harvested
+  with `--max-handicap 10`.
+
+These profiles are source samplers, not training or evaluation rules. Their SGF
+corpora remain quarantined, and their handicap metadata is never admitted to
+self-play training. The resulting board positions still require the complete
+original/champion, standard/powered, all-symmetry machine-consensus workflow;
+terminal margin or handicap count never assigns a Lead label. Bind the maximum
+harvest handicap and sampled turn window in the supplement specification so a
+restart cannot silently broaden the source distribution.
+
 Merge disjoint consensus bundles without weakening their provenance:
 
 ```bash

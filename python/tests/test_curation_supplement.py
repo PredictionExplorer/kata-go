@@ -336,6 +336,7 @@ def publish_spec(
     spec_name="supplement-spec.json",
     work_name="lead-supplement",
     override_args=(),
+    harvest=None,
 ):
     assets = frozen_assets(tmp_path) if assets is None else assets
     if primary is None:
@@ -400,6 +401,8 @@ def publish_spec(
         "prior_round_summaries": list(prior_summaries),
         "downstream_accepted_counts": downstream_counts,
     }
+    if harvest is not None:
+        value["harvest"] = dict(harvest)
     value["spec_sha256"] = canonical_sha256(value)
     spec_path = tmp_path / spec_name
     write_canonical(spec_path, value)
@@ -626,6 +629,29 @@ def test_production_command_and_gpu_topology_are_exact(tmp_path):
     assert plan_analysis_commands(spec)[0]["environment"] == {
         "CUDA_VISIBLE_DEVICES": "2"
     }
+
+
+def test_targeted_handicap_harvest_is_spec_bound(tmp_path):
+    spec_path, _, _ = publish_spec(
+        tmp_path,
+        harvest={
+            "max_handicap": 10,
+            "min_turn_number_board_area_prop": 0.05,
+            "max_turn_number_board_area_prop": 0.75,
+        },
+    )
+    engine = coordinator(spec_path, FakeProcesses())
+
+    assert engine.spec.harvest.max_handicap == 10
+    assert engine.spec.harvest.max_turn_number_board_area_prop == 0.75
+    assert engine.once()["next_stage"] == "create_harvest_plan"
+    assert engine.once()["next_stage"] == "execute_harvest"
+
+    plan = json.loads(engine.layout.harvest_plan.read_text())
+    argv = plan["argv"]
+    assert argv[argv.index("-max-handicap") + 1] == "10"
+    assert argv[argv.index("-min-turn-number-board-area-prop") + 1] == "0.05"
+    assert argv[argv.index("-max-turn-number-board-area-prop") + 1] == "0.75"
 
 
 def test_primary_prefilter_validation_is_cached_and_invalidated(
@@ -886,6 +912,7 @@ def test_zero_result_prefilter_publishes_insufficiency(tmp_path):
     assert json.loads(engine.layout.summary.read_text())["state"] == (
         "insufficient_candidates"
     )
+    assert main(["watch", "--spec", str(spec_path)]) == 0
 
 
 def test_clean_deployment_and_manifest_are_reverified(tmp_path):

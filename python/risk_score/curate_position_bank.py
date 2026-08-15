@@ -535,6 +535,9 @@ def build_harvest_argv(
     training_input_roots: Sequence[Path],
     output_dir: Path,
     threads: int,
+    max_handicap: int = 0,
+    min_turn_number_board_area_prop: float = 0.05,
+    max_turn_number_board_area_prop: float = 0.95,
 ) -> Tuple[str, ...]:
     binary = Path(katago)
     if binary.is_symlink() or not binary.is_file():
@@ -551,6 +554,21 @@ def build_harvest_argv(
     if type(threads) is not int or threads != 1:
         raise ValueError(
             "deterministic samplesgfs harvesting currently requires exactly one thread"
+        )
+    if type(max_handicap) is not int or not 0 <= max_handicap <= 100:
+        raise ValueError("maximum harvest handicap must be an integer in [0, 100]")
+    minimum_turn = _finite(
+        min_turn_number_board_area_prop,
+        "minimum turn-number board-area proportion",
+    )
+    maximum_turn = _finite(
+        max_turn_number_board_area_prop,
+        "maximum turn-number board-area proportion",
+    )
+    if not 0 <= minimum_turn < maximum_turn <= 1:
+        raise ValueError(
+            "harvest turn-number board-area proportions must satisfy "
+            "0 <= minimum < maximum <= 1"
         )
     argv = [str(binary.resolve()), "samplesgfs"]
     for directory in map(Path, sgfs_dirs):
@@ -578,11 +596,11 @@ def build_harvest_argv(
             "-turn-weight-lambda",
             "0",
             "-min-turn-number-board-area-prop",
-            "0.05",
+            str(minimum_turn),
             "-max-turn-number-board-area-prop",
-            "0.95",
+            str(maximum_turn),
             "-max-handicap",
-            "0",
+            str(max_handicap),
             "-max-komi",
             "7.5",
             "-num-threads",
@@ -602,6 +620,9 @@ def publish_harvest_plan(
     output_dir: Path,
     manifest_path: Path,
     threads: int,
+    max_handicap: int = 0,
+    min_turn_number_board_area_prop: float = 0.05,
+    max_turn_number_board_area_prop: float = 0.95,
 ) -> Mapping[str, Any]:
     argv = build_harvest_argv(
         katago=katago,
@@ -610,6 +631,9 @@ def publish_harvest_plan(
         training_input_roots=training_input_roots,
         output_dir=output_dir,
         threads=threads,
+        max_handicap=max_handicap,
+        min_turn_number_board_area_prop=min_turn_number_board_area_prop,
+        max_turn_number_board_area_prop=max_turn_number_board_area_prop,
     )
     if Path(output_dir).exists():
         raise ValueError("planned harvest output directory must not already exist")
@@ -3929,6 +3953,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     harvest.add_argument("--output-dir", required=True, type=Path)
     harvest.add_argument("--manifest", required=True, type=Path)
     harvest.add_argument("--threads", type=int, default=1)
+    harvest.add_argument("--max-handicap", type=int, default=0)
+    harvest.add_argument(
+        "--min-turn-number-board-area-prop", type=float, default=0.05
+    )
+    harvest.add_argument(
+        "--max-turn-number-board-area-prop", type=float, default=0.95
+    )
 
     harvest_execute = subparsers.add_parser("harvest-execute")
     harvest_execute.add_argument("plan", type=Path)
@@ -4044,6 +4075,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 output_dir=args.output_dir,
                 manifest_path=args.manifest,
                 threads=args.threads,
+                max_handicap=args.max_handicap,
+                min_turn_number_board_area_prop=(
+                    args.min_turn_number_board_area_prop
+                ),
+                max_turn_number_board_area_prop=(
+                    args.max_turn_number_board_area_prop
+                ),
             )
         elif args.command == "harvest-execute":
             result = execute_harvest_plan(args.plan)

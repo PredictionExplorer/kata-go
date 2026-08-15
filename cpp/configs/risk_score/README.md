@@ -220,7 +220,12 @@ rules and immutable original model, but deliberately gives one color an
 uncompensated fixed 100x playout advantage. This makes large-lead positions
 common without asserting any labels: the complete two-model consensus analysis
 remains the only source of machine-reviewed Lead labels. Its output must never
-enter a shuffler or trainer input root.
+enter a shuffler or trainer input root. Low-yield recovery may additionally
+freeze `handicapProb=1,numExtraBlackFixed=4` for Lead-40 discovery or
+`handicapProb=1,numExtraBlackFixed=9` for Lead-80 discovery. Those overrides are
+curation-only source samplers; the supplement manifest must bind the matching
+harvest limit (`max-handicap` 5 or 10), and the handicap corpus remains
+ineligible for training.
 
 `promotion_selfplay_worker_19x19.cfg` is the generation-pinned one-GPU
 self-play template. Launch seven separate workers through the promotion
