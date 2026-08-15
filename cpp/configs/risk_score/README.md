@@ -233,6 +233,14 @@ controller/supervisor, each with an immutable one-model directory, distinct
 output root, and explicit `cudaDeviceToUseModel0Thread0`. It fixes
 `switchNetsMidGame=false`.
 
+`margin_safety_gatekeeper_19x19.cfg` supports the self-play-only margin mode.
+It tests each exported candidate against the current accepted model in 100
+fresh conventional-search games at 400 visits. The accompanying
+`selfplay_margin_policy_v1.json` accepts candidates at a deliberately
+permissive 35% score floor: enough to reject catastrophic models without
+requiring margin-seeking fine-tunes to preserve their parent's full strength.
+The gate consumes no external SGFs.
+
 ## Phase 2 self-play
 
 `phase2_selfplay_19x19.cfg` fixes 19x19 positional-superko area scoring with

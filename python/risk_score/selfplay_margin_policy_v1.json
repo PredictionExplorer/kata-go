@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "policy_version": "selfplay-margin-promotion-v1",
+  "status": "active",
+  "training": {
+    "data_source": "self-play-only",
+    "initial_model": "kata1-zhizi-b40c768nbt-s11272M-d5935M",
+    "objective": {
+      "score_power": 1.5,
+      "score_scale": 20.0,
+      "win_weight": 4.0
+    }
+  },
+  "promotion": {
+    "external_position_data_allowed": false,
+    "comparison": "fresh-candidate-vs-current-model",
+    "comparison_search": "standard",
+    "games_per_candidate": 100,
+    "visits_per_move": 400,
+    "minimum_candidate_win_rate": 0.35,
+    "candidate_wins_exact_threshold_ties": true,
+    "maximum_active_candidates": 3,
+    "automatic_promotion": true
+  },
+  "safety": {
+    "require_model_load_and_finite_output": true,
+    "fixed_rules": "19x19-positional-area-7.5-komi",
+    "allow_resignation": true,
+    "allow_handicap": false,
+    "retain_previous_accepted_models": 5,
+    "retain_rejected_models": true,
+    "rollback_checkpoint_required": true
+  }
+}

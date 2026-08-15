@@ -1014,6 +1014,31 @@ it with the controller-owned live status after all activation gates pass.
 
 ### 5. Evaluation and controller promotion
 
+#### Self-play-only margin mode
+
+For runs whose primary objective is margin-seeking behavior rather than
+preserving the original model's full playing strength, use the frozen
+`selfplay_margin_policy_v1.json` policy and
+`margin_safety_gatekeeper_19x19.cfg`.
+
+This mode uses no external SGFs or curated position bank. Training remains
+powered-utility self-play, while promotion is deliberately permissive:
+
+- each candidate plays 100 fresh 19x19, 7.5-komi games against the current
+  accepted model;
+- the safety match uses conventional search at 400 visits;
+- candidates scoring at least 35% are accepted automatically;
+- model-load and finite-output probing remains mandatory before publication;
+- the trainer, exporter/model probe, and gatekeeper share GPU 7 sequentially;
+- prior accepted models and trainer checkpoints remain available for rollback.
+
+The 35% floor is a guard against catastrophic playing-strength collapse, not a
+requirement that margin-seeking candidates remain stronger than their parent.
+The seven self-play GPUs continue generating training data while GPU 7
+alternates between training and candidate gating.
+
+#### Strict promotion mode
+
 Build the source bank through the active `queries-consensus`,
 `label-consensus`, optional `merge-labeling-consensus`, and
 `finalize-consensus` flow in `RiskSeekingCheckpointPromotionRunbook.md`.
