@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "contract": "risk-score-extreme-score-training-policy-v1",
+  "policy_version": "expected-max-focal-selfplay-v1",
+  "status": "frozen",
+  "objective": {
+    "name": "expected_maximum_focal_terminal_score",
+    "win_loss_weight": 0,
+    "cohort_sizes": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "production_cohort_size": 8,
+    "search_approximation": "legally_clamped_gaussian_order_statistic",
+    "maximum_supported_cohort_size": 8
+  },
+  "curriculum": [
+    {
+      "cohort_size": 1,
+      "minimum_selected_training_samples": 0
+    },
+    {
+      "cohort_size": 2,
+      "minimum_selected_training_samples": 2000000
+    },
+    {
+      "cohort_size": 4,
+      "minimum_selected_training_samples": 4000000
+    },
+    {
+      "cohort_size": 8,
+      "minimum_selected_training_samples": 8000000
+    }
+  ],
+  "league": {
+    "focal_colors": [
+      "B",
+      "W"
+    ],
+    "workers_per_gpu": 2,
+    "threads_per_worker": 50,
+    "opponent_weights": {
+      "latest_frozen": 0.5,
+      "recent_frozen": 0.3,
+      "score_minimizing_exploiter": 0.2
+    },
+    "opponent_gradient": "stopped",
+    "worker_allocation": "largest_remainder_per_focal_color",
+    "minimum_workers_per_required_opponent_per_color": 1,
+    "model_selection": "single_immutable_content_addressed_snapshot",
+    "maximum_games_per_worker": 100000
+  },
+  "training": {
+    "initial_checkpoint": "immutable_original_b40",
+    "extreme_score_only": true,
+    "allow_mixed_legacy_rows": false,
+    "optimistic_policy_from_win_loss": false,
+    "resignation": false
+  },
+  "evaluation": {
+    "policy": "risk-score-held-out-expected-max-v1",
+    "raw_lifetime_record_is_gating": false,
+    "required_slices": [
+      "overall",
+      "B",
+      "W"
+    ]
+  }
+}

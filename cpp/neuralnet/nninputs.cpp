@@ -124,6 +124,21 @@ namespace {
     return 0.5 * erfc(x / sqrtTwo);
   }
 
+  static double standardNormalPDF(double x) {
+    static const double invSqrtTwoPi = 0.39894228040143267794;
+    if(!std::isfinite(x))
+      return 0.0;
+    return invSqrtTwoPi * exp(-0.5*x*x);
+  }
+
+  static double standardizeFiniteScore(double score, double mean, double stdev) {
+    double difference = score-mean;
+    if(std::isfinite(difference))
+      return difference / stdev;
+    //Avoid overflow in the subtraction when all three inputs are finite.
+    return score / stdev - mean / stdev;
+  }
+
   static double standardNormalProbabilityBetween(double lower, double upper) {
     if(lower >= upper)
       return 0.0;
@@ -133,6 +148,172 @@ namespace {
     else
       probability = standardNormalCDF(upper) - standardNormalCDF(lower);
     return std::max(0.0, probability);
+  }
+
+  static void validateExpectedMaxScoreParams(
+    double scoreMean,
+    double scoreStdev,
+    int bestOfN,
+    double lowerBound,
+    double upperBound
+  ) {
+    if(!std::isfinite(scoreMean) || !std::isfinite(scoreStdev) || scoreStdev < 0.0)
+      throw StringError("Invalid finite normal score distribution for expected-max score utility");
+    if(bestOfN < 1 || bestOfN > 64)
+      throw StringError("bestOfN must be between 1 and 64 for expected-max score utility");
+    if(!std::isfinite(lowerBound) || !std::isfinite(upperBound) || lowerBound >= upperBound)
+      throw StringError("Invalid legal score bounds for expected-max score utility");
+  }
+
+  static double expectedClampedNormalScore(
+    double scoreMean,
+    double scoreStdev,
+    double lowerBound,
+    double upperBound
+  ) {
+    if(scoreStdev == 0.0)
+      return std::min(upperBound,std::max(lowerBound,scoreMean));
+
+    double lowerZ = standardizeFiniteScore(lowerBound,scoreMean,scoreStdev);
+    double upperZ = standardizeFiniteScore(upperBound,scoreMean,scoreStdev);
+    double lowerProb = standardNormalCDF(lowerZ);
+    double upperProb = standardNormalSurvival(upperZ);
+    double interiorProb = standardNormalProbabilityBetween(lowerZ,upperZ);
+    double result =
+      lowerBound * lowerProb +
+      scoreMean * interiorProb +
+      scoreStdev * (standardNormalPDF(lowerZ)-standardNormalPDF(upperZ)) +
+      upperBound * upperProb;
+    return std::min(upperBound,std::max(lowerBound,result));
+  }
+
+  //For M_N=max(Z_1,...,Z_N), E[clamp(mu+sigma*M_N,L,H)] can be written as
+  //H - sigma * integral_a^b Phi(z)^N dz. Cache deterministic antiderivatives
+  //of Phi(z)^N for every supported N so leaf evaluation stays inexpensive.
+  static const int EXPECTED_MAX_SCORE_MAX_N = 64;
+  static const int EXPECTED_MAX_SCORE_Z_STEPS_PER_UNIT = 1024;
+  static const double EXPECTED_MAX_SCORE_Z_LIMIT = 8.0;
+  static const int EXPECTED_MAX_SCORE_Z_STEPS =
+    2 * (int)EXPECTED_MAX_SCORE_Z_LIMIT * EXPECTED_MAX_SCORE_Z_STEPS_PER_UNIT;
+  static const int EXPECTED_MAX_SCORE_Z_LEN = EXPECTED_MAX_SCORE_Z_STEPS + 1;
+
+  struct ExpectedMaxScoreIntegralTable {
+    std::vector<double> cumulativeIntegrals;
+
+    ExpectedMaxScoreIntegralTable()
+      :cumulativeIntegrals((EXPECTED_MAX_SCORE_MAX_N+1) * EXPECTED_MAX_SCORE_Z_LEN,0.0)
+    {
+      const double step = 1.0 / EXPECTED_MAX_SCORE_Z_STEPS_PER_UNIT;
+      std::vector<double> previousPowers(EXPECTED_MAX_SCORE_MAX_N+1,0.0);
+      std::vector<double> cumulative(EXPECTED_MAX_SCORE_MAX_N+1,0.0);
+
+      double cdf = standardNormalCDF(-EXPECTED_MAX_SCORE_Z_LIMIT);
+      double cdfPower = 1.0;
+      for(int bestOfN = 1; bestOfN<=EXPECTED_MAX_SCORE_MAX_N; bestOfN++) {
+        cdfPower *= cdf;
+        previousPowers[bestOfN] = cdfPower;
+      }
+
+      for(int zIdx = 1; zIdx<EXPECTED_MAX_SCORE_Z_LEN; zIdx++) {
+        double z = -EXPECTED_MAX_SCORE_Z_LIMIT + zIdx * step;
+        cdf = standardNormalCDF(z);
+        cdfPower = 1.0;
+        for(int bestOfN = 1; bestOfN<=EXPECTED_MAX_SCORE_MAX_N; bestOfN++) {
+          cdfPower *= cdf;
+          cumulative[bestOfN] += 0.5 * step * (previousPowers[bestOfN]+cdfPower);
+          cumulativeIntegrals[bestOfN * EXPECTED_MAX_SCORE_Z_LEN + zIdx] = cumulative[bestOfN];
+          previousPowers[bestOfN] = cdfPower;
+        }
+      }
+    }
+
+    double integralFromNegativeLimit(int bestOfN, double z) const {
+      if(z <= -EXPECTED_MAX_SCORE_Z_LIMIT)
+        return 0.0;
+      if(z >= EXPECTED_MAX_SCORE_Z_LIMIT) {
+        double integralAtLimit =
+          cumulativeIntegrals[bestOfN * EXPECTED_MAX_SCORE_Z_LEN + EXPECTED_MAX_SCORE_Z_STEPS];
+        //At eight standard deviations Phi(z)^N differs from one by less than
+        //4e-14 for all supported N, so the remaining antiderivative is linear.
+        return integralAtLimit + (z-EXPECTED_MAX_SCORE_Z_LIMIT);
+      }
+
+      double zPos = (z+EXPECTED_MAX_SCORE_Z_LIMIT) * EXPECTED_MAX_SCORE_Z_STEPS_PER_UNIT;
+      int zIdx0 = std::min(EXPECTED_MAX_SCORE_Z_STEPS-1,(int)floor(zPos));
+      int zIdx1 = zIdx0+1;
+      double lambda = zPos-zIdx0;
+      double value0 = cumulativeIntegrals[bestOfN * EXPECTED_MAX_SCORE_Z_LEN + zIdx0];
+      double value1 = cumulativeIntegrals[bestOfN * EXPECTED_MAX_SCORE_Z_LEN + zIdx1];
+      return value0 + lambda * (value1-value0);
+    }
+  };
+
+  static const ExpectedMaxScoreIntegralTable& getExpectedMaxScoreIntegralTable() {
+    static const ExpectedMaxScoreIntegralTable table;
+    return table;
+  }
+
+  static double integrateNormalCDFPowerOverScore(
+    double scoreMean,
+    double scoreStdev,
+    int bestOfN,
+    double lowerBound,
+    double upperBound
+  ) {
+    double transitionRadius = EXPECTED_MAX_SCORE_Z_LIMIT * scoreStdev;
+    double transitionLower = scoreMean-transitionRadius;
+    double transitionUpper = scoreMean+transitionRadius;
+
+    //Above transitionUpper, Phi(z)^N is one to better than 4e-14.
+    double integral = std::max(0.0,upperBound-std::max(lowerBound,transitionUpper));
+
+    double interiorLower = std::max(lowerBound,transitionLower);
+    double interiorUpper = std::min(upperBound,transitionUpper);
+    if(interiorLower < interiorUpper) {
+      double zLower = standardizeFiniteScore(interiorLower,scoreMean,scoreStdev);
+      double zUpper = standardizeFiniteScore(interiorUpper,scoreMean,scoreStdev);
+
+      //When sigma dwarfs the legal interval, subtracting nearby cached
+      //antiderivatives would lose precision. Integrate that narrow interval
+      //directly with deterministic eight-point Gauss-Legendre quadrature.
+      if(zUpper-zLower < 0.01) {
+        static const double nodes[4] = {
+          0.18343464249564980494,
+          0.52553240991632898582,
+          0.79666647741362673959,
+          0.96028985649753623168
+        };
+        static const double weights[4] = {
+          0.36268378337836198297,
+          0.31370664587788728734,
+          0.22238103445337447054,
+          0.10122853629037625915
+        };
+        double midpoint = 0.5 * (interiorLower+interiorUpper);
+        double halfWidth = 0.5 * (interiorUpper-interiorLower);
+        for(int i = 0; i<4; i++) {
+          double delta = halfWidth * nodes[i];
+          double lowerCDF = standardNormalCDF(
+            standardizeFiniteScore(midpoint-delta,scoreMean,scoreStdev)
+          );
+          double upperCDF = standardNormalCDF(
+            standardizeFiniteScore(midpoint+delta,scoreMean,scoreStdev)
+          );
+          integral += halfWidth * weights[i] * (
+            pow(lowerCDF,bestOfN) + pow(upperCDF,bestOfN)
+          );
+        }
+      }
+      else {
+        const ExpectedMaxScoreIntegralTable& table = getExpectedMaxScoreIntegralTable();
+        integral += scoreStdev * (
+          table.integralFromNegativeLimit(bestOfN,zUpper) -
+          table.integralFromNegativeLimit(bestOfN,zLower)
+        );
+      }
+    }
+
+    return std::min(upperBound-lowerBound,std::max(0.0,integral));
   }
 }
 
@@ -586,6 +767,79 @@ double ScoreValue::expectedScoreMaximizingUtility(
     return scoreMaximizingUtilityUnchecked(clampedScore,power,scale);
   }
   return getScoreMaximizingUtilityTable(power,scale,lowerBound,upperBound)->getExpectedUtility(whiteScoreMean,whiteScoreStdev);
+}
+
+double ScoreValue::expectedMaxScore(
+  double scoreMean,
+  double scoreStdev,
+  int bestOfN,
+  double lowerBound,
+  double upperBound
+) {
+  validateExpectedMaxScoreParams(scoreMean,scoreStdev,bestOfN,lowerBound,upperBound);
+  if(scoreStdev == 0.0)
+    return std::min(upperBound,std::max(lowerBound,scoreMean));
+  if(bestOfN == 1) {
+    double result = expectedClampedNormalScore(scoreMean,scoreStdev,lowerBound,upperBound);
+    if(!std::isfinite(result))
+      throw StringError("Nonfinite result from expected-max score utility");
+    return result;
+  }
+
+  double cdfPowerIntegral = integrateNormalCDFPowerOverScore(
+    scoreMean,scoreStdev,bestOfN,lowerBound,upperBound
+  );
+  double result = upperBound-cdfPowerIntegral;
+  //Interpolation should preserve this order-statistic property, but explicitly
+  //enforce it at the N=1 boundary against sub-ulp table error.
+  result = std::max(
+    result,
+    expectedClampedNormalScore(scoreMean,scoreStdev,lowerBound,upperBound)
+  );
+  if(!std::isfinite(result))
+    throw StringError("Nonfinite result from expected-max score utility");
+  return std::min(upperBound,std::max(lowerBound,result));
+}
+
+double ScoreValue::expectedMaxScoreUtility(
+  double whiteScoreMean,
+  double whiteScoreStdev,
+  Player focalPla,
+  int bestOfN,
+  double lowerWhiteScoreBound,
+  double upperWhiteScoreBound
+) {
+  if(focalPla != P_WHITE && focalPla != P_BLACK)
+    throw StringError("Expected-max score utility requires a Black or White focal player");
+
+  //For N=1 both focal perspectives reduce identically to expected White score.
+  if(bestOfN == 1) {
+    return expectedMaxScore(
+      whiteScoreMean,
+      whiteScoreStdev,
+      bestOfN,
+      lowerWhiteScoreBound,
+      upperWhiteScoreBound
+    );
+  }
+  if(focalPla == P_WHITE) {
+    return expectedMaxScore(
+      whiteScoreMean,
+      whiteScoreStdev,
+      bestOfN,
+      lowerWhiteScoreBound,
+      upperWhiteScoreBound
+    );
+  }
+
+  double expectedBlackMax = expectedMaxScore(
+    -whiteScoreMean,
+    whiteScoreStdev,
+    bestOfN,
+    -upperWhiteScoreBound,
+    -lowerWhiteScoreBound
+  );
+  return -expectedBlackMax;
 }
 
 void ScoreValue::getScoreMaximizingUtilityTailProbabilities(

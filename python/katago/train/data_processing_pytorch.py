@@ -1,10 +1,10 @@
 import logging
 import os
-
-import numpy as np
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 
+import numpy as np
 import torch
 import torch.nn.functional
 
@@ -14,6 +14,24 @@ from ..train import modelconfigs
 # Data format version 2 files (recorded in channel 63 of each row) had only 64 channels; they are zero-padded
 # up to this width when loading, which correctly encodes "not reanalyzed" for the version 3 channels.
 GLOBAL_TARGETS_NC_CHANNELS = 80
+EXTREME_SCORE_COHORT_METADATA_START = 68
+EXTREME_SCORE_COHORT_METADATA_END = 80
+EXTREME_SCORE_COHORT_METADATA_VERSION = 1
+EXTREME_SCORE_METADATA_VERSION_CHANNEL = 68
+EXTREME_SCORE_GROUP_SIZE_CHANNEL = 69
+EXTREME_SCORE_ATTEMPT_INDEX_CHANNEL = 70
+EXTREME_SCORE_FOCAL_COLOR_CHANNEL = 71
+EXTREME_SCORE_FOCAL_MARGIN_CHANNEL = 72
+EXTREME_SCORE_LEAVE_ONE_OUT_MAX_CHANNEL = 73
+EXTREME_SCORE_CREDIT_CHANNEL = 74
+EXTREME_SCORE_RANK_CHANNEL = 75
+EXTREME_SCORE_SELECTED_CHANNEL = 76
+EXTREME_SCORE_APPLIED_WEIGHT_CHANNEL = 77
+EXTREME_SCORE_COHORT_ID_LOW_CHANNEL = 78
+EXTREME_SCORE_COHORT_ID_HIGH_CHANNEL = 79
+GLOBAL_WEIGHT_CHANNEL = 25
+PLAYER_POLICY_WEIGHT_CHANNEL = 26
+OPPONENT_POLICY_WEIGHT_CHANNEL = 28
 
 def pad_global_targets_nc(globalTargetsNC: np.ndarray) -> np.ndarray:
     """Zero-pad older-format globalTargetsNC rows up to the current channel count."""
@@ -24,6 +42,277 @@ def pad_global_targets_nc(globalTargetsNC: np.ndarray) -> np.ndarray:
     padded = np.zeros((globalTargetsNC.shape[0], GLOBAL_TARGETS_NC_CHANNELS), dtype=globalTargetsNC.dtype)
     padded[:, :num_channels] = globalTargetsNC
     return padded
+
+def validate_extreme_score_training_rows(
+    globalTargetsNC: np.ndarray,
+    source: str = "globalTargetsNC",
+    policyTargetsNCMove: np.ndarray | None = None,
+    scoreDistrN: np.ndarray | None = None,
+    valueTargetsNCHW: np.ndarray | None = None,
+    qValueTargetsNCMove: np.ndarray | None = None,
+    expected_group_size: int | None = None,
+) -> None:
+    """Fail closed unless every row is an explicit, consistently weighted cohort row.
+
+    Channels 68-79 carry the writer's v1 cohort assignment and exact
+    leave-one-out credit. C25 remains the authoritative aggregate loss weight;
+    C77 records the unscaled cohort credit for auditability.
+    """
+    if globalTargetsNC.ndim != 2:
+        raise ValueError(f"{source} must be rank 2, got shape {globalTargetsNC.shape}")
+    if globalTargetsNC.shape[1] < EXTREME_SCORE_COHORT_METADATA_END:
+        raise ValueError(
+            f"{source} has {globalTargetsNC.shape[1]} channels; "
+            f"extreme-score training requires channels "
+            f"{EXTREME_SCORE_COHORT_METADATA_START}-"
+            f"{EXTREME_SCORE_COHORT_METADATA_END - 1}"
+        )
+
+    cohort_metadata = globalTargetsNC[
+        :,
+        EXTREME_SCORE_COHORT_METADATA_START:EXTREME_SCORE_COHORT_METADATA_END,
+    ]
+    if not np.all(np.isfinite(cohort_metadata)):
+        raise ValueError(f"{source} has non-finite extreme-score cohort metadata")
+
+    metadata_versions = globalTargetsNC[:, EXTREME_SCORE_METADATA_VERSION_CHANNEL]
+    if not np.all(metadata_versions == EXTREME_SCORE_COHORT_METADATA_VERSION):
+        bad_rows = np.flatnonzero(
+            metadata_versions != EXTREME_SCORE_COHORT_METADATA_VERSION
+        )
+        raise ValueError(
+            f"{source} contains {bad_rows.size} row(s) without supported "
+            f"extreme-score cohort metadata v"
+            f"{EXTREME_SCORE_COHORT_METADATA_VERSION}; first bad row "
+            f"{int(bad_rows[0])}"
+        )
+
+    group_sizes = globalTargetsNC[:, EXTREME_SCORE_GROUP_SIZE_CHANNEL]
+    attempt_indices = globalTargetsNC[:, EXTREME_SCORE_ATTEMPT_INDEX_CHANNEL]
+    ranks = globalTargetsNC[:, EXTREME_SCORE_RANK_CHANNEL]
+    selected = globalTargetsNC[:, EXTREME_SCORE_SELECTED_CHANNEL]
+    cohort_id_low = globalTargetsNC[:, EXTREME_SCORE_COHORT_ID_LOW_CHANNEL]
+    cohort_id_high = globalTargetsNC[:, EXTREME_SCORE_COHORT_ID_HIGH_CHANNEL]
+    integer_fields_valid = (
+        (group_sizes == np.floor(group_sizes))
+        & (attempt_indices == np.floor(attempt_indices))
+        & (ranks == np.floor(ranks))
+        & (selected == np.floor(selected))
+        & (cohort_id_low == np.floor(cohort_id_low))
+        & (cohort_id_high == np.floor(cohort_id_high))
+    )
+    assignment_fields_valid = (
+        integer_fields_valid
+        & (group_sizes >= 1.0)
+        & (attempt_indices >= 0.0)
+        & (attempt_indices < group_sizes)
+        & (ranks >= 1.0)
+        & (ranks <= group_sizes)
+        & ((selected == 0.0) | (selected == 1.0))
+        & (cohort_id_low >= 0.0)
+        & (cohort_id_low <= float(0x3FFFFF))
+        & (cohort_id_high >= 0.0)
+        & (cohort_id_high <= float(0x3FFFFF))
+    )
+    focal_colors = globalTargetsNC[:, EXTREME_SCORE_FOCAL_COLOR_CHANNEL]
+    assignment_fields_valid &= (focal_colors == -1.0) | (focal_colors == 1.0)
+    if not np.all(assignment_fields_valid):
+        bad_rows = np.flatnonzero(~assignment_fields_valid)
+        raise ValueError(
+            f"{source} contains invalid extreme-score cohort assignment "
+            f"fields; first bad row {int(bad_rows[0])}"
+        )
+    if expected_group_size is not None:
+        if type(expected_group_size) is not int or expected_group_size <= 0:
+            raise ValueError("expected extreme-score group size must be positive")
+        if not np.all(group_sizes == float(expected_group_size)):
+            bad_rows = np.flatnonzero(
+                group_sizes != float(expected_group_size)
+            )
+            raise ValueError(
+                f"{source} cohort size differs from the frozen curriculum "
+                f"N={expected_group_size}; first bad row {int(bad_rows[0])}"
+            )
+
+    focal_margins = globalTargetsNC[:, EXTREME_SCORE_FOCAL_MARGIN_CHANNEL]
+    leave_one_out_max = globalTargetsNC[
+        :, EXTREME_SCORE_LEAVE_ONE_OUT_MAX_CHANNEL
+    ]
+    credits = globalTargetsNC[:, EXTREME_SCORE_CREDIT_CHANNEL]
+    applied_weights = globalTargetsNC[:, EXTREME_SCORE_APPLIED_WEIGHT_CHANNEL]
+    expected_credits = np.where(
+        group_sizes == 1.0,
+        1.0,
+        np.maximum(0.0, focal_margins - leave_one_out_max),
+    )
+    credit_valid = (
+        (credits >= 0.0)
+        & np.isclose(credits, expected_credits, rtol=1e-5, atol=1e-5)
+        & np.isclose(applied_weights, credits, rtol=1e-6, atol=1e-6)
+        & (selected == (credits > 0.0).astype(selected.dtype))
+        & ((group_sizes != 1.0) | (leave_one_out_max == 0.0))
+    )
+    if not np.all(credit_valid):
+        bad_rows = np.flatnonzero(~credit_valid)
+        raise ValueError(
+            f"{source} contains inconsistent leave-one-out cohort credit "
+            f"metadata; first bad row {int(bad_rows[0])}"
+        )
+
+    cohort_weights = globalTargetsNC[:, GLOBAL_WEIGHT_CHANNEL]
+    valid_cohort_weights = (
+        np.isfinite(cohort_weights)
+        & (cohort_weights >= 0.0)
+        & ((selected == 0.0) | (cohort_weights > 0.0))
+        & ((selected == 1.0) | (cohort_weights == 0.0))
+    )
+    if not np.all(valid_cohort_weights):
+        bad_rows = np.flatnonzero(~valid_cohort_weights)
+        raise ValueError(
+            f"{source} contains {bad_rows.size} invalid extreme-score cohort "
+            f"weight(s) in C{GLOBAL_WEIGHT_CHANNEL}; first bad row "
+            f"{int(bad_rows[0])}"
+        )
+    if not np.all(selected == 1.0):
+        raise ValueError(
+            f"{source} contains unselected cohort rows; the writer must omit "
+            "zero-credit games before score-only training"
+        )
+
+    player_policy_weights = globalTargetsNC[:, PLAYER_POLICY_WEIGHT_CHANNEL]
+    if not np.all(np.isfinite(player_policy_weights) & (player_policy_weights > 0.0)):
+        raise ValueError(
+            f"{source} contains an extreme-score row without positive focal "
+            f"policy weight in C{PLAYER_POLICY_WEIGHT_CHANNEL}"
+        )
+
+    opponent_policy_weights = globalTargetsNC[:, OPPONENT_POLICY_WEIGHT_CHANNEL]
+    if not np.all(np.isfinite(opponent_policy_weights) & (opponent_policy_weights == 0.0)):
+        raise ValueError(
+            f"{source} contains an extreme-score row with nonzero opponent "
+            f"policy weight in C{OPPONENT_POLICY_WEIGHT_CHANNEL}"
+        )
+
+    required_weight_channels = {
+        27: "ownership/score-distribution",
+        33: "future-position",
+        34: "scoring",
+    }
+    for channel, name in required_weight_channels.items():
+        weights = globalTargetsNC[:, channel]
+        if not np.all(
+            np.isfinite(weights) & (weights > 0.0) & (weights <= 1.0)
+        ):
+            raise ValueError(
+                f"{source} contains an invalid {name} weight in C{channel}; "
+                "extreme-score rows require a finite value in (0,1]"
+            )
+    lead_weights = globalTargetsNC[:, 29]
+    if not np.all(
+        np.isfinite(lead_weights)
+        & (lead_weights >= 0.0)
+        & (lead_weights <= 1.0)
+    ):
+        raise ValueError(
+            f"{source} contains an invalid optional lead weight in C29; "
+            "expected a finite value in [0,1]"
+        )
+
+    # Metrics computes every head before zeroing forbidden contributions, so
+    # non-finite dormant targets can still poison loss_sum through NaN * 0.
+    consumed_global_channels = list(range(23)) + list(range(24, 30)) + [
+        33,
+        34,
+        35,
+    ]
+    if not np.all(np.isfinite(globalTargetsNC[:, consumed_global_channels])):
+        raise ValueError(f"{source} has non-finite consumed global target values")
+
+    def _check_row_count(name: str, array: np.ndarray) -> None:
+        if array.shape[0] != globalTargetsNC.shape[0]:
+            raise ValueError(
+                f"{source}:{name} has {array.shape[0]} rows, expected "
+                f"{globalTargetsNC.shape[0]}"
+            )
+
+    if policyTargetsNCMove is not None:
+        _check_row_count("policyTargetsNCMove", policyTargetsNCMove)
+        if policyTargetsNCMove.ndim != 3 or policyTargetsNCMove.shape[1] < 2:
+            raise ValueError(
+                f"{source}:policyTargetsNCMove must have shape (N,>=2,M)"
+            )
+        policies = np.asarray(policyTargetsNCMove[:, :2, :])
+        valid_policies = (
+            np.all(np.isfinite(policies), axis=(1, 2))
+            & np.all(policies >= 0.0, axis=(1, 2))
+            & np.all(np.sum(policies, axis=2) > 0.0, axis=1)
+        )
+        if not np.all(valid_policies):
+            raise ValueError(
+                f"{source}:policyTargetsNCMove contains a non-finite, negative, "
+                "or empty policy target"
+            )
+
+    if scoreDistrN is not None:
+        _check_row_count("scoreDistrN", scoreDistrN)
+        if scoreDistrN.ndim != 2:
+            raise ValueError(f"{source}:scoreDistrN must have shape (N,S)")
+        score_distributions = np.asarray(scoreDistrN)
+        valid_score_distributions = (
+            np.all(np.isfinite(score_distributions), axis=1)
+            & np.all(score_distributions >= 0.0, axis=1)
+            & np.isclose(
+                np.sum(score_distributions, axis=1),
+                100.0,
+                rtol=0.0,
+                atol=1e-4,
+            )
+        )
+        if not np.all(valid_score_distributions):
+            raise ValueError(
+                f"{source}:scoreDistrN contains an invalid score distribution"
+            )
+
+    if valueTargetsNCHW is not None:
+        _check_row_count("valueTargetsNCHW", valueTargetsNCHW)
+        if valueTargetsNCHW.ndim != 4 or valueTargetsNCHW.shape[1] < 5:
+            raise ValueError(
+                f"{source}:valueTargetsNCHW must have shape (N,>=5,H,W)"
+            )
+        value_targets = np.asarray(valueTargetsNCHW[:, :5, :, :])
+        valid_value_targets = (
+            np.all(np.isfinite(value_targets), axis=(1, 2, 3))
+            & np.all(
+                (value_targets[:, :4] >= -1.0)
+                & (value_targets[:, :4] <= 1.0),
+                axis=(1, 2, 3),
+            )
+            & np.all(
+                (value_targets[:, 4] >= -120.0)
+                & (value_targets[:, 4] <= 120.0),
+                axis=(1, 2),
+            )
+        )
+        if not np.all(valid_value_targets):
+            raise ValueError(
+                f"{source}:valueTargetsNCHW contains non-finite or out-of-range "
+                "ownership/scoring targets"
+            )
+
+    if qValueTargetsNCMove is not None:
+        _check_row_count("qValueTargetsNCMove", qValueTargetsNCMove)
+        if qValueTargetsNCMove.ndim != 3 or qValueTargetsNCMove.shape[1] < 3:
+            raise ValueError(
+                f"{source}:qValueTargetsNCMove must have shape (N,>=3,M)"
+            )
+        qvalue_targets = np.asarray(qValueTargetsNCMove[:, :3, :])
+        if not np.all(np.isfinite(qvalue_targets)) or not np.all(
+            qvalue_targets[:, 2, :] >= 0.0
+        ):
+            raise ValueError(
+                f"{source}:qValueTargetsNCMove contains non-finite targets or "
+                "negative visit weights"
+            )
 
 def read_npz_training_data(
     npz_files,
@@ -36,7 +325,17 @@ def read_npz_training_data(
     include_meta: bool,
     model_config: modelconfigs.ModelConfig,
     prefetch_depth: int = 1,
+    extreme_score_only: bool = False,
+    extreme_score_cohort_size: int | None = None,
 ):
+    if extreme_score_only and extreme_score_cohort_size is None:
+        raise ValueError(
+            "score-only data loading requires a frozen cohort size"
+        )
+    if not extreme_score_only and extreme_score_cohort_size is not None:
+        raise ValueError(
+            "extreme-score cohort size requires score-only data loading"
+        )
     rand = np.random.default_rng(seed=list(os.urandom(12)))
     num_bin_features = modelconfigs.get_num_bin_input_features(model_config)
     num_global_features = modelconfigs.get_num_global_input_features(model_config)
@@ -73,7 +372,31 @@ def read_npz_training_data(
             binaryInputNCHWPacked = select_rank_rows(npz["binaryInputNCHWPacked"])
             globalInputNC = select_rank_rows(npz["globalInputNC"])
             policyTargetsNCMove = select_rank_rows(npz["policyTargetsNCMove"]).astype(np.float32)
-            globalTargetsNC = pad_global_targets_nc(select_rank_rows(npz["globalTargetsNC"]))
+            if extreme_score_only:
+                # Validate the whole globally used prefix before rank slicing so
+                # every DDP rank fails on the same malformed shard.
+                globalTargetsNCAllRanks = pad_global_targets_nc(
+                    npz["globalTargetsNC"][:used]
+                )
+                validate_extreme_score_training_rows(
+                    globalTargetsNCAllRanks,
+                    source=f"{npz_file}:globalTargetsNC",
+                    policyTargetsNCMove=npz["policyTargetsNCMove"][:used],
+                    scoreDistrN=npz["scoreDistrN"][:used],
+                    valueTargetsNCHW=npz["valueTargetsNCHW"][:used],
+                    qValueTargetsNCMove=(
+                        npz["qValueTargetsNCMove"][:used]
+                        if include_qvalues
+                        else None
+                    ),
+                    expected_group_size=extreme_score_cohort_size,
+                )
+                globalTargetsNC = select_rank_rows(globalTargetsNCAllRanks)
+                del globalTargetsNCAllRanks
+            else:
+                globalTargetsNC = pad_global_targets_nc(
+                    select_rank_rows(npz["globalTargetsNC"])
+                )
             scoreDistrN = select_rank_rows(npz["scoreDistrN"]).astype(np.float32)
             valueTargetsNCHW = select_rank_rows(npz["valueTargetsNCHW"]).astype(np.float32)
             if include_meta:

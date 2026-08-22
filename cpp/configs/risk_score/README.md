@@ -241,6 +241,18 @@ permissive 35% score floor: enough to reject catastrophic models without
 requiring margin-seeking fine-tunes to preserve their parent's full strength.
 The gate consumes no external SGFs.
 
+`extreme_score_selfplay_19x19.cfg` is the successor for expected-best-of-N
+training. Each process trains one focal color against a separately loaded
+frozen opponent snapshot, groups `N` stochastic attempts, and emits only
+focal-side rows with explicit cohort credit. Use `extreme_score_match_19x19.cfg`
+for held-out candidate/reference evaluation under the identical stochastic
+attempt policy. Both configs set win utility to zero and require matching
+`extremeScoreGroupSize`/focal-color overrides. Launch only through
+`risk_score.extreme_score_league` with a bounded `games_per_worker`; then use
+`extreme_score_provenance`, `extreme_score_evaluation_run`, and
+`extreme_score_controller` to bind shuffle lineage, execute held-out matches,
+and atomically activate only evaluator-approved snapshots.
+
 ## Phase 2 self-play
 
 `phase2_selfplay_19x19.cfg` fixes 19x19 positional-superko area scoring with

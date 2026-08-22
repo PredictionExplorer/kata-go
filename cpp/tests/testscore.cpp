@@ -1,5 +1,7 @@
 #include "../tests/tests.h"
 
+#include <limits>
+
 #include "../neuralnet/nninputs.h"
 #include "../program/setup.h"
 #include "../search/searchparams.h"
@@ -58,6 +60,59 @@ namespace {
     for(int i = 1; i<numSteps; i++)
       sum += (i % 2 == 0 ? 2.0 : 4.0) * integrand(integrationLower + i*step);
     return result + sum * step / 3.0;
+  }
+
+  static double slowExpectedClampedNormalScore(
+    double scoreMean,
+    double scoreStdev,
+    double lowerBound,
+    double upperBound
+  ) {
+    if(scoreStdev <= 0.0)
+      return std::min(upperBound,std::max(lowerBound,scoreMean));
+    static const double sqrtTwo = 1.41421356237309504880;
+    static const double invSqrtTwoPi = 0.39894228040143267794;
+    auto normalCDF = [](double x) {
+      return 0.5 * erfc(-x / sqrtTwo);
+    };
+    auto normalSurvival = [](double x) {
+      return 0.5 * erfc(x / sqrtTwo);
+    };
+    auto normalPDF = [](double x) {
+      return invSqrtTwoPi * exp(-0.5*x*x);
+    };
+
+    double lowerZ = (lowerBound-scoreMean) / scoreStdev;
+    double upperZ = (upperBound-scoreMean) / scoreStdev;
+    double interiorProb = normalCDF(upperZ)-normalCDF(lowerZ);
+    return
+      lowerBound * normalCDF(lowerZ) +
+      scoreMean * interiorProb +
+      scoreStdev * (normalPDF(lowerZ)-normalPDF(upperZ)) +
+      upperBound * normalSurvival(upperZ);
+  }
+
+  static double slowExpectedMaxScore(
+    double scoreMean,
+    double scoreStdev,
+    int bestOfN,
+    double lowerBound,
+    double upperBound
+  ) {
+    if(scoreStdev <= 0.0)
+      return std::min(upperBound,std::max(lowerBound,scoreMean));
+    static const double sqrtTwo = 1.41421356237309504880;
+    auto integrand = [&](double score) {
+      double cdf = 0.5 * erfc(-(score-scoreMean) / (scoreStdev*sqrtTwo));
+      return pow(cdf,bestOfN);
+    };
+
+    const int numSteps = 100000;
+    double step = (upperBound-lowerBound) / numSteps;
+    double sum = integrand(lowerBound) + integrand(upperBound);
+    for(int i = 1; i<numSteps; i++)
+      sum += (i % 2 == 0 ? 2.0 : 4.0) * integrand(lowerBound+i*step);
+    return upperBound - sum * step / 3.0;
   }
 }
 
@@ -257,11 +312,18 @@ void Tests::runScoreTests() {
 
     SearchParams params;
     testAssert(!params.useScoreMaximizingUtility);
+    testAssert(!params.useExpectedMaxScoreUtility);
+    testAssert(params.extremeScoreGroupSize == 1);
+    testAssert(params.expectedMaxFocalPla == C_EMPTY);
     testAssert(params.scorePower == 1.5);
     testAssert(params.scoreScale == 20.0);
     testAssert(params.winWeight == 2.0);
     nlohmann::json paramsJson = params.changeableParametersToJson();
     testAssert(paramsJson["useScoreMaximizingUtility"] == false);
+    testAssert(paramsJson["useExpectedMaxScoreUtility"] == false);
+    testAssert(paramsJson["extremeScoreGroupSize"] == 1);
+    testAssert(paramsJson["expectedMaxFocalColor"] == "");
+    testAssert(paramsJson.find("expectedMaxFocalPla") == paramsJson.end());
     testAssert(paramsJson["scorePower"] == 1.5);
     testAssert(paramsJson["scoreScale"] == 20.0);
     testAssert(paramsJson["winWeight"] == 2.0);
@@ -269,11 +331,26 @@ void Tests::runScoreTests() {
     changedParams.useScoreMaximizingUtility = true;
     testAssert(changedParams != params);
     testAssert(changedParams.getHash() != params.getHash());
+    changedParams = params;
+    changedParams.useExpectedMaxScoreUtility = true;
+    testAssert(changedParams != params);
+    testAssert(changedParams.getHash() != params.getHash());
+    Hash128 expectedMaxHash = changedParams.getHash();
+    changedParams.expectedMaxFocalPla = P_WHITE;
+    testAssert(changedParams.getHash() != expectedMaxHash);
+    testAssert(changedParams.changeableParametersToJson()["expectedMaxFocalColor"] == "W");
+    expectedMaxHash = changedParams.getHash();
+    changedParams.extremeScoreGroupSize = 8;
+    testAssert(changedParams != params);
+    testAssert(changedParams.getHash() != expectedMaxHash);
     ostringstream paramsOut;
     streambuf* oldCoutBuf = cout.rdbuf(paramsOut.rdbuf());
     params.printParams(paramsOut);
     cout.rdbuf(oldCoutBuf);
     testAssert(paramsOut.str().find("useScoreMaximizingUtility: 0") != std::string::npos);
+    testAssert(paramsOut.str().find("useExpectedMaxScoreUtility: 0") != std::string::npos);
+    testAssert(paramsOut.str().find("extremeScoreGroupSize: 1") != std::string::npos);
+    testAssert(paramsOut.str().find("expectedMaxFocalPla: 0") != std::string::npos);
     testAssert(paramsOut.str().find("scorePower: 1.5") != std::string::npos);
     testAssert(paramsOut.str().find("scoreScale: 20") != std::string::npos);
     testAssert(paramsOut.str().find("winWeight: 2") != std::string::npos);
@@ -282,10 +359,14 @@ void Tests::runScoreTests() {
       {"numBots","2"},
       {"numSearchThreads","1"},
       {"useScoreMaximizingUtility","false"},
+      {"useExpectedMaxScoreUtility","false"},
+      {"extremeScoreGroupSize","3"},
       {"scorePower","1.25"},
       {"scoreScale","25.0"},
       {"winWeight","2.5"},
       {"useScoreMaximizingUtility1","true"},
+      {"useExpectedMaxScoreUtility1","false"},
+      {"extremeScoreGroupSize1","8"},
       {"scorePower1","2.0"},
       {"scoreScale1","10.0"},
       {"winWeight1","3.0"}
@@ -296,13 +377,272 @@ void Tests::runScoreTests() {
     );
     testAssert(loadedParams.size() == 2);
     testAssert(!loadedParams[0].useScoreMaximizingUtility);
+    testAssert(!loadedParams[0].useExpectedMaxScoreUtility);
+    testAssert(loadedParams[0].extremeScoreGroupSize == 3);
     testAssert(loadedParams[0].scorePower == 1.25);
     testAssert(loadedParams[0].scoreScale == 25.0);
     testAssert(loadedParams[0].winWeight == 2.5);
     testAssert(loadedParams[1].useScoreMaximizingUtility);
+    testAssert(!loadedParams[1].useExpectedMaxScoreUtility);
+    testAssert(loadedParams[1].extremeScoreGroupSize == 8);
     testAssert(loadedParams[1].scorePower == 2.0);
     testAssert(loadedParams[1].scoreScale == 10.0);
     testAssert(loadedParams[1].winWeight == 3.0);
+  }
+
+  {
+    const double lowerBound = -42.5;
+    const double upperBound = 51.5;
+    const double scoreMean = 6.25;
+    const double scoreStdev = 12.75;
+
+    double expectedN1 = ScoreValue::expectedMaxScore(
+      scoreMean,scoreStdev,1,lowerBound,upperBound
+    );
+    double clampedMeanReference = slowExpectedClampedNormalScore(
+      scoreMean,scoreStdev,lowerBound,upperBound
+    );
+    testAssert(std::fabs(expectedN1-clampedMeanReference) < 1e-12);
+
+    double expectedN7 = ScoreValue::expectedMaxScore(
+      scoreMean,scoreStdev,7,lowerBound,upperBound
+    );
+    double expectedN7Reference = slowExpectedMaxScore(
+      scoreMean,scoreStdev,7,lowerBound,upperBound
+    );
+    testAssert(std::fabs(expectedN7-expectedN7Reference) < 2e-4);
+
+    double previous = lowerBound;
+    const int groupSizes[] = {1,2,4,8,16,32,64};
+    for(int groupSize: groupSizes) {
+      double expected = ScoreValue::expectedMaxScore(
+        scoreMean,scoreStdev,groupSize,lowerBound,upperBound
+      );
+      testAssert(std::isfinite(expected));
+      testAssert(expected >= lowerBound && expected <= upperBound);
+      testAssert(expected > previous);
+      previous = expected;
+    }
+
+    for(int groupSize: groupSizes) {
+      testAssert(
+        ScoreValue::expectedMaxScore(200.0,0.0,groupSize,lowerBound,upperBound) ==
+        upperBound
+      );
+      testAssert(
+        ScoreValue::expectedMaxScore(-200.0,0.0,groupSize,lowerBound,upperBound) ==
+        lowerBound
+      );
+      testAssert(
+        ScoreValue::expectedMaxScore(-3.75,0.0,groupSize,lowerBound,upperBound) ==
+        -3.75
+      );
+    }
+
+    const double legalCases[][2] = {
+      {-1e100,1e-12},
+      {1e100,1e-12},
+      {0.0,1e-300},
+      {0.0,1e100}
+    };
+    for(const auto& legalCase: legalCases) {
+      double expected = ScoreValue::expectedMaxScore(
+        legalCase[0],legalCase[1],64,lowerBound,upperBound
+      );
+      testAssert(std::isfinite(expected));
+      testAssert(expected >= lowerBound && expected <= upperBound);
+    }
+
+    double whiteFocalUtility = ScoreValue::expectedMaxScoreUtility(
+      scoreMean,scoreStdev,P_WHITE,8,lowerBound,upperBound
+    );
+    double blackFocalUtility = ScoreValue::expectedMaxScoreUtility(
+      scoreMean,scoreStdev,P_BLACK,8,lowerBound,upperBound
+    );
+    testAssert(whiteFocalUtility > expectedN1);
+    testAssert(blackFocalUtility < expectedN1);
+    testAssert(
+      ScoreValue::expectedMaxScoreUtility(
+        scoreMean,scoreStdev,P_WHITE,1,lowerBound,upperBound
+      ) == ScoreValue::expectedMaxScoreUtility(
+        scoreMean,scoreStdev,P_BLACK,1,lowerBound,upperBound
+      )
+    );
+    double colorReversedUtility = ScoreValue::expectedMaxScoreUtility(
+      -scoreMean,scoreStdev,P_BLACK,8,-upperBound,-lowerBound
+    );
+    testAssert(std::fabs(whiteFocalUtility+colorReversedUtility) < 1e-12);
+
+    //The universal CDF cache must not retain a prior group size or legal range,
+    //and the search/eval-cache hash must change with the objective parameters.
+    double n2First = ScoreValue::expectedMaxScore(
+      scoreMean,scoreStdev,2,lowerBound,upperBound
+    );
+    double n16 = ScoreValue::expectedMaxScore(
+      scoreMean,scoreStdev,16,-10.0,10.0
+    );
+    double n2Again = ScoreValue::expectedMaxScore(
+      scoreMean,scoreStdev,2,lowerBound,upperBound
+    );
+    testAssert(n2First == n2Again);
+    testAssert(n16 >= -10.0 && n16 <= 10.0);
+
+    bool rejectedBestOfN = false;
+    try {
+      (void)ScoreValue::expectedMaxScore(scoreMean,scoreStdev,0,lowerBound,upperBound);
+    }
+    catch(const StringError&) {
+      rejectedBestOfN = true;
+    }
+    testAssert(rejectedBestOfN);
+    rejectedBestOfN = false;
+    try {
+      (void)ScoreValue::expectedMaxScore(scoreMean,scoreStdev,65,lowerBound,upperBound);
+    }
+    catch(const StringError&) {
+      rejectedBestOfN = true;
+    }
+    testAssert(rejectedBestOfN);
+
+    bool rejectedNonfinite = false;
+    try {
+      (void)ScoreValue::expectedMaxScore(
+        std::numeric_limits<double>::infinity(),scoreStdev,4,lowerBound,upperBound
+      );
+    }
+    catch(const StringError&) {
+      rejectedNonfinite = true;
+    }
+    testAssert(rejectedNonfinite);
+    rejectedNonfinite = false;
+    try {
+      (void)ScoreValue::expectedMaxScore(
+        scoreMean,std::numeric_limits<double>::quiet_NaN(),4,lowerBound,upperBound
+      );
+    }
+    catch(const StringError&) {
+      rejectedNonfinite = true;
+    }
+    testAssert(rejectedNonfinite);
+    rejectedNonfinite = false;
+    try {
+      (void)ScoreValue::expectedMaxScore(
+        scoreMean,scoreStdev,4,
+        -std::numeric_limits<double>::infinity(),upperBound
+      );
+    }
+    catch(const StringError&) {
+      rejectedNonfinite = true;
+    }
+    testAssert(rejectedNonfinite);
+
+    bool rejectedInvalidBounds = false;
+    try {
+      (void)ScoreValue::expectedMaxScore(
+        scoreMean,scoreStdev,4,upperBound,upperBound
+      );
+    }
+    catch(const StringError&) {
+      rejectedInvalidBounds = true;
+    }
+    testAssert(rejectedInvalidBounds);
+
+    bool rejectedInvalidFocalPla = false;
+    try {
+      (void)ScoreValue::expectedMaxScoreUtility(
+        scoreMean,scoreStdev,C_EMPTY,4,lowerBound,upperBound
+      );
+    }
+    catch(const StringError&) {
+      rejectedInvalidFocalPla = true;
+    }
+    testAssert(rejectedInvalidFocalPla);
+
+    map<string,string> expectedMaxConfigValues {
+      {"numSearchThreads","1"},
+      {"useExpectedMaxScoreUtility","true"},
+      {"extremeScoreGroupSize","64"},
+      {"expectedMaxFocalColor","B"}
+    };
+    ConfigParser expectedMaxCfg(expectedMaxConfigValues);
+    vector<SearchParams> expectedMaxParams = Setup::loadParams(
+      expectedMaxCfg,Setup::SETUP_FOR_OTHER,false,false
+    );
+    testAssert(expectedMaxParams.size() == 1);
+    testAssert(expectedMaxParams[0].useExpectedMaxScoreUtility);
+    testAssert(!expectedMaxParams[0].useScoreMaximizingUtility);
+    testAssert(expectedMaxParams[0].extremeScoreGroupSize == 64);
+    testAssert(expectedMaxParams[0].expectedMaxFocalPla == P_BLACK);
+
+    for(const string& invalidSize: {"0","65"}) {
+      bool rejectedConfig = false;
+      try {
+        map<string,string> invalidConfigValues {
+          {"numSearchThreads","1"},
+          {"useExpectedMaxScoreUtility","true"},
+          {"extremeScoreGroupSize",invalidSize},
+          {"expectedMaxFocalColor","W"}
+        };
+        ConfigParser invalidCfg(invalidConfigValues);
+        (void)Setup::loadParams(invalidCfg,Setup::SETUP_FOR_OTHER,false,false);
+      }
+      catch(const StringError&) {
+        rejectedConfig = true;
+      }
+      testAssert(rejectedConfig);
+    }
+
+    for(const string& focalColor: {"","X"}) {
+      bool rejectedFocalConfig = false;
+      try {
+        map<string,string> invalidFocalValues {
+          {"numSearchThreads","1"},
+          {"useExpectedMaxScoreUtility","true"},
+          {"extremeScoreGroupSize","4"}
+        };
+        if(!focalColor.empty())
+          invalidFocalValues["expectedMaxFocalColor"] = focalColor;
+        ConfigParser invalidFocalCfg(invalidFocalValues);
+        (void)Setup::loadParams(invalidFocalCfg,Setup::SETUP_FOR_OTHER,false,false);
+      }
+      catch(const StringError&) {
+        rejectedFocalConfig = true;
+      }
+      testAssert(rejectedFocalConfig);
+    }
+
+    bool rejectedConflictingModes = false;
+    try {
+      map<string,string> conflictingConfigValues {
+        {"numSearchThreads","1"},
+        {"useScoreMaximizingUtility","true"},
+        {"useExpectedMaxScoreUtility","true"},
+        {"extremeScoreGroupSize","4"}
+      };
+      ConfigParser conflictingCfg(conflictingConfigValues);
+      (void)Setup::loadParams(conflictingCfg,Setup::SETUP_FOR_OTHER,false,false);
+    }
+    catch(const ConfigParsingError&) {
+      rejectedConflictingModes = true;
+    }
+    testAssert(rejectedConflictingModes);
+
+    bool rejectedExpectedMaxEvalCache = false;
+    try {
+      map<string,string> cachedConfigValues {
+        {"numSearchThreads","1"},
+        {"useExpectedMaxScoreUtility","true"},
+        {"extremeScoreGroupSize","4"},
+        {"expectedMaxFocalColor","W"},
+        {"useEvalCache","true"}
+      };
+      ConfigParser cachedCfg(cachedConfigValues);
+      (void)Setup::loadParams(cachedCfg,Setup::SETUP_FOR_OTHER,false,false);
+    }
+    catch(const ConfigParsingError&) {
+      rejectedExpectedMaxEvalCache = true;
+    }
+    testAssert(rejectedExpectedMaxEvalCache);
   }
 
   {

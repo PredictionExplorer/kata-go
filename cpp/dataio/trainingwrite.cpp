@@ -1,6 +1,7 @@
 #include "../dataio/trainingwrite.h"
 
 #include "../core/fileutils.h"
+#include "../core/hash.h"
 #include "../core/test.h"
 #include "../neuralnet/modelversion.h"
 
@@ -16,6 +17,76 @@ ValueTargets::ValueTargets()
 {}
 ValueTargets::~ValueTargets()
 {}
+
+//-------------------------------------------------------------------------------------
+
+ExtremeCohortSettings::ExtremeCohortSettings()
+  :groupSize(0),
+   focalPla(C_EMPTY),
+   configIdentity(),
+   runIdentity()
+{}
+
+ExtremeCohortSettings::ExtremeCohortSettings(
+  int n,
+  Player focal,
+  const string& config,
+  const string& run
+)
+  :groupSize(n),
+   focalPla(focal),
+   configIdentity(config),
+   runIdentity(run)
+{}
+
+ExtremeCohortSettings::~ExtremeCohortSettings()
+{}
+
+bool ExtremeCohortSettings::isEnabled() const {
+  return groupSize > 0;
+}
+
+uint64_t ExtremeCohortSettings::cohortIdStart() const {
+  if(!isEnabled())
+    return 0;
+  return Hash::simpleHash(runIdentity.c_str()) & 0x7FFFFFFFFFFULL;
+}
+
+ExtremeCohortData::ExtremeCohortData()
+  :enabled(false),
+   metadataVersion(0),
+   cohortId(0),
+   attemptIdx(0),
+   groupSize(0),
+   focalPla(C_EMPTY),
+   focalModelIdentity(),
+   opponentModelIdentity(),
+   configIdentity(),
+   runIdentity(),
+   focalFinalMargin(0.0),
+   leaveOneOutMaxMargin(0.0),
+   credit(0.0),
+   rank(0),
+   selected(false),
+   appliedWeight(0.0)
+{}
+
+ExtremeCohortData::~ExtremeCohortData()
+{}
+
+bool ExtremeCohortData::hasValidAssignment() const {
+  return
+    enabled &&
+    metadataVersion == METADATA_VERSION &&
+    groupSize > 0 &&
+    attemptIdx >= 0 &&
+    attemptIdx < groupSize &&
+    (focalPla == P_BLACK || focalPla == P_WHITE) &&
+    !focalModelIdentity.empty() &&
+    !opponentModelIdentity.empty() &&
+    !configIdentity.empty() &&
+    !runIdentity.empty();
+}
 
 //-------------------------------------------------------------------------------------
 
@@ -97,6 +168,7 @@ FinishedGameData::FinishedGameData()
    finalWhiteScoring(NULL),
 
    trainingWeight(1.0),
+   extremeCohort(),
 
    sidePositions(),
    changedNeuralNets(),
@@ -125,6 +197,178 @@ FinishedGameData::~FinishedGameData() {
 
   for(size_t i = 0; i<changedNeuralNets.size(); i++)
     delete changedNeuralNets[i];
+}
+
+bool applyExtremeCohortCredits(vector<FinishedGameData*>& games, string& error) {
+  error.clear();
+  if(games.empty()) {
+    error = "empty cohort";
+    return false;
+  }
+
+  FinishedGameData* first = games[0];
+  if(first == NULL || !first->extremeCohort.hasValidAssignment()) {
+    error = "missing or invalid cohort assignment";
+    return false;
+  }
+  const ExtremeCohortData& expected = first->extremeCohort;
+  const int groupSize = expected.groupSize;
+  if(games.size() != (size_t)groupSize) {
+    error = "cohort does not contain its declared number of games";
+    return false;
+  }
+
+  vector<FinishedGameData*> ordered(groupSize,NULL);
+  vector<double> scores(groupSize,0.0);
+  for(FinishedGameData* data: games) {
+    if(data == NULL) {
+      error = "null game in cohort";
+      return false;
+    }
+    const ExtremeCohortData& assignment = data->extremeCohort;
+    if(
+      !assignment.hasValidAssignment() ||
+      assignment.cohortId != expected.cohortId ||
+      assignment.groupSize != expected.groupSize ||
+      assignment.focalPla != expected.focalPla ||
+      assignment.focalModelIdentity != expected.focalModelIdentity ||
+      assignment.opponentModelIdentity != expected.opponentModelIdentity ||
+      assignment.configIdentity != expected.configIdentity ||
+      assignment.runIdentity != expected.runIdentity
+    ) {
+      error = "cohort assignment identities do not match";
+      return false;
+    }
+    if(
+      assignment.rank != 0 ||
+      assignment.selected ||
+      assignment.credit != 0.0 ||
+      assignment.appliedWeight != 0.0
+    ) {
+      error = "cohort game was already finalized";
+      return false;
+    }
+    if(ordered[assignment.attemptIdx] != NULL) {
+      error = "duplicate attempt index in cohort";
+      return false;
+    }
+
+    if(
+      !data->endHist.isGameFinished ||
+      !data->endHist.isScored ||
+      data->endHist.isNoResult ||
+      data->endHist.isResignation ||
+      data->hitTurnLimit
+    ) {
+      error = "cohort game did not end with a finite scored result";
+      return false;
+    }
+    if(!std::isfinite(data->endHist.finalWhiteMinusBlackScore)) {
+      error = "cohort game has a non-finite final score";
+      return false;
+    }
+    if(!data->changedNeuralNets.empty()) {
+      error = "cohort game changed model generation";
+      return false;
+    }
+
+    const string& expectedBlackName =
+      assignment.focalPla == P_BLACK ? assignment.focalModelIdentity : assignment.opponentModelIdentity;
+    const string& expectedWhiteName =
+      assignment.focalPla == P_WHITE ? assignment.focalModelIdentity : assignment.opponentModelIdentity;
+    if(data->bName != expectedBlackName || data->wName != expectedWhiteName) {
+      error = "cohort game player identities do not match the frozen assignment";
+      return false;
+    }
+
+    if(data->startHist.moveHistory.size() > data->endHist.moveHistory.size()) {
+      error = "cohort game has an invalid move-history range";
+      return false;
+    }
+    const size_t numMoves = data->endHist.moveHistory.size() - data->startHist.moveHistory.size();
+    if(
+      data->targetWeightByTurn.size() != numMoves ||
+      data->targetWeightByTurnUnrounded.size() != numMoves
+    ) {
+      error = "cohort game has inconsistent per-turn weights";
+      return false;
+    }
+    if(!std::isfinite(data->trainingWeight) || data->trainingWeight <= 0.0) {
+      error = "cohort game has an invalid training weight";
+      return false;
+    }
+    for(size_t turn = 0; turn<numMoves; turn++) {
+      if(
+        !std::isfinite(data->targetWeightByTurn[turn]) ||
+        data->targetWeightByTurn[turn] < 0.0f ||
+        !std::isfinite(data->targetWeightByTurnUnrounded[turn]) ||
+        data->targetWeightByTurnUnrounded[turn] < 0.0f
+      ) {
+        error = "cohort game has an invalid per-turn weight";
+        return false;
+      }
+    }
+
+    const double whiteMargin = (double)data->endHist.finalWhiteMinusBlackScore;
+    scores[assignment.attemptIdx] = assignment.focalPla == P_WHITE ? whiteMargin : -whiteMargin;
+    ordered[assignment.attemptIdx] = data;
+  }
+
+  for(int i = 0; i<groupSize; i++) {
+    if(ordered[i] == NULL) {
+      error = "cohort is missing an attempt index";
+      return false;
+    }
+  }
+
+  //All validation is complete. Mutate only now so any rejected cohort fails closed without
+  //partially changing a game that a caller might inspect for diagnostics.
+  for(int i = 0; i<groupSize; i++) {
+    double maxOther = 0.0;
+    if(groupSize > 1) {
+      maxOther = -std::numeric_limits<double>::infinity();
+      for(int j = 0; j<groupSize; j++) {
+        if(j != i)
+          maxOther = std::max(maxOther,scores[j]);
+      }
+    }
+    //N=1 is the expected-score curriculum stage. Every focal trajectory must
+    //contribute, regardless of whether its realized score is negative.
+    const double credit =
+      groupSize == 1 ? 1.0 : std::max(0.0,scores[i] - maxOther);
+    int rank = 1;
+    for(int j = 0; j<groupSize; j++) {
+      if(scores[j] > scores[i])
+        rank += 1;
+    }
+
+    FinishedGameData* data = ordered[i];
+    data->extremeCohort.focalFinalMargin = scores[i] != 0.0 ? scores[i] : 0.0;
+    data->extremeCohort.leaveOneOutMaxMargin = maxOther != 0.0 ? maxOther : 0.0;
+    data->extremeCohort.credit = credit;
+    data->extremeCohort.rank = rank;
+    data->extremeCohort.selected = credit > 0.0;
+    data->extremeCohort.appliedWeight = credit;
+    data->trainingWeight *= credit;
+
+    const size_t startTurnIdx = data->startHist.moveHistory.size();
+    for(size_t turn = 0; turn<data->targetWeightByTurn.size(); turn++) {
+      const Move& move = data->endHist.moveHistory[startTurnIdx+turn];
+      if(credit <= 0.0 || move.pla != data->extremeCohort.focalPla) {
+        data->targetWeightByTurn[turn] = 0.0f;
+        data->targetWeightByTurnUnrounded[turn] = 0.0f;
+      }
+    }
+    for(SidePosition* sidePosition: data->sidePositions) {
+      if(credit <= 0.0 || sidePosition->pla != data->extremeCohort.focalPla) {
+        sidePosition->targetWeight = 0.0f;
+        sidePosition->targetWeightUnrounded = 0.0f;
+      }
+    }
+  }
+
+  games = std::move(ordered);
+  return true;
 }
 
 void FinishedGameData::printDebug(ostream& out) const {
@@ -235,6 +479,24 @@ void FinishedGameData::printDebug(ostream& out) const {
     }
   }
   out << "trainingWeight " << trainingWeight << endl;
+  out << "extremeCohortEnabled " << extremeCohort.enabled << endl;
+  if(extremeCohort.enabled) {
+    out << "extremeCohortMetadataVersion " << extremeCohort.metadataVersion << endl;
+    out << "extremeCohortId " << extremeCohort.cohortId << endl;
+    out << "extremeCohortAttemptIdx " << extremeCohort.attemptIdx << endl;
+    out << "extremeCohortGroupSize " << extremeCohort.groupSize << endl;
+    out << "extremeCohortFocalPla " << PlayerIO::playerToString(extremeCohort.focalPla) << endl;
+    out << "extremeCohortFocalModelIdentity " << extremeCohort.focalModelIdentity << endl;
+    out << "extremeCohortOpponentModelIdentity " << extremeCohort.opponentModelIdentity << endl;
+    out << "extremeCohortConfigIdentity " << extremeCohort.configIdentity << endl;
+    out << "extremeCohortRunIdentity " << extremeCohort.runIdentity << endl;
+    out << "extremeCohortFocalFinalMargin " << extremeCohort.focalFinalMargin << endl;
+    out << "extremeCohortLeaveOneOutMaxMargin " << extremeCohort.leaveOneOutMaxMargin << endl;
+    out << "extremeCohortCredit " << extremeCohort.credit << endl;
+    out << "extremeCohortRank " << extremeCohort.rank << endl;
+    out << "extremeCohortSelected " << extremeCohort.selected << endl;
+    out << "extremeCohortAppliedWeight " << extremeCohort.appliedWeight << endl;
+  }
   for(int i = 0; i<sidePositions.size(); i++) {
     SidePosition* sp = sidePositions[i];
     out << "Side position " << i << endl;
@@ -481,7 +743,8 @@ void TrainingWriteBuffers::addRow(
   int mode,
   SGFMetadata* sgfMeta,
   Rand& rand,
-  const ReanalysisData& reanalysisData
+  const ReanalysisData& reanalysisData,
+  const ExtremeCohortData& extremeCohortData
 ) {
   static_assert(NNModelVersion::latestInputsVersionImplemented == 7, "");
   if(inputsVersion < 3 || inputsVersion > 7)
@@ -697,9 +960,26 @@ void TrainingWriteBuffers::addRow(
   rowGlobal[66] = reanalysisData.wasReanalyzed ? reanalysisData.selectionValueSurprise : 0.0f;
   rowGlobal[67] = reanalysisData.wasReanalyzed ? (float)reanalysisData.originalNumVisits : 0.0f;
 
-  //Unused
-  for(int i = 68; i<80; i++)
-    rowGlobal[i] = 0.0f;
+  //Extreme cohort metadata. Disabled rows retain the exact historical all-zero encoding.
+  if(extremeCohortData.enabled) {
+    testAssert(extremeCohortData.hasValidAssignment());
+    rowGlobal[68] = (float)extremeCohortData.metadataVersion;
+    rowGlobal[69] = (float)extremeCohortData.groupSize;
+    rowGlobal[70] = (float)extremeCohortData.attemptIdx;
+    rowGlobal[71] = extremeCohortData.focalPla == P_WHITE ? 1.0f : -1.0f;
+    rowGlobal[72] = (float)extremeCohortData.focalFinalMargin;
+    rowGlobal[73] = (float)extremeCohortData.leaveOneOutMaxMargin;
+    rowGlobal[74] = (float)extremeCohortData.credit;
+    rowGlobal[75] = (float)extremeCohortData.rank;
+    rowGlobal[76] = extremeCohortData.selected ? 1.0f : 0.0f;
+    rowGlobal[77] = (float)extremeCohortData.appliedWeight;
+    rowGlobal[78] = (float)(extremeCohortData.cohortId & 0x3FFFFFULL);
+    rowGlobal[79] = (float)((extremeCohortData.cohortId >> 22) & 0x3FFFFFULL);
+  }
+  else {
+    for(int i = 68; i<80; i++)
+      rowGlobal[i] = 0.0f;
+  }
 
   testAssert(80 == GLOBAL_TARGET_NUM_CHANNELS);
 
@@ -1163,7 +1443,17 @@ void TrainingDataWriter::writeGame(const FinishedGameData& data) {
 
     int64_t unreducedNumVisits = data.policyTargetsByTurn[turnAfterStart].unreducedNumVisits;
     const vector<PolicyTargetMove>* policyTarget0 = data.policyTargetsByTurn[turnAfterStart].policyTargets;
-    const vector<PolicyTargetMove>* policyTarget1 = (turnAfterStart + 1 < numMoves) ? data.policyTargetsByTurn[turnAfterStart+1].policyTargets : NULL;
+    if(
+      data.extremeCohort.enabled &&
+      (nextPlayer != data.extremeCohort.focalPla || policyTarget0 == NULL)
+    )
+      targetWeight = 0.0;
+    //The next move is by the opposite color. Extreme cohorts train only the declared
+    //focal policy, so do not leak an opponent policy target through channel C28.
+    const vector<PolicyTargetMove>* policyTarget1 =
+      (!data.extremeCohort.enabled && turnAfterStart + 1 < numMoves) ?
+      data.policyTargetsByTurn[turnAfterStart+1].policyTargets :
+      NULL;
     bool isSidePosition = false;
     float valueTargetWeight = 1.0f;
     float tdValueTargetWeight = 1.0f;
@@ -1234,7 +1524,8 @@ void TrainingDataWriter::writeGame(const FinishedGameData& data) {
             data.mode,
             NULL,
             rand,
-            reanalysisData
+            reanalysisData,
+            data.extremeCohort
           );
           writeAndClearIfFull();
         }
@@ -1258,6 +1549,8 @@ void TrainingDataWriter::writeGame(const FinishedGameData& data) {
     SidePosition* sp = data.sidePositions[i];
 
     double targetWeight = sp->targetWeight;
+    if(data.extremeCohort.enabled && sp->pla != data.extremeCohort.focalPla)
+      targetWeight = 0.0;
     while(targetWeight > 0.0) {
       if(targetWeight >= 1.0 || rand.nextBool(targetWeight)) {
         if(debugOut == NULL || rowCount.load(std::memory_order_relaxed) % debugOnlyWriteEvery == 0) {
@@ -1307,7 +1600,9 @@ void TrainingDataWriter::writeGame(const FinishedGameData& data) {
             data.numExtraBlack,
             data.mode,
             NULL,
-            rand
+            rand,
+            ReanalysisData(),
+            data.extremeCohort
           );
           writeAndClearIfFull();
         }

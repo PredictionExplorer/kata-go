@@ -255,10 +255,20 @@ std::shared_ptr<NNOutput>* Search::maybeAddPolicyNoiseAndTemp(SearchThread& thre
 
 
 double Search::getEffectiveWinLossUtilityFactor() const {
+  if(searchParams.useExpectedMaxScoreUtility)
+    return 0.0;
   return searchParams.useScoreMaximizingUtility ? searchParams.winWeight : searchParams.winLossUtilityFactor;
 }
 
 void Search::updateUtilityBounds() {
+  if(searchParams.useExpectedMaxScoreUtility) {
+    //For either focal color the White-positive conversion remains within the
+    //legally possible White score interval.
+    ScoreValue::getScoreMaximizingUtilityLegalBounds(
+      rootBoard,rootHistory,minUtilityForCurrentSearch,maxUtilityForCurrentSearch
+    );
+    return;
+  }
   if(!searchParams.useScoreMaximizingUtility) {
     double utilityRangeRadius =
       searchParams.winLossUtilityFactor +
@@ -303,6 +313,8 @@ double Search::getUtilityRangeRadius() const {
 }
 
 double Search::getResultUtility(double winLossValue, double noResultValue) const {
+  if(searchParams.useExpectedMaxScoreUtility)
+    return 0.0;
   return (
     winLossValue * getEffectiveWinLossUtilityFactor() +
     noResultValue * searchParams.noResultUtilityForWhite
@@ -320,6 +332,20 @@ double Search::getScoreUtility(double scoreMeanAvg, double scoreMeanSqAvg) const
   double scoreMean = scoreMeanAvg;
   double scoreMeanSq = scoreMeanSqAvg;
   double scoreStdev = ScoreValue::getScoreStdev(scoreMean, scoreMeanSq);
+  if(searchParams.useExpectedMaxScoreUtility) {
+    double lowerScoreBound;
+    double upperScoreBound;
+    ScoreValue::getScoreMaximizingUtilityLegalBounds(rootBoard,rootHistory,lowerScoreBound,upperScoreBound);
+    Player focalPla = searchParams.expectedMaxFocalPla;
+    return ScoreValue::expectedMaxScoreUtility(
+      scoreMean,
+      scoreStdev,
+      focalPla,
+      searchParams.extremeScoreGroupSize,
+      lowerScoreBound,
+      upperScoreBound
+    );
+  }
   if(searchParams.useScoreMaximizingUtility) {
     double lowerScoreBound;
     double upperScoreBound;
@@ -343,6 +369,29 @@ double Search::getScoreUtilityDiff(double scoreMeanAvg, double scoreMeanSqAvg, d
   double scoreMean = scoreMeanAvg;
   double scoreMeanSq = scoreMeanSqAvg;
   double scoreStdev = ScoreValue::getScoreStdev(scoreMean, scoreMeanSq);
+  if(searchParams.useExpectedMaxScoreUtility) {
+    double lowerScoreBound;
+    double upperScoreBound;
+    ScoreValue::getScoreMaximizingUtilityLegalBounds(rootBoard,rootHistory,lowerScoreBound,upperScoreBound);
+    Player focalPla = searchParams.expectedMaxFocalPla;
+    double utilityBefore = ScoreValue::expectedMaxScoreUtility(
+      scoreMean,
+      scoreStdev,
+      focalPla,
+      searchParams.extremeScoreGroupSize,
+      lowerScoreBound,
+      upperScoreBound
+    );
+    double utilityAfter = ScoreValue::expectedMaxScoreUtility(
+      scoreMean + delta,
+      scoreStdev,
+      focalPla,
+      searchParams.extremeScoreGroupSize,
+      lowerScoreBound,
+      upperScoreBound
+    );
+    return utilityAfter-utilityBefore;
+  }
   if(searchParams.useScoreMaximizingUtility) {
     double lowerScoreBound;
     double upperScoreBound;
@@ -376,6 +425,31 @@ double Search::getScoreUtilityDiff(double scoreMeanAvg, double scoreMeanSqAvg, d
 }
 
 double Search::getApproxScoreUtilityDerivative(double scoreMean, double scoreMeanSq) const {
+  if(searchParams.useExpectedMaxScoreUtility) {
+    double lowerScoreBound;
+    double upperScoreBound;
+    ScoreValue::getScoreMaximizingUtilityLegalBounds(rootBoard,rootHistory,lowerScoreBound,upperScoreBound);
+    double scoreStdev = ScoreValue::getScoreStdev(scoreMean,scoreMeanSq);
+    double epsilon = 0.25;
+    Player focalPla = searchParams.expectedMaxFocalPla;
+    double utilityLower = ScoreValue::expectedMaxScoreUtility(
+      scoreMean-epsilon,
+      scoreStdev,
+      focalPla,
+      searchParams.extremeScoreGroupSize,
+      lowerScoreBound,
+      upperScoreBound
+    );
+    double utilityUpper = ScoreValue::expectedMaxScoreUtility(
+      scoreMean+epsilon,
+      scoreStdev,
+      focalPla,
+      searchParams.extremeScoreGroupSize,
+      lowerScoreBound,
+      upperScoreBound
+    );
+    return (utilityUpper-utilityLower) / (2.0*epsilon);
+  }
   if(searchParams.useScoreMaximizingUtility) {
     double lowerScoreBound;
     double upperScoreBound;

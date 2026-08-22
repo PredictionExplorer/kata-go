@@ -1014,6 +1014,311 @@ it with the controller-owned live status after all activation gates pass.
 
 ### 5. Evaluation and controller promotion
 
+#### Expected-max focal self-play
+
+The `extreme_score_selfplay_19x19.cfg` mode optimizes the expected maximum
+terminal score over fixed cohorts and uses no win/loss utility. Every worker
+has one declared focal color and plays an evolving focal model against one
+frozen snapshot from the score-only league. Launch with both `-models-dir` and
+`-opponent-models-dir`; the opponent model is loaded once and never updated
+inside that worker process.
+
+Run matched Black-focal and White-focal workers. Bind the same value to
+`extremeCohortSize` and `extremeScoreGroupSize`, beginning with the curriculum
+`1, 2, 4, 8`. Cohort completion applies exact leave-one-out marginal credit,
+keeps only focal-side policy rows, writes C68–C79 cohort metadata, and drops
+incomplete cohorts. Train these shards only with `train.py
+-extreme-score-only`; mixing ordinary or legacy rows fails closed.
+
+Freeze each generation's worker matrix with
+`risk_score.extreme_score_league`. A balanced seven-GPU plan creates one
+Black-focal and one White-focal worker per GPU and deterministically allocates
+each color across the latest snapshot, recent snapshots, and score-minimizing
+exploiters. Model directories, config, binary, commands, output roots, and
+weights are hash-bound.
+
+The initial expected-max search uses a legally clamped Gaussian approximation
+from the exported score mean/stdev. Production remains capped at `N=8` unless
+held-out calibration justifies exporting and consuming the full score-belief
+histogram.
+
+#### Held-out expected-max evaluator
+
+`risk_score.extreme_score_evaluator` is a standalone, recommendation-only gate
+for the expected maximum of terminal score. It does not call or modify the
+current promotion controller. Its primary estimand is:
+
+```text
+J_N = mean over cohorts c of max(score[c, 1], ..., score[c, N])
+```
+
+Precommit the complete plan before producing any result. Every cohort has the
+same fixed `N`, and each adjacent Black/White cohort pair forms one bootstrap
+cluster. The two color cohorts in a cluster use the same frozen league cell and
+opponent snapshot. Candidate and reference execute the identical cohort,
+trial-index, seed, config, opponent, and focal-color matrix; only the focal
+model identity differs. Seeds may not be regenerated or reused across cohorts.
+
+The plan request must use contract
+`risk-score-extreme-score-plan-request-v1` and provide:
+
+- candidate and reference model IDs and SHA-256s;
+- one frozen config ID and SHA-256;
+- finite legal score bounds;
+- an even, alternating, exactly color-balanced cohort list;
+- each cohort ID, cluster ID, league cell, opponent snapshot ID and model
+  SHA-256, focal color, and exactly `N` seeds; and
+- the rollback recommendation, including the reference/checkpoint identities
+  that must remain available.
+
+Finalize the request as canonical, self-hashed JSON:
+
+```bash
+cd "$REPO/python"
+python3 -m risk_score.extreme_score_evaluator plan \
+  --spec "$RUN_DIR/schedules/extreme-score-request.json" \
+  --policy "$REPO/python/risk_score/extreme_score_policy_v1.json" \
+  --output "$RUN_DIR/schedules/extreme-score-plan.json"
+```
+
+The runner integration must emit one JSONL row per planned trial with the
+runner job identity copied unchanged, plus `score`, `no_result`, and
+`hit_turn_limit`. `score` is the finite terminal score from the focal model's
+perspective. Both terminal flags must be explicit booleans and false. Missing
+or duplicate trials, identity drift, nonnumeric/nonfinite/out-of-range scores,
+no-results, and turn limits are integrity failures.
+
+After both arms finalize, evaluate the immutable files:
+
+```bash
+python3 -m risk_score.extreme_score_evaluator evaluate \
+  --plan "$RUN_DIR/schedules/extreme-score-plan.json" \
+  --candidate-results "$RUN_DIR/phase2/extreme-score/candidate.jsonl" \
+  --reference-results "$RUN_DIR/phase2/extreme-score/reference.jsonl" \
+  --raw-lifetime-records "$RUN_DIR/phase2/extreme-score/lifetime-records.json" \
+  --output "$RUN_DIR/manifest/extreme-score-report.json"
+
+python3 -m risk_score.extreme_score_evaluator status \
+  --plan "$RUN_DIR/schedules/extreme-score-plan.json" \
+  --report "$RUN_DIR/manifest/extreme-score-report.json"
+```
+
+The report computes candidate-minus-reference cohort-max deltas and a
+deterministic one-sided exact paired cluster sign test overall and separately
+for focal Black and focal White. At least eight informative independent
+clusters are required in every slice. `PASS` requires a positive paired point
+estimate and `p <= 0.05` in all three slices. A nonpositive point estimate is
+`FAIL`; positive estimates without sufficient evidence are `INCONCLUSIVE`.
+Integrity failures are `FAIL`. There are no game-outcome metrics or
+playing-strength thresholds in this evaluator.
+
+Raw lifetime records are copied only into `non_gating_diagnostics` with
+`used_for_decision=false`; a record score cannot cause promotion. The plan,
+execution matrix, policy, semantic result rows, source result files, report,
+status, and rollback recommendation are hash-bound. Preserve the plan, both
+result files, report, referenced models/config/opponents, and rollback
+checkpoint together.
+
+#### Executable extreme-score production path
+
+Use only bounded worker plans. `games_per_worker` is mandatory, must be a
+multiple of `group_size`, and may not exceed the frozen policy maximum. The
+initial stage is `N=1` with `selected_training_samples=0`; later plans use the
+selected sample count in the controller's accepted state and must satisfy the
+frozen curriculum. Give every generation and evaluation immutable, unique
+paths:
+
+```bash
+export GENERATION_ID="extreme-g0001"
+export EVALUATION_ID="${GENERATION_ID}-candidate-0001"
+export GENERATION_DIR="$RUN_DIR/generations/$GENERATION_ID"
+export EVALUATION_DIR="$RUN_DIR/evaluations/$EVALUATION_ID"
+mkdir -p "$GENERATION_DIR" "$EVALUATION_DIR"
+```
+
+Before the first league round only, initialize the authoritative accepted
+pointer from the immutable original model and checkpoint:
+
+```bash
+python3 -m risk_score.extreme_score_controller initialize \
+  --model-id "$INITIAL_MODEL_ID" \
+  --model "$INITIAL_MODEL_FILE" \
+  --checkpoint "$INITIAL_CHECKPOINT" \
+  --training-policy \
+    "$REPO/python/risk_score/extreme_score_training_policy_v1.json" \
+  --state-root "$TRAIN_BASE/promotion/extreme-state" \
+  --state "$TRAIN_BASE/promotion/extreme-state/accepted-current.json" \
+  --lock "$TRAIN_BASE/promotion/extreme-state/controller.lock"
+```
+
+Create and freeze the league plan:
+
+```bash
+cd "$REPO/python"
+python3 -m risk_score.extreme_score_league plan \
+  --request "$GENERATION_DIR/league-request.json" \
+  --policy "$REPO/python/risk_score/extreme_score_training_policy_v1.json" \
+  --output "$GENERATION_DIR/league-plan.json"
+```
+
+The request contract is `risk-score-extreme-league-request-v1`. It binds the
+binary, self-play config, the authoritative `accepted-current.json`, the three
+policy-required opponent roles, GPUs `0..6`, 50 threads per worker, current
+`group_size`, `games_per_worker`, and
+`$TRAIN_BASE/selfplay` as `output_root`. Start each plan worker as its own
+bounded systemd oneshot so a terminal disconnect cannot orphan it:
+
+```bash
+python3 - "$GENERATION_DIR/league-plan.json" <<'PY' |
+import json,sys
+for worker in json.load(open(sys.argv[1],encoding="utf-8"))["workers"]:
+    print(worker["worker_id"])
+PY
+while read -r worker_id; do
+  sudo -n systemd-run --collect --unit \
+    "katago-extreme-${GENERATION_ID}-${worker_id}" \
+    --property=Type=oneshot \
+    --property="WorkingDirectory=$REPO/python" \
+    --setenv="PYTHONPATH=$REPO/python" \
+    python3 -m risk_score.extreme_score_league run-worker \
+      --plan "$GENERATION_DIR/league-plan.json" \
+      --worker-id "$worker_id"
+done
+```
+
+Every worker rechecks the policy, launcher, binary, config, and immutable focal
+and opponent snapshots immediately before execution. A successful bounded
+process freezes its output tree and publishes
+`worker-execution-receipt.json`. A failed or interrupted worker is not resumed
+in place; create a new generation/plan so an old partial output can never enter
+training.
+
+Wait for all transient units, then require successful immutable receipts before
+shuffle:
+
+```bash
+python3 -m risk_score.extreme_score_league status \
+  --plan "$GENERATION_DIR/league-plan.json" |
+  jq -e 'all(.workers[]; .state == "SUCCEEDED")'
+```
+
+Run shuffle through the provenance wrapper. The command file is a JSON argv
+array such as
+`["/absolute/repo/python/selfplay/shuffle.sh","/absolute/train-base",
+"/absolute/scratch", "32"]`:
+
+```bash
+python3 -m risk_score.extreme_score_provenance run \
+  --plan "$GENERATION_DIR/league-plan.json" \
+  --shuffle-command-json "$GENERATION_DIR/shuffle-command.json" \
+  --shuffled-root "$TRAIN_BASE/shuffleddata" \
+  --output-id "$GENERATION_ID" \
+  --claim-root "$TRAIN_BASE/promotion/extreme-shuffle-claims" \
+  --lock "$TRAIN_BASE/promotion/extreme-shuffle.lock"
+```
+
+This bypasses the generic shuffle gate deliberately, snapshots exactly the NPZ
+files bound by successful worker receipts, and precommits the generation output
+path before invoking `shuffle.sh`. It then recomputes all source and output
+hashes and writes the sole strict `generation-provenance.json`. A final renamed
+output can be recovered after a wrapper crash; an incomplete `.tmp` requires a
+new generation ID.
+
+Start or restart the trainer on GPU 7 with the objective and provenance
+bindings explicit:
+
+```bash
+export CUDA_VISIBLE_DEVICES=7
+cd "$REPO/python"
+./selfplay/train.sh \
+  "$TRAIN_BASE" "$TRAINING_NAME" "$MODEL_KIND" "$BATCH_SIZE" main \
+  -initial-checkpoint "$INITIAL_CHECKPOINT" \
+  -extreme-score-only \
+  -extreme-score-training-policy \
+    "$REPO/python/risk_score/extreme_score_training_policy_v1.json" \
+  -extreme-score-cohort-size "$COHORT_N" \
+  -allow-objective-mode-migration \
+  -generation-provenance-dir \
+    "$TRAIN_BASE/promotion/provenance/extreme-trainer" \
+  -require-shuffle-provenance \
+  -fixed-val-datadir "$FIXED_VAL_DIR" \
+  -fixed-val-manifest "$FIXED_VAL_MANIFEST" \
+  -lr-scale "$LR_SCALE" \
+  -max-train-bucket-per-new-data "$MAX_BUCKET_PER_DATA" \
+  -max-train-bucket-size "$MAX_BUCKET_SIZE" \
+  -samples-per-epoch 100000 \
+  -swa-period-samples 1000000 \
+  -use-muon -use-bf16 \
+  -epochs-per-export 5 \
+  -export-min-sample-interval 500000 \
+  -no-repeat-files -stop-when-train-bucket-limited
+```
+
+The migration flag resets optimizer state only on the first transition from a
+standard checkpoint. Restarts inherit score-only mode and must reproduce the
+same policy hash and cohort size. A curriculum change additionally requires
+`-allow-extreme-score-curriculum-transition`; decreasing `N`, changing policy,
+or consuming a shuffle from another `N` fails closed.
+Each persistent checkpoint also atomically publishes
+`train/$TRAINING_NAME/extreme-score-progress.json`, binding the score-only
+sample count, policy, cohort size, shuffle provenance, and checkpoint hash.
+
+Run the hardened gated exporter from section 4 with `USEGATING=1`, but do not
+start the stock win-rate gatekeeper. Keep each exported candidate in
+`modelstobetested` while constructing its held-out plan and runner spec; only
+the extreme-score controller below may change the accepted-model pointer.
+
+Finalize the GPU-7 runner spec and execute the complete held-out matrix:
+
+```bash
+python3 -m risk_score.extreme_score_evaluator plan \
+  --spec "$EVALUATION_DIR/extreme-score-plan-request.json" \
+  --policy "$REPO/python/risk_score/extreme_score_policy_v1.json" \
+  --output "$EVALUATION_DIR/extreme-score-plan.json"
+
+python3 -m risk_score.extreme_score_evaluation_run finalize \
+  --request "$EVALUATION_DIR/evaluation-run-request.json" \
+  --output "$EVALUATION_DIR/evaluation-run.json"
+
+python3 -m risk_score.extreme_score_evaluation_run run \
+  --spec "$EVALUATION_DIR/evaluation-run.json" \
+  --plan "$EVALUATION_DIR/extreme-score-plan.json" \
+  --output "$EVALUATION_DIR/extreme-score-report.json" \
+  --attestation-output "$EVALUATION_DIR/execution-attestation.json"
+```
+
+The run request binds the binary, match config, candidate/reference and
+opponent model files, output root, process count, physical GPU UUID, requested
+ordinal, and GPU lease provenance. The runner verifies the UUID before and
+after every subprocess. Transient failures leave attempt artifacts but never a
+final report, so the same invocation can resume safely. The separate execution
+attestation transitively binds the run spec, GPU identity, arm result files,
+and every cell receipt; promotion refuses an unattested report.
+
+Reconcile each final report against the initialized accepted pointer:
+
+```bash
+python3 -m risk_score.extreme_score_controller reconcile \
+  --plan "$EVALUATION_DIR/extreme-score-plan.json" \
+  --report "$EVALUATION_DIR/extreme-score-report.json" \
+  --attestation "$EVALUATION_DIR/execution-attestation.json" \
+  --run-spec "$EVALUATION_DIR/evaluation-run.json" \
+  --training-progress \
+    "$TRAIN_BASE/train/$TRAINING_NAME/extreme-score-progress.json" \
+  --state-root "$TRAIN_BASE/promotion/extreme-state" \
+  --state "$TRAIN_BASE/promotion/extreme-state/accepted-current.json" \
+  --lock "$TRAIN_BASE/promotion/extreme-state/controller.lock"
+```
+
+The controller reloads and recomputes the bound report, replays all runner
+receipts without launching new matches, snapshots accepted model and rollback
+checkpoint bytes by SHA-256, records authenticated curriculum progress, and
+atomically updates the accepted pointer only for `PASS`.
+`FAIL`/`INCONCLUSIVE` leave the reference active. Immutable transaction and
+completion receipts make reconciliation restart-safe. Stop or lease the GPU-7
+trainer before evaluation; never run trainer and evaluator concurrently on
+that GPU.
+
 #### Self-play-only margin mode
 
 For runs whose primary objective is margin-seeking behavior rather than

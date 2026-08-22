@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "contract": "risk-score-held-out-expected-max-policy-v1",
+  "policy_version": "risk-score-held-out-expected-max-v1",
+  "status": "frozen",
+  "objective": {
+    "name": "held_out_expected_max",
+    "score_perspective": "focal_model",
+    "cohort_statistic": "maximum_finite_terminal_score",
+    "estimand": "mean_over_precommitted_fixed_n_cohort_maxima",
+    "comparison": "paired_candidate_minus_reference",
+    "raw_lifetime_records": "diagnostic_only"
+  },
+  "inference": {
+    "method": "exact_paired_cluster_sign_test",
+    "one_sided_alpha": 0.05,
+    "minimum_clusters": 8,
+    "required_slices": [
+      "overall",
+      "B",
+      "W"
+    ],
+    "promotion_rule": "positive_paired_delta_and_one_sided_exact_sign_p_value_at_or_below_alpha_in_every_required_slice"
+  },
+  "integrity": {
+    "require_precommitted_plan": true,
+    "require_complete_fixed_n_cohorts": true,
+    "require_candidate_reference_pairing": true,
+    "require_identical_seed_config_opponent_and_cohort_identities": true,
+    "require_alternating_balanced_focal_colors": true,
+    "require_finite_legal_numeric_scores": true,
+    "reject_no_results": true,
+    "reject_turn_limits": true
+  }
+}

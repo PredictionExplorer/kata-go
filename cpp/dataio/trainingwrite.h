@@ -59,6 +59,59 @@ struct ReanalysisData {
   int numNeuralNetChangesSoFar = 0;
 };
 
+//Opt-in configuration for fixed-size cohorts used to assign credit to the game with the
+//largest final score from the perspective of one declared focal color.
+struct ExtremeCohortSettings {
+  int groupSize;
+  Player focalPla;
+  std::string configIdentity;
+  std::string runIdentity;
+
+  ExtremeCohortSettings();
+  ExtremeCohortSettings(
+    int groupSize,
+    Player focalPla,
+    const std::string& configIdentity,
+    const std::string& runIdentity
+  );
+  ~ExtremeCohortSettings();
+
+  bool isEnabled() const;
+  //Stable per-run starting id, kept within 43 bits so sequential ids remain exactly
+  //representable by the two 22-bit global-target chunks for any practical run.
+  uint64_t cohortIdStart() const;
+};
+
+//Assignment and result metadata for one game in an extreme-score cohort. Assignment fields
+//are populated before the game starts. Result fields remain at backward-compatible zero
+//defaults until every game in the cohort has finished and credit has been computed.
+struct ExtremeCohortData {
+  static constexpr int METADATA_VERSION = 1;
+
+  bool enabled;
+  int metadataVersion;
+  uint64_t cohortId;
+  int attemptIdx;
+  int groupSize;
+  Player focalPla;
+  std::string focalModelIdentity;
+  std::string opponentModelIdentity;
+  std::string configIdentity;
+  std::string runIdentity;
+
+  double focalFinalMargin;
+  double leaveOneOutMaxMargin;
+  double credit;
+  int rank;
+  bool selected;
+  double appliedWeight;
+
+  ExtremeCohortData();
+  ~ExtremeCohortData();
+
+  bool hasValidAssignment() const;
+};
+
 //A side position that was searched off the main line of the game, to give some data about an alternative move.
 struct SidePosition {
   Board board;
@@ -139,6 +192,8 @@ struct FinishedGameData {
 
   double trainingWeight;
 
+  ExtremeCohortData extremeCohort;
+
   std::vector<SidePosition*> sidePositions;
   std::vector<ChangedNeuralNet*> changedNeuralNets;
 
@@ -162,6 +217,14 @@ struct FinishedGameData {
 
   void printDebug(std::ostream& out) const;
 };
+
+//Validate a complete cohort, compute exact leave-one-out credit
+//max(0, S_i - max_{j != i}(S_j)), and apply it to trainingWeight. For N=1, the
+//leave-one-out maximum is defined as zero. No game is mutated if validation fails.
+bool applyExtremeCohortCredits(
+  std::vector<FinishedGameData*>& games,
+  std::string& error
+);
 
 struct TrainingWriteBuffers {
   int inputsVersion;
@@ -261,7 +324,18 @@ struct TrainingWriteBuffers {
   //configured (see PlaySettings::useSearchValueSurprise). Both C65 and C66 are the stats that drove the
   //probability of this position being selected for reanalysis, recorded for statistical purposes.
   //C67: If C64, the number of visits of the original cheap search (the reanalysis search's visits are in C60).
-  //C68-79: Unused, zero-filled.
+  //C68-79: Extreme cohort metadata. All zero for ordinary/old-format rows.
+  //C68: Metadata schema version (1 when enabled)
+  //C69: Fixed cohort group size N
+  //C70: Zero-based attempt index within the cohort
+  //C71: Declared focal color (-1 black, +1 white)
+  //C72: Final score margin from the focal color's perspective
+  //C73: Maximum focal margin among the other N-1 attempts (0 by convention for N=1)
+  //C74: Exact leave-one-out credit max(0,C72-C73)
+  //C75: Competition rank within the cohort (1 is best, ties share rank)
+  //C76: 1 if credit is positive, else 0
+  //C77: Cohort weight applied to FinishedGameData::trainingWeight
+  //C78-79: Cohort id, split into two 22-bit chunks, low chunk first
 
   NumpyBuffer<float> globalTargetsNC;
 
@@ -340,7 +414,8 @@ struct TrainingWriteBuffers {
     int mode,
     SGFMetadata* sgfMeta,
     Rand& rand,
-    const ReanalysisData& reanalysisData = ReanalysisData()
+    const ReanalysisData& reanalysisData = ReanalysisData(),
+    const ExtremeCohortData& extremeCohortData = ExtremeCohortData()
   );
 
   void writeToZipFile(const std::string& fileName);

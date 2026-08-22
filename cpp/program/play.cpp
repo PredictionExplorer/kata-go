@@ -2633,7 +2633,9 @@ FinishedGameData* GameRunner::runGame(
   ExtraBlackAndKomi extraBlackAndKomi;
   OtherGameProperties otherGameProps;
   if(playSettings.forSelfPlay) {
-    testAssert(botSpecB.botIdx == botSpecW.botIdx);
+    // Self-play may use two distinct evaluators for stop-gradient focal
+    // training. Randomize the game/search parameters once and copy the same
+    // result to both bots so only model identity differs between the sides.
     SearchParams params = botSpecB.baseParams;
     gameInit->createGame(board,pla,hist,extraBlackAndKomi,params,initialPosition,playSettings,otherGameProps,startPosSample);
     botSpecB.baseParams = params;
@@ -2656,9 +2658,10 @@ FinishedGameData* GameRunner::runGame(
   }
 
   bool clearBotBeforeSearchThisGame = clearBotBeforeSearch;
-  if(botSpecB.botIdx == botSpecW.botIdx) {
+  if(playSettings.forSelfPlay || botSpecB.botIdx == botSpecW.botIdx) {
     //Avoid interactions between the two bots since they're the same.
     //Also in self-play this makes sure root noise is effective on each new search
+    //and prevents two-model focal self-play from reusing stale opponent trees.
     clearBotBeforeSearchThisGame = true;
   }
 

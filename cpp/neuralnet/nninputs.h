@@ -266,6 +266,33 @@ namespace ScoreValue {
     double lowerBound,
     double upperBound
   );
+
+  //Expected maximum of bestOfN independent draws from the normal distribution implied by
+  //scoreMean and scoreStdev, after every draw is clamped to [lowerBound,upperBound].
+  //This is exact for the implied Gaussian (up to deterministic table interpolation), but is
+  //necessarily an approximation to the network's unexposed full score belief. No lagged
+  //reference CDF is available in the current search parameters, so the leaf-local Gaussian
+  //is used as the order-statistic reference distribution.
+  double expectedMaxScore(
+    double scoreMean,
+    double scoreStdev,
+    int bestOfN,
+    double lowerBound,
+    double upperBound
+  );
+  //Converts expectedMaxScore for focalPla's score margin back to KataGo's internal
+  //White-positive utility convention. White focal utility is an expected maximum;
+  //Black focal utility is the negative expected maximum of the Black margin, equivalently
+  //an expected minimum of White's margin.
+  double expectedMaxScoreUtility(
+    double whiteScoreMean,
+    double whiteScoreStdev,
+    Player focalPla,
+    int bestOfN,
+    double lowerWhiteScoreBound,
+    double upperWhiteScoreBound
+  );
+
   void getScoreMaximizingUtilityTailProbabilities(
     double whiteScoreMean,
     double whiteScoreStdev,

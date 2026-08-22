@@ -46,6 +46,14 @@ from katago.utils.training_data_generator import TrainingDataGenerator
 from katago.train import load_model
 from katago.train import data_processing_pytorch
 from katago.train import trainloop_helpers
+from katago.train.extreme_score_policy import (
+    load_extreme_score_training_policy,
+    validate_extreme_score_curriculum_transition,
+)
+from katago.train.objective_mode import (
+    reset_swa_for_objective_migration,
+    resolve_objective_mode,
+)
 from katago.train.metrics_logging import accumulate_metrics, log_metrics, clear_metric_nonfinite
 from katago.train.training_controls import (
     add_validation_telemetry,
@@ -57,6 +65,10 @@ from risk_score.promotion_feedback import (
     TrainerProvenanceRecorder,
     file_sha256 as provenance_file_sha256,
 )
+from risk_score.extreme_score_provenance import (
+    validate_extreme_shuffle_manifest,
+)
+from risk_score.extreme_score_progress import publish_training_progress
 
 
 # HANDLE COMMAND AND ARGS -------------------------------------------------------------------
@@ -173,6 +185,13 @@ if __name__ == "__main__":
     optional_args.add_argument('-soft-policy-weight-scale', type=float, default=8.0, help='Soft policy loss coeff', required=False)
     optional_args.add_argument('-disable-optimistic-policy', help='Disable optimistic policy', required=False, action='store_true')
     optional_args.add_argument('-meta-kata-only-soft-policy', help='Mask soft policy on non-kata rows using sgfmeta', required=False, action='store_true')
+    objective_mode = optional_args.add_mutually_exclusive_group()
+    objective_mode.add_argument('-extreme-score-only', dest='extreme_score_only', help='Train only on explicit focal-cohort rows and remove all win/loss-derived loss contributions', required=False, action='store_const', const=True, default=None)
+    objective_mode.add_argument('-standard-objective', dest='extreme_score_only', help='Explicitly request the standard objective instead of inheriting checkpoint mode', required=False, action='store_const', const=False)
+    optional_args.add_argument('-allow-objective-mode-migration', help='Permit an explicit objective-mode change and reset optimizer state', required=False, action='store_true')
+    optional_args.add_argument('-extreme-score-training-policy', type=str, help='Absolute path to the frozen extreme-score training policy; inherited from a bound score-only checkpoint when omitted', required=False)
+    optional_args.add_argument('-extreme-score-cohort-size', type=int, help='Required fixed cohort size for every score-only training row', required=False)
+    optional_args.add_argument('-allow-extreme-score-curriculum-transition', help='Permit an explicit cohort-size transition within the same frozen policy', required=False, action='store_true')
     optional_args.add_argument('-value-loss-scale', type=float, default=0.6, help='Additional value loss coeff', required=False)
     optional_args.add_argument('-td-value-loss-scales', type=str, default="0.6,0.6,0.6", help='Additional td value loss coeffs, 3 comma separated values', required=False)
     optional_args.add_argument('-seki-loss-scale', type=float, default=1.0, help='Additional seki loss coeff', required=False)
@@ -446,6 +465,15 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
     soft_policy_weight_scale = args["soft_policy_weight_scale"]
     disable_optimistic_policy = args["disable_optimistic_policy"]
     meta_kata_only_soft_policy = args["meta_kata_only_soft_policy"]
+    requested_extreme_score_only = args["extreme_score_only"]
+    allow_objective_mode_migration = args["allow_objective_mode_migration"]
+    requested_extreme_score_training_policy = args[
+        "extreme_score_training_policy"
+    ]
+    requested_extreme_score_cohort_size = args["extreme_score_cohort_size"]
+    allow_extreme_score_curriculum_transition = args[
+        "allow_extreme_score_curriculum_transition"
+    ]
     value_loss_scale = args["value_loss_scale"]
     td_value_loss_scales = [float(x) for x in args["td_value_loss_scales"].split(",")]
     seki_loss_scale = args["seki_loss_scale"]
@@ -718,6 +746,13 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
                         "path": str(receipt_path),
                         "sha256": provenance_file_sha256(receipt_path),
                     }
+                if extreme_score_only:
+                    publish_training_progress(
+                        output_path=Path(traindir)
+                        / "extreme-score-progress.json",
+                        checkpoint_path=Path(get_checkpoint_path()),
+                        train_state=train_state,
+                    )
 
     def get_is_muon_suitable(group_name: str):
         if group_name == "normal" or group_name == "normal_attn" or group_name == "normal_gab" or group_name == "gab_mlp" or group_name == "tab_module":
@@ -1063,6 +1098,131 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
         loaded = load()
     (model_config, ddp_model, raw_model, swa_model, optimizer, metrics_obj, running_metrics, train_state, last_val_metrics) = loaded
 
+    previous_extreme_score_only = train_state.get("extreme_score_only")
+    (extreme_score_only, objective_mode_changed) = resolve_objective_mode(
+        previous_extreme_score_only,
+        requested_extreme_score_only,
+        allow_objective_mode_migration,
+    )
+    if objective_mode_changed:
+        logging.info(
+            "Training objective mode changed; resetting optimizer, running, "
+            "and validation state"
+        )
+        optimizer.state.clear()
+        swa_model = reset_swa_for_objective_migration(
+            raw_model, swa_model, swa_scale
+        )
+        metrics_obj.load_state_dict(
+            {
+                "moving_unowned_proportion_sum": 0.0,
+                "moving_unowned_proportion_weight": 0.0,
+            }
+        )
+        running_metrics = {}
+        last_val_metrics = {}
+        train_state["swa_sample_accum"] = 0.0
+        train_state["extreme_score_selected_samples"] = 0
+        train_state["objective_mode_migrations"] = (
+            int(train_state.get("objective_mode_migrations", 0)) + 1
+        )
+    train_state["extreme_score_only"] = extreme_score_only
+
+    previous_extreme_policy = train_state.get("extreme_score_training_policy")
+    if extreme_score_only:
+        if previous_extreme_policy is not None and not isinstance(
+            previous_extreme_policy, dict
+        ):
+            raise ValueError(
+                "checkpoint extreme-score training policy binding is malformed"
+            )
+        policy_path_value = requested_extreme_score_training_policy
+        if policy_path_value is None and previous_extreme_policy is not None:
+            policy_path_value = previous_extreme_policy.get("path")
+        cohort_size = requested_extreme_score_cohort_size
+        if cohort_size is None and previous_extreme_policy is not None:
+            cohort_size = previous_extreme_policy.get("cohort_size")
+        if policy_path_value is None or cohort_size is None:
+            raise ValueError(
+                "score-only training requires -extreme-score-training-policy "
+                "and -extreme-score-cohort-size when the checkpoint has no "
+                "frozen policy binding"
+            )
+        extreme_score_training_policy = load_extreme_score_training_policy(
+            Path(policy_path_value), cohort_size
+        )
+        if previous_extreme_policy is None:
+            # A legacy score-only checkpoint has optimizer moments trained
+            # without policy provenance. Require an explicit migration and
+            # reset it before adopting a frozen policy.
+            if previous_extreme_score_only is True and not objective_mode_changed:
+                if not allow_objective_mode_migration:
+                    raise ValueError(
+                        "unbound score-only checkpoint requires "
+                        "-allow-objective-mode-migration before attaching a "
+                        "frozen training policy"
+                    )
+                optimizer.state.clear()
+                swa_model = reset_swa_for_objective_migration(
+                    raw_model, swa_model, swa_scale
+                )
+                running_metrics = {}
+                last_val_metrics = {}
+                train_state["swa_sample_accum"] = 0.0
+                train_state["extreme_score_selected_samples"] = 0
+                train_state["objective_mode_migrations"] = (
+                    int(train_state.get("objective_mode_migrations", 0)) + 1
+                )
+        else:
+            for field in ("file_sha256", "contract", "policy_version"):
+                if (
+                    previous_extreme_policy.get(field)
+                    != extreme_score_training_policy[field]
+                ):
+                    raise ValueError(
+                        "extreme-score training policy differs from checkpoint "
+                        f"binding in {field}"
+                    )
+            previous_cohort_size = previous_extreme_policy.get("cohort_size")
+            if validate_extreme_score_curriculum_transition(
+                previous_cohort_size=previous_cohort_size,
+                requested_policy=extreme_score_training_policy,
+                selected_training_samples=int(
+                    train_state.get("extreme_score_selected_samples", 0)
+                ),
+                allow_transition=allow_extreme_score_curriculum_transition,
+            ):
+                train_state["extreme_score_curriculum_transitions"] = (
+                    int(
+                        train_state.get(
+                            "extreme_score_curriculum_transitions", 0
+                        )
+                    )
+                    + 1
+                )
+        train_state[
+            "extreme_score_training_policy"
+        ] = extreme_score_training_policy
+        extreme_score_cohort_size = cohort_size
+        if "extreme_score_selected_samples" not in train_state:
+            train_state["extreme_score_selected_samples"] = 0
+        if trainer_provenance is None or not require_shuffle_provenance:
+            raise ValueError(
+                "score-only training requires strict shuffle provenance via "
+                "-generation-provenance-dir and -require-shuffle-provenance"
+            )
+    else:
+        if (
+            requested_extreme_score_training_policy is not None
+            or requested_extreme_score_cohort_size is not None
+            or allow_extreme_score_curriculum_transition
+        ):
+            raise ValueError(
+                "extreme-score policy/curriculum flags require score-only mode"
+            )
+        extreme_score_cohort_size = None
+        train_state.pop("extreme_score_training_policy", None)
+
 
     if "global_step_samples" not in train_state:
         train_state["global_step_samples"] = 0
@@ -1107,6 +1267,12 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
     logging.info(f"soft_policy_weight_scale {soft_policy_weight_scale}")
     logging.info(f"disable_optimistic_policy {disable_optimistic_policy}")
     logging.info(f"meta_kata_only_soft_policy {meta_kata_only_soft_policy}")
+    logging.info(f"extreme_score_only {extreme_score_only}")
+    if extreme_score_only:
+        logging.info(
+            "extreme_score_training_policy "
+            f"{train_state['extreme_score_training_policy']}"
+        )
     logging.info(f"value_loss_scale {value_loss_scale}")
     logging.info(f"td_value_loss_scales {td_value_loss_scales}")
     logging.info(f"seki_loss_scale {seki_loss_scale}")
@@ -1342,7 +1508,19 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
                     )
                     if current_provenance_binding is not None:
                         manifest = current_provenance_binding["manifest"]
-                        train_state["generation_provenance_binding"] = {
+                        extreme_shuffle_binding = None
+                        if extreme_score_only:
+                            extreme_shuffle_binding = (
+                                validate_extreme_shuffle_manifest(
+                                    current_provenance_binding["manifest_path"],
+                                    expected_policy=extreme_score_training_policy,
+                                    expected_cohort_size=extreme_score_cohort_size,
+                                )
+                            )
+                            train_state[
+                                "extreme_score_shuffle_provenance"
+                            ] = extreme_shuffle_binding
+                        generation_provenance_binding = {
                             "shuffle_path": curdatadir,
                             "shuffle_manifest_path": str(
                                 current_provenance_binding["manifest_path"]
@@ -1354,9 +1532,19 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
                             "generation_ids": manifest["generation_ids"],
                             "candidate_hashes": manifest["candidate_hashes"],
                         }
+                        if extreme_shuffle_binding is not None:
+                            generation_provenance_binding[
+                                "extreme_score"
+                            ] = extreme_shuffle_binding
+                        train_state[
+                            "generation_provenance_binding"
+                        ] = generation_provenance_binding
                     else:
                         train_state.pop(
                             "generation_provenance_binding", None
+                        )
+                        train_state.pop(
+                            "extreme_score_shuffle_provenance", None
                         )
                 last_curdatadir = curdatadir
 
@@ -1644,6 +1832,8 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
                 include_meta=raw_model.get_has_metadata_encoder(),
                 model_config=model_config,
                 prefetch_depth=data_prefetch_depth,
+                extreme_score_only=extreme_score_only,
+                extreme_score_cohort_size=extreme_score_cohort_size,
             ):
                 optimizer.zero_grad(set_to_none=True)
                 extra_outputs = None
@@ -1687,6 +1877,7 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
                     main_loss_scale=main_loss_scale,
                     intermediate_loss_scale=intermediate_loss_scale,
                     include_model_norms=not model_norms_only_at_print,
+                    extreme_score_only=extreme_score_only,
                 )
                 if model_norms_only_at_print and is_print_batch:
                     metrics.update(metrics_obj.get_model_norm_metrics(raw_model))
@@ -1769,6 +1960,10 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
                 batch_count_this_epoch += 1
                 train_state["train_steps_since_last_reload"] += batch_size * world_size
                 train_state["global_step_samples"] += batch_size * world_size
+                if extreme_score_only:
+                    train_state["extreme_score_selected_samples"] += (
+                        batch_size * world_size
+                    )
 
                 metrics = trainloop_helpers.detensorify_metrics(metrics)
                 gnorm_watcher.observe(metrics, gnorm_cap=gnorm_cap)
@@ -1920,7 +2115,9 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
                         device=device,
                         randomize_symmetries=True,
                         include_meta=raw_model.get_has_metadata_encoder(),
-                        model_config=model_config
+                        model_config=model_config,
+                        extreme_score_only=extreme_score_only,
+                        extreme_score_cohort_size=extreme_score_cohort_size,
                     ):
                         if use_amp:
                             with autocast("cuda", dtype=amp_dtype):
@@ -1953,6 +2150,7 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
                             variance_time_loss_scale=variance_time_loss_scale,
                             main_loss_scale=main_loss_scale,
                             intermediate_loss_scale=intermediate_loss_scale,
+                            extreme_score_only=extreme_score_only,
                         )
                         metrics = trainloop_helpers.detensorify_metrics(metrics)
                         last_val_batch_metrics = metrics

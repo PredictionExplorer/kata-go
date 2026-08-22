@@ -460,6 +460,25 @@ vector<SearchParams> Setup::loadParams(
     if(cfg.contains("useScoreMaximizingUtility"+idxStr)) params.useScoreMaximizingUtility = cfg.getBool("useScoreMaximizingUtility"+idxStr);
     else if(cfg.contains("useScoreMaximizingUtility"))   params.useScoreMaximizingUtility = cfg.getBool("useScoreMaximizingUtility");
     else                                                  params.useScoreMaximizingUtility = false;
+    if(cfg.contains("useExpectedMaxScoreUtility"+idxStr)) params.useExpectedMaxScoreUtility = cfg.getBool("useExpectedMaxScoreUtility"+idxStr);
+    else if(cfg.contains("useExpectedMaxScoreUtility"))   params.useExpectedMaxScoreUtility = cfg.getBool("useExpectedMaxScoreUtility");
+    else                                                   params.useExpectedMaxScoreUtility = false;
+    if(cfg.contains("extremeScoreGroupSize"+idxStr)) params.extremeScoreGroupSize = cfg.getInt("extremeScoreGroupSize"+idxStr, 1, 64);
+    else if(cfg.contains("extremeScoreGroupSize"))   params.extremeScoreGroupSize = cfg.getInt("extremeScoreGroupSize",        1, 64);
+    else                                             params.extremeScoreGroupSize = 1;
+    string expectedMaxFocalColor;
+    if(cfg.contains("expectedMaxFocalColor"+idxStr)) expectedMaxFocalColor = cfg.getString("expectedMaxFocalColor"+idxStr);
+    else if(cfg.contains("expectedMaxFocalColor"))   expectedMaxFocalColor = cfg.getString("expectedMaxFocalColor");
+    if(!expectedMaxFocalColor.empty()) {
+      if(!PlayerIO::tryParsePlayer(expectedMaxFocalColor,params.expectedMaxFocalPla))
+        throw ConfigParsingError("expectedMaxFocalColor must be black or white");
+    }
+    else
+      params.expectedMaxFocalPla = C_EMPTY;
+    if(params.useScoreMaximizingUtility && params.useExpectedMaxScoreUtility)
+      throw ConfigParsingError("useScoreMaximizingUtility and useExpectedMaxScoreUtility cannot both be enabled");
+    if(params.useExpectedMaxScoreUtility && params.expectedMaxFocalPla == C_EMPTY)
+      throw ConfigParsingError("expectedMaxFocalColor is required when useExpectedMaxScoreUtility is enabled");
     if(cfg.contains("scorePower"+idxStr)) params.scorePower = cfg.getDouble("scorePower"+idxStr, 1.0, 2.0);
     else if(cfg.contains("scorePower"))   params.scorePower = cfg.getDouble("scorePower",        1.0, 2.0);
     else                                  params.scorePower = 1.5;
@@ -831,6 +850,12 @@ vector<SearchParams> Setup::loadParams(
     //On distributed, tolerate reading mutexPoolSize since older version configs use it.
     if(setupFor == SETUP_FOR_DISTRIBUTED)
       cfg.markAllKeysUsedWithPrefix("mutexPoolSize");
+
+    // Eval-cache first-explore records do not retain score second moments.
+    // Expected-max utility depends on variance, so accepting this combination
+    // would silently collapse best-of-N utility to the N=1 value.
+    if(params.useExpectedMaxScoreUtility && params.useEvalCache)
+      throw ConfigParsingError("useEvalCache must be false when useExpectedMaxScoreUtility is enabled");
 
     paramss.push_back(params);
   }

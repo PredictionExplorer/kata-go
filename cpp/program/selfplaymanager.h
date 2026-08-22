@@ -2,6 +2,9 @@
 #define PROGRAM_SELFPLAYMANAGER_H_
 
 #include <atomic>
+#include <condition_variable>
+#include <map>
+#include <tuple>
 
 #include "../core/threadsafequeue.h"
 #include "../core/timer.h"
@@ -9,13 +12,68 @@
 #include "../dataio/trainingwrite.h"
 #include "../neuralnet/nneval.h"
 
+//Single-threaded completion buffer used by a model's data-write loop. It owns every
+//game passed to addGame until either a complete validated cohort is returned or the
+//game is discarded. The identity tuple is part of the key, so generations, colors,
+//runs, and configs can never complete one another's cohorts.
+class ExtremeCohortGameBuffer {
+ public:
+  enum AddResult {
+    BUFFERED,
+    COHORT_READY,
+    COHORT_REJECTED
+  };
+
+  ExtremeCohortGameBuffer();
+  ~ExtremeCohortGameBuffer();
+
+  ExtremeCohortGameBuffer(const ExtremeCohortGameBuffer&) = delete;
+  ExtremeCohortGameBuffer& operator=(const ExtremeCohortGameBuffer&) = delete;
+
+  AddResult addGame(
+    FinishedGameData* gameData,
+    std::vector<FinishedGameData*>& completedGames,
+    std::string& error
+  );
+
+  //Delete all incomplete cohorts. Returns the number of games discarded.
+  size_t discardIncomplete();
+  size_t numPendingGames() const;
+  size_t numPendingCohorts() const;
+
+ private:
+  struct CohortKey {
+    uint64_t cohortId;
+    int groupSize;
+    Player focalPla;
+    std::string focalModelIdentity;
+    std::string opponentModelIdentity;
+    std::string configIdentity;
+    std::string runIdentity;
+
+    bool operator<(const CohortKey& other) const;
+  };
+
+  struct CohortBucket {
+    std::vector<FinishedGameData*> gamesByAttempt;
+    bool failed;
+    std::string failureReason;
+
+    CohortBucket();
+    explicit CohortBucket(int groupSize);
+  };
+
+  std::map<CohortKey,CohortBucket> pending;
+};
+
 class SelfplayManager {
  public:
   SelfplayManager(
     int maxDataQueueSize,
     Logger* logger,
     int64_t logGamesEvery,
-    bool autoCleanupAllButLatestIfUnused
+    bool autoCleanupAllButLatestIfUnused,
+    const ExtremeCohortSettings& extremeCohortSettings = ExtremeCohortSettings()
   );
   ~SelfplayManager();
 
@@ -68,6 +126,19 @@ class SelfplayManager {
 
   //Increment a counter and maybe log some stats
   void countOneGameStarted(NNEvaluator* nnEval);
+  //The returned assignment is fixed before launch. In ordinary mode it is disabled.
+  ExtremeCohortData countOneGameStartedAndGetCohort(
+    NNEvaluator* nnEval,
+    const std::string& opponentModelIdentity
+  );
+
+  // Extreme mode reserves bounded unwritten-data capacity before a game
+  // starts, so in-flight, queued, and cohort-buffered games share one limit.
+  bool waitForDataToWriteCapacity(
+    NNEvaluator* nnEval,
+    const std::function<bool()>& shouldStop
+  );
+  void cancelDataToWriteReservation(NNEvaluator* nnEval);
 
   //SelfplayManager takes responsibility for deleting the gameData once written.
   //Use these only if loadModelAndStartDataWriting was used to start the model.
@@ -94,7 +165,16 @@ class SelfplayManager {
     bool hasDataWriteLoop;
 
     ThreadSafeQueue<FinishedGameData*> finishedGameQueue;
+    const size_t maxUnwrittenGames;
+    std::mutex unwrittenGamesMutex;
+    std::condition_variable unwrittenGamesCapacity;
+    size_t numUnwrittenGames;
+    bool dataQueueReadOnly;
     int acquireCount;
+
+    bool hasOpenExtremeCohort;
+    uint64_t openExtremeCohortId;
+    int nextExtremeAttemptIdx;
 
     TrainingDataWriter* tdataWriter;
     std::ofstream* sgfOut;
@@ -106,6 +186,11 @@ class SelfplayManager {
       bool hasDataWriteLoop
     );
     ~ModelData();
+
+    bool waitForUnwrittenGameCapacity(const std::function<bool()>& shouldStop);
+    void releaseUnwrittenGames(size_t count);
+    void setDataQueueReadOnly();
+    size_t getNumUnwrittenGames();
   };
 
  private:
@@ -113,6 +198,7 @@ class SelfplayManager {
   Logger* logger;
   const int64_t logGamesEvery;
   const bool autoCleanupAllButLatestIfUnused;
+  const ExtremeCohortSettings extremeCohortSettings;
 
   const ClockTimer timer;
 
@@ -122,10 +208,16 @@ class SelfplayManager {
   std::condition_variable dataWriteLoopsAreDone;
 
   uint64_t totalNumRowsProcessed;
+  uint64_t nextExtremeCohortId;
 
   NNEvaluator* acquireModelAlreadyLocked(SelfplayManager::ModelData* foundData);
   void releaseAlreadyLocked(SelfplayManager::ModelData* foundData);
   void maybeAutoCleanupAlreadyLocked();
+  ExtremeCohortData countOneGameStartedInternal(
+    NNEvaluator* nnEval,
+    const std::string& opponentModelIdentity,
+    bool assignExtremeCohort
+  );
   void runDataWriteLoopImpl(ModelData* modelData);
 
  public:

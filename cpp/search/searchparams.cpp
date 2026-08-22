@@ -15,6 +15,9 @@ SearchParams::SearchParams()
    staticScoreUtilityFactor(0.3),
    dynamicScoreUtilityFactor(0.0),
    useScoreMaximizingUtility(false),
+   useExpectedMaxScoreUtility(false),
+   extremeScoreGroupSize(1),
+   expectedMaxFocalPla(C_EMPTY),
    scorePower(1.5),
    scoreScale(20.0),
    winWeight(2.0),
@@ -133,6 +136,9 @@ bool SearchParams::operator==(const SearchParams& other) const {
     staticScoreUtilityFactor == other.staticScoreUtilityFactor &&
     dynamicScoreUtilityFactor == other.dynamicScoreUtilityFactor &&
     useScoreMaximizingUtility == other.useScoreMaximizingUtility &&
+    useExpectedMaxScoreUtility == other.useExpectedMaxScoreUtility &&
+    extremeScoreGroupSize == other.extremeScoreGroupSize &&
+    expectedMaxFocalPla == other.expectedMaxFocalPla &&
     scorePower == other.scorePower &&
     scoreScale == other.scoreScale &&
     winWeight == other.winWeight &&
@@ -391,6 +397,10 @@ json SearchParams::changeableParametersToJson() const {
   ret["staticScoreUtilityFactor"] = staticScoreUtilityFactor;
   ret["dynamicScoreUtilityFactor"] = dynamicScoreUtilityFactor;
   ret["useScoreMaximizingUtility"] = useScoreMaximizingUtility;
+  ret["useExpectedMaxScoreUtility"] = useExpectedMaxScoreUtility;
+  ret["extremeScoreGroupSize"] = extremeScoreGroupSize;
+  ret["expectedMaxFocalColor"] =
+    expectedMaxFocalPla == C_EMPTY ? "" : PlayerIO::playerToStringShort(expectedMaxFocalPla);
   ret["scorePower"] = scorePower;
   ret["scoreScale"] = scoreScale;
   ret["winWeight"] = winWeight;
@@ -574,6 +584,9 @@ void SearchParams::printParams(std::ostream& out) const {
   PRINTPARAM(staticScoreUtilityFactor);
   PRINTPARAM(dynamicScoreUtilityFactor);
   PRINTPARAM(useScoreMaximizingUtility);
+  PRINTPARAM(useExpectedMaxScoreUtility);
+  PRINTPARAM(extremeScoreGroupSize);
+  out << "expectedMaxFocalPla: " << (int)expectedMaxFocalPla << std::endl;
   PRINTPARAM(scorePower);
   PRINTPARAM(scoreScale);
   PRINTPARAM(winWeight);

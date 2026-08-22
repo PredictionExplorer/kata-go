@@ -66,17 +66,29 @@ SearchThread::~SearchThread() {
 
 static const double VALUE_WEIGHT_DEGREES_OF_FREEDOM = 3.0;
 
-static void validateScoreMaximizingUtility(
+static void validateAlternativeScoreUtility(
   const SearchParams& searchParams,
   const BoardHistory& history
 ) {
-  if(!searchParams.useScoreMaximizingUtility)
+  if(!searchParams.useScoreMaximizingUtility && !searchParams.useExpectedMaxScoreUtility)
     return;
+  if(searchParams.useScoreMaximizingUtility && searchParams.useExpectedMaxScoreUtility)
+    throw StringError("useScoreMaximizingUtility and useExpectedMaxScoreUtility cannot both be enabled");
   if(history.rules.scoringRule != Rules::SCORING_AREA)
-    throw StringError("useScoreMaximizingUtility currently supports area scoring only");
-  if(!std::isfinite(searchParams.winWeight) || searchParams.winWeight < 0.0)
-    throw StringError("winWeight must be finite and nonnegative");
-  (void)ScoreValue::scoreMaximizingUtility(0.0,searchParams.scorePower,searchParams.scoreScale);
+    throw StringError("Alternative score utility modes currently support area scoring only");
+  if(searchParams.useExpectedMaxScoreUtility) {
+    if(searchParams.extremeScoreGroupSize < 1 || searchParams.extremeScoreGroupSize > 64)
+      throw StringError("extremeScoreGroupSize must be between 1 and 64");
+    if(searchParams.expectedMaxFocalPla != P_BLACK && searchParams.expectedMaxFocalPla != P_WHITE)
+      throw StringError("expectedMaxFocalColor must identify Black or White");
+    if(searchParams.useEvalCache)
+      throw StringError("useEvalCache is unsupported with expected-max score utility");
+  }
+  else {
+    if(!std::isfinite(searchParams.winWeight) || searchParams.winWeight < 0.0)
+      throw StringError("winWeight must be finite and nonnegative");
+    (void)ScoreValue::scoreMaximizingUtility(0.0,searchParams.scorePower,searchParams.scoreScale);
+  }
 }
 
 static bool utilityAffectingParamsDiffer(
@@ -88,6 +100,9 @@ static bool utilityAffectingParamsDiffer(
     oldParams.staticScoreUtilityFactor != newParams.staticScoreUtilityFactor ||
     oldParams.dynamicScoreUtilityFactor != newParams.dynamicScoreUtilityFactor ||
     oldParams.useScoreMaximizingUtility != newParams.useScoreMaximizingUtility ||
+    oldParams.useExpectedMaxScoreUtility != newParams.useExpectedMaxScoreUtility ||
+    oldParams.extremeScoreGroupSize != newParams.extremeScoreGroupSize ||
+    oldParams.expectedMaxFocalPla != newParams.expectedMaxFocalPla ||
     oldParams.scorePower != newParams.scorePower ||
     oldParams.scoreScale != newParams.scoreScale ||
     oldParams.winWeight != newParams.winWeight ||
@@ -177,7 +192,7 @@ Search::Search(const SearchParams& params, NNEvaluator* nnEval, NNEvaluator* hum
   mutexPool = new MutexPool(nodeTable->mutexPool->getNumMutexes());
 
   rootHistory.clear(rootBoard,rootPla,Rules(),0);
-  validateScoreMaximizingUtility(searchParams,rootHistory);
+  validateAlternativeScoreUtility(searchParams,rootHistory);
   updateUtilityBounds();
   rootKoHashTable->recompute(rootHistory);
 }
@@ -211,7 +226,7 @@ Player Search::getPlayoutDoublingAdvantagePla() const {
 }
 
 void Search::setPosition(Player pla, const Board& board, const BoardHistory& history) {
-  validateScoreMaximizingUtility(searchParams,history);
+  validateAlternativeScoreUtility(searchParams,history);
   clearSearch();
   rootPla = pla;
   plaThatSearchIsFor = C_EMPTY;
@@ -292,14 +307,14 @@ void Search::setRootSymmetryPruningOnly(const std::vector<int>& v) {
 
 
 void Search::setParams(const SearchParams& params) {
-  validateScoreMaximizingUtility(params,rootHistory);
+  validateAlternativeScoreUtility(params,rootHistory);
   clearSearch();
   searchParams = params;
   updateUtilityBounds();
 }
 
 void Search::setParamsNoClearing(const SearchParams& params) {
-  validateScoreMaximizingUtility(params,rootHistory);
+  validateAlternativeScoreUtility(params,rootHistory);
   if(utilityAffectingParamsDiffer(searchParams,params))
     utilityStatsDirty = true;
   searchParams = params;
@@ -683,8 +698,13 @@ void Search::beginSearch(bool pondering) {
     throw StringError("Search got from NNEval nnXLen = " + Global::intToString(nnXLen) +
                       " nnYLen = " + Global::intToString(nnYLen) + " but was asked to search board with larger x or y size");
 
+  if(!pondering)
+    plaThatSearchIsFor = rootPla;
+  //If we begin the game with a ponder, then assume that "we" are the opposing side until we see otherwise.
+  if(plaThatSearchIsFor == C_EMPTY)
+    plaThatSearchIsFor = getOpp(rootPla);
   rootBoard.checkConsistency();
-  validateScoreMaximizingUtility(searchParams,rootHistory);
+  validateAlternativeScoreUtility(searchParams,rootHistory);
   updateUtilityBounds();
   if(searchParams.useScoreMaximizingUtility) {
     double lowerScoreBound;
@@ -699,18 +719,25 @@ void Search::beginSearch(bool pondering) {
       upperScoreBound
     );
   }
+  else if(searchParams.useExpectedMaxScoreUtility) {
+    double lowerScoreBound;
+    double upperScoreBound;
+    ScoreValue::getScoreMaximizingUtilityLegalBounds(rootBoard,rootHistory,lowerScoreBound,upperScoreBound);
+    (void)ScoreValue::expectedMaxScoreUtility(
+      0.5 * (lowerScoreBound+upperScoreBound),
+      std::max(1.0,rootBoard.sqrtBoardArea()),
+      searchParams.expectedMaxFocalPla,
+      searchParams.extremeScoreGroupSize,
+      lowerScoreBound,
+      upperScoreBound
+    );
+  }
 
   numSearchesBegun++;
 
   //Avoid any issues in principle from rolling over
   if(searchNodeAge > 0x3FFFFFFF)
     clearSearch();
-
-  if(!pondering)
-    plaThatSearchIsFor = rootPla;
-  //If we begin the game with a ponder, then assume that "we" are the opposing side until we see otherwise.
-  if(plaThatSearchIsFor == C_EMPTY)
-    plaThatSearchIsFor = getOpp(rootPla);
 
   if(plaThatSearchIsForLastSearch != plaThatSearchIsFor) {
     //In the case we are doing playoutDoublingAdvantage without a specific player (so, doing the root player)
@@ -787,12 +814,32 @@ void Search::beginSearch(bool pondering) {
   else
     rootGraphHash = Hash128();
 
+  Hash128 oldEvalCacheParamsHash = evalCacheParamsHash;
   //Precompute the params hash once per search (params are constant during a search) so it can be cheaply
   //folded into every eval cache lookup, keeping cached search results from leaking across different params.
-  if(searchParams.useEvalCache && searchParams.useGraphSearch)
+  if(searchParams.useEvalCache && searchParams.useGraphSearch) {
     evalCacheParamsHash = searchParams.getHash();
+  }
   else
     evalCacheParamsHash = Hash128();
+
+  if(
+    rootNode != NULL &&
+    searchParams.useEvalCache &&
+    searchParams.useGraphSearch &&
+    evalCache != nullptr &&
+    mirroringPla == C_EMPTY &&
+    oldEvalCacheParamsHash != evalCacheParamsHash
+  ) {
+    //setParamsNoClearing preserves the tree, so refresh existing node pointers
+    //when any cache-keyed objective parameter changes.
+    std::function<void(SearchNode*,int)> refreshEvalCacheEntry =
+      [&](SearchNode* node, int threadIdx) {
+        (void)threadIdx;
+        node->evalCacheEntry = evalCache->find(getEvalCacheKey(node->graphHash));
+      };
+    applyRecursivelyAnyOrderMulithreaded({rootNode},&refreshEvalCacheEntry);
+  }
 
   if(rootNode == NULL) {
     //Avoid storing the root node in the nodeTable, guarantee that it never is part of a cycle, allocate it directly.
@@ -879,7 +926,11 @@ void Search::beginSearch(bool pondering) {
     //And also to clear out lastResponseBiasDeltaSum and lastResponseBiasWeight
     if(
       utilityStatsDirty ||
-      (!searchParams.useScoreMaximizingUtility && searchParams.dynamicScoreUtilityFactor != 0) ||
+      (
+        !searchParams.useScoreMaximizingUtility &&
+        !searchParams.useExpectedMaxScoreUtility &&
+        searchParams.dynamicScoreUtilityFactor != 0
+      ) ||
       searchParams.subtreeValueBiasFactor != 0 ||
       patternBonusTable != NULL
     ) {
@@ -1259,8 +1310,19 @@ bool Search::playoutDescend(
     else {
       double winLossValue = 2.0 * ScoreValue::whiteWinsOfWinner(thread.history.winner, searchParams.drawEquivalentWinsForWhite) - 1;
       double noResultValue = 0.0;
-      double scoreMean = ScoreValue::whiteScoreDrawAdjust(thread.history.finalWhiteMinusBlackScore,searchParams.drawEquivalentWinsForWhite,thread.history);
-      double scoreMeanSq = ScoreValue::whiteScoreMeanSqOfScoreGridded(thread.history.finalWhiteMinusBlackScore,searchParams.drawEquivalentWinsForWhite);
+      double scoreMean;
+      double scoreMeanSq;
+      if(searchParams.useExpectedMaxScoreUtility) {
+        // A terminal score is known exactly. Draw-grid smoothing and its
+        // synthetic variance are useful for ordinary utility, but would add a
+        // fictitious order-statistic bonus after the game has already ended.
+        scoreMean = thread.history.finalWhiteMinusBlackScore;
+        scoreMeanSq = scoreMean * scoreMean;
+      }
+      else {
+        scoreMean = ScoreValue::whiteScoreDrawAdjust(thread.history.finalWhiteMinusBlackScore,searchParams.drawEquivalentWinsForWhite,thread.history);
+        scoreMeanSq = ScoreValue::whiteScoreMeanSqOfScoreGridded(thread.history.finalWhiteMinusBlackScore,searchParams.drawEquivalentWinsForWhite);
+      }
       double lead = scoreMean;
       double weight = (searchParams.useUncertainty && nnEvaluator->supportsShorttermError()) ? searchParams.uncertaintyMaxWeight : 1.0;
       addLeafValue(node, winLossValue, noResultValue, scoreMean, scoreMeanSq, lead, weight, true, false);

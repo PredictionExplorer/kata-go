@@ -13,6 +13,9 @@ struct SearchParams {
   double staticScoreUtilityFactor; //Scaling for a [-1,1] "scoreValue" for having more/fewer points, centered at 0.
   double dynamicScoreUtilityFactor; //Scaling for a [-1,1] "scoreValue" for having more/fewer points, centered at recent estimated expected score.
   bool useScoreMaximizingUtility; //Use a risk-seeking score utility instead of static and dynamic score utility.
+  bool useExpectedMaxScoreUtility; //Use the focal player's expected best score among extremeScoreGroupSize Gaussian draws.
+  int extremeScoreGroupSize; //Number of draws (bestOfN) for expected-max score utility, from 1 through 64.
+  Player expectedMaxFocalPla; //Fixed focal player whose best-of-N score is maximized. The opponent minimizes this utility.
   double scorePower; //Power for risk-seeking score utility.
   double scoreScale; //Point scale for risk-seeking score utility.
   double winWeight; //Weight of win-loss utility when using risk-seeking score utility.

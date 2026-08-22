@@ -5,6 +5,7 @@
 #include "../neuralnet/nneval.h"
 #include "../program/playutils.h"
 #include "../program/play.h"
+#include "../program/selfplaymanager.h"
 
 using namespace std;
 using namespace TestCommon;
@@ -59,6 +60,242 @@ static NNEvaluator* startNNEval(
   return nnEval;
 }
 
+static FinishedGameData* makeExtremeCohortTestGame(
+  int groupSize,
+  uint64_t cohortId,
+  int attemptIdx,
+  Player focalPla,
+  double finalWhiteMinusBlackScore,
+  const string& focalModelIdentity,
+  const string& opponentModelIdentity,
+  const string& configIdentity,
+  const string& runIdentity,
+  double trainingWeight = 1.0,
+  const vector<Player>& movePlas = vector<Player>()
+) {
+  FinishedGameData* data = new FinishedGameData();
+  data->bName = focalPla == P_BLACK ? focalModelIdentity : opponentModelIdentity;
+  data->wName = focalPla == P_WHITE ? focalModelIdentity : opponentModelIdentity;
+  data->trainingWeight = trainingWeight;
+  data->endHist.isGameFinished = true;
+  data->endHist.isScored = true;
+  data->endHist.isNoResult = false;
+  data->endHist.isResignation = false;
+  data->endHist.finalWhiteMinusBlackScore = (float)finalWhiteMinusBlackScore;
+  data->endHist.winner =
+    finalWhiteMinusBlackScore > 0.0 ? P_WHITE :
+    finalWhiteMinusBlackScore < 0.0 ? P_BLACK :
+    C_EMPTY;
+  for(Player pla: movePlas) {
+    data->endHist.moveHistory.push_back(Move(Board::PASS_LOC,pla));
+    data->targetWeightByTurn.push_back(1.0f);
+    data->targetWeightByTurnUnrounded.push_back(1.0f);
+  }
+
+  data->extremeCohort.enabled = true;
+  data->extremeCohort.metadataVersion = ExtremeCohortData::METADATA_VERSION;
+  data->extremeCohort.cohortId = cohortId;
+  data->extremeCohort.attemptIdx = attemptIdx;
+  data->extremeCohort.groupSize = groupSize;
+  data->extremeCohort.focalPla = focalPla;
+  data->extremeCohort.focalModelIdentity = focalModelIdentity;
+  data->extremeCohort.opponentModelIdentity = opponentModelIdentity;
+  data->extremeCohort.configIdentity = configIdentity;
+  data->extremeCohort.runIdentity = runIdentity;
+  testAssert(data->extremeCohort.hasValidAssignment());
+  return data;
+}
+
+static void deleteExtremeCohortTestGames(vector<FinishedGameData*>& games) {
+  for(FinishedGameData* game: games)
+    delete game;
+  games.clear();
+}
+
+static void runExtremeCohortCreditTests() {
+  cout << "Running extreme cohort credit tests" << endl;
+  const string focalModel = "focal-generation-a";
+  const string opponentModel = "opponent-generation-a";
+  const string configIdentity = "config-a";
+  const string runIdentity = "run-a";
+
+  //Completion order must not affect attempt order, margins, rank, or exact leave-one-out credit.
+  {
+    ExtremeCohortGameBuffer buffer;
+    vector<FinishedGameData*> completed;
+    string error;
+    testAssert(
+      buffer.addGame(
+        makeExtremeCohortTestGame(3,10,2,P_WHITE,5.0,focalModel,opponentModel,configIdentity,runIdentity,0.5),
+        completed,error
+      ) == ExtremeCohortGameBuffer::BUFFERED
+    );
+    testAssert(
+      buffer.addGame(
+        makeExtremeCohortTestGame(3,10,0,P_WHITE,3.0,focalModel,opponentModel,configIdentity,runIdentity,0.5),
+        completed,error
+      ) == ExtremeCohortGameBuffer::BUFFERED
+    );
+    testAssert(
+      buffer.addGame(
+        makeExtremeCohortTestGame(3,10,1,P_WHITE,9.0,focalModel,opponentModel,configIdentity,runIdentity,0.5),
+        completed,error
+      ) == ExtremeCohortGameBuffer::COHORT_READY
+    );
+    testAssert(error.empty());
+    testAssert(completed.size() == 3);
+    testAssert(completed[0]->extremeCohort.attemptIdx == 0);
+    testAssert(completed[1]->extremeCohort.attemptIdx == 1);
+    testAssert(completed[2]->extremeCohort.attemptIdx == 2);
+    testAssert(completed[0]->extremeCohort.focalFinalMargin == 3.0);
+    testAssert(completed[0]->extremeCohort.leaveOneOutMaxMargin == 9.0);
+    testAssert(completed[0]->extremeCohort.credit == 0.0);
+    testAssert(completed[0]->extremeCohort.rank == 3);
+    testAssert(completed[1]->extremeCohort.focalFinalMargin == 9.0);
+    testAssert(completed[1]->extremeCohort.leaveOneOutMaxMargin == 5.0);
+    testAssert(completed[1]->extremeCohort.credit == 4.0);
+    testAssert(completed[1]->extremeCohort.rank == 1);
+    testAssert(completed[1]->extremeCohort.selected);
+    testAssert(completed[1]->trainingWeight == 2.0);
+    testAssert(completed[2]->extremeCohort.rank == 2);
+    testAssert(buffer.numPendingGames() == 0);
+    deleteExtremeCohortTestGames(completed);
+  }
+
+  //Ties share a competition rank and receive exactly zero credit.
+  {
+    vector<FinishedGameData*> games;
+    games.push_back(makeExtremeCohortTestGame(3,11,0,P_WHITE,7.0,focalModel,opponentModel,configIdentity,runIdentity));
+    games.push_back(makeExtremeCohortTestGame(3,11,1,P_WHITE,7.0,focalModel,opponentModel,configIdentity,runIdentity));
+    games.push_back(makeExtremeCohortTestGame(3,11,2,P_WHITE,2.0,focalModel,opponentModel,configIdentity,runIdentity));
+    string error;
+    testAssert(applyExtremeCohortCredits(games,error));
+    testAssert(games[0]->extremeCohort.rank == 1);
+    testAssert(games[1]->extremeCohort.rank == 1);
+    testAssert(games[2]->extremeCohort.rank == 3);
+    for(FinishedGameData* game: games) {
+      testAssert(game->extremeCohort.credit == 0.0);
+      testAssert(!game->extremeCohort.selected);
+      testAssert(game->trainingWeight == 0.0);
+    }
+    deleteExtremeCohortTestGames(games);
+  }
+
+  //N=1 is the expected-score curriculum stage, so every focal trajectory
+  //contributes with unit cohort credit even when no comparison attempt exists.
+  {
+    vector<FinishedGameData*> games;
+    games.push_back(makeExtremeCohortTestGame(1,12,0,P_WHITE,3.5,focalModel,opponentModel,configIdentity,runIdentity,2.0));
+    string error;
+    testAssert(applyExtremeCohortCredits(games,error));
+    testAssert(games[0]->extremeCohort.leaveOneOutMaxMargin == 0.0);
+    testAssert(games[0]->extremeCohort.credit == 1.0);
+    testAssert(games[0]->extremeCohort.rank == 1);
+    testAssert(games[0]->trainingWeight == 2.0);
+    deleteExtremeCohortTestGames(games);
+  }
+
+  //Final margins and winner selection are from the declared focal color's perspective.
+  {
+    const vector<Player> movePlas = {P_BLACK,P_WHITE,P_BLACK,P_WHITE};
+    vector<FinishedGameData*> games;
+    games.push_back(makeExtremeCohortTestGame(2,13,0,P_BLACK,-8.0,focalModel,opponentModel,configIdentity,runIdentity,1.0,movePlas));
+    games.push_back(makeExtremeCohortTestGame(2,13,1,P_BLACK,-3.0,focalModel,opponentModel,configIdentity,runIdentity,1.0,movePlas));
+    string error;
+    testAssert(applyExtremeCohortCredits(games,error));
+    testAssert(games[0]->extremeCohort.focalFinalMargin == 8.0);
+    testAssert(games[0]->extremeCohort.credit == 5.0);
+    testAssert(games[0]->extremeCohort.selected);
+    testAssert(games[1]->extremeCohort.focalFinalMargin == 3.0);
+    testAssert(games[1]->extremeCohort.credit == 0.0);
+    testAssert(games[0]->targetWeightByTurn[0] == 1.0f);
+    testAssert(games[0]->targetWeightByTurn[1] == 0.0f);
+    testAssert(games[0]->targetWeightByTurn[2] == 1.0f);
+    testAssert(games[0]->targetWeightByTurn[3] == 0.0f);
+    for(int turn = 0; turn<4; turn++) {
+      testAssert(games[1]->targetWeightByTurn[turn] == 0.0f);
+      testAssert(games[1]->targetWeightByTurnUnrounded[turn] == 0.0f);
+    }
+    deleteExtremeCohortTestGames(games);
+  }
+
+  //The identity tuple is part of the key: identical numeric cohort ids from different
+  //model generations remain separate even when their completions interleave.
+  {
+    ExtremeCohortGameBuffer buffer;
+    vector<FinishedGameData*> completed;
+    string error;
+    testAssert(
+      buffer.addGame(
+        makeExtremeCohortTestGame(2,14,0,P_WHITE,4.0,"generation-a",opponentModel,configIdentity,runIdentity),
+        completed,error
+      ) == ExtremeCohortGameBuffer::BUFFERED
+    );
+    testAssert(
+      buffer.addGame(
+        makeExtremeCohortTestGame(2,14,1,P_WHITE,5.0,"generation-b",opponentModel,configIdentity,runIdentity),
+        completed,error
+      ) == ExtremeCohortGameBuffer::BUFFERED
+    );
+    testAssert(buffer.numPendingCohorts() == 2);
+    testAssert(
+      buffer.addGame(
+        makeExtremeCohortTestGame(2,14,1,P_WHITE,7.0,"generation-a",opponentModel,configIdentity,runIdentity),
+        completed,error
+      ) == ExtremeCohortGameBuffer::COHORT_READY
+    );
+    testAssert(completed.size() == 2);
+    testAssert(completed[0]->extremeCohort.focalModelIdentity == "generation-a");
+    deleteExtremeCohortTestGames(completed);
+    testAssert(buffer.numPendingGames() == 1);
+    testAssert(
+      buffer.addGame(
+        makeExtremeCohortTestGame(2,14,0,P_WHITE,8.0,"generation-b",opponentModel,configIdentity,runIdentity),
+        completed,error
+      ) == ExtremeCohortGameBuffer::COHORT_READY
+    );
+    testAssert(completed[0]->extremeCohort.focalModelIdentity == "generation-b");
+    deleteExtremeCohortTestGames(completed);
+  }
+
+  //An interrupted final cohort is never released and is deleted on shutdown.
+  {
+    ExtremeCohortGameBuffer buffer;
+    vector<FinishedGameData*> completed;
+    string error;
+    testAssert(
+      buffer.addGame(
+        makeExtremeCohortTestGame(2,15,0,P_WHITE,4.0,focalModel,opponentModel,configIdentity,runIdentity),
+        completed,error
+      ) == ExtremeCohortGameBuffer::BUFFERED
+    );
+    testAssert(buffer.discardIncomplete() == 1);
+    testAssert(buffer.numPendingGames() == 0);
+  }
+
+  //The shared unwritten-game bound covers in-flight and cohort-buffered games,
+  //and stop requests unblock a producer without consuming capacity.
+  {
+    SelfplayManager::ModelData modelData(
+      "capacity-test",NULL,2,NULL,NULL,0.0,false
+    );
+    testAssert(modelData.waitForUnwrittenGameCapacity([](){ return false; }));
+    testAssert(modelData.waitForUnwrittenGameCapacity([](){ return false; }));
+    testAssert(modelData.getNumUnwrittenGames() == 2);
+    testAssert(!modelData.waitForUnwrittenGameCapacity([](){ return true; }));
+    testAssert(modelData.getNumUnwrittenGames() == 2);
+    modelData.releaseUnwrittenGames(1);
+    testAssert(modelData.waitForUnwrittenGameCapacity([](){ return false; }));
+    testAssert(modelData.getNumUnwrittenGames() == 2);
+    modelData.setDataQueueReadOnly();
+    testAssert(!modelData.waitForUnwrittenGameCapacity([](){ return false; }));
+    modelData.releaseUnwrittenGames(2);
+    testAssert(modelData.getNumUnwrittenGames() == 0);
+  }
+
+  cout << "Extreme cohort credit tests passed" << endl;
+}
+
 //Directly test that addRow records the reanalysis info in the expected global target channels.
 static void runReanalysisRowChannelsTest() {
   cout << "Running reanalysis row channels test" << endl;
@@ -86,12 +323,16 @@ static void runReanalysisRowChannelsTest() {
   nnRawStats.policyEntropy = 0.0;
   Rand rand("runReanalysisRowChannelsTest");
 
-  auto addRowWith = [&](const ReanalysisData& reanalysisData) {
+  auto addRowWith = [&](
+    const ReanalysisData& reanalysisData,
+    const ExtremeCohortData& extremeCohortData,
+    float rowWeight
+  ) {
     buffers.addRow(
       board,hist,nextPla,
       hist,hist,
       0,
-      1.0f,
+      rowWeight,
       100,
       &policyTarget,
       NULL,
@@ -116,12 +357,13 @@ static void runReanalysisRowChannelsTest() {
       FinishedGameData::MODE_NORMAL,
       NULL,
       rand,
-      reanalysisData
+      reanalysisData,
+      extremeCohortData
     );
   };
 
   //Row 0: an ordinary row, not reanalyzed
-  addRowWith(ReanalysisData());
+  addRowWith(ReanalysisData(),ExtremeCohortData(),1.0f);
   //Row 1: a reanalyzed row
   ReanalysisData reanalysisData;
   reanalysisData.wasReanalyzed = true;
@@ -129,12 +371,33 @@ static void runReanalysisRowChannelsTest() {
   reanalysisData.selectionPolicySurprise = 0.25f;
   reanalysisData.selectionValueSurprise = 0.125f;
   reanalysisData.originalNumVisits = 137;
-  addRowWith(reanalysisData);
+  addRowWith(reanalysisData,ExtremeCohortData(),1.0f);
+
+  //Row 2: an extreme-cohort row. The id crosses a 22-bit chunk boundary.
+  ExtremeCohortData extremeCohortData;
+  extremeCohortData.enabled = true;
+  extremeCohortData.metadataVersion = ExtremeCohortData::METADATA_VERSION;
+  extremeCohortData.cohortId = (1ULL << 22) + 17;
+  extremeCohortData.attemptIdx = 2;
+  extremeCohortData.groupSize = 4;
+  extremeCohortData.focalPla = P_WHITE;
+  extremeCohortData.focalModelIdentity = "focal";
+  extremeCohortData.opponentModelIdentity = "opponent";
+  extremeCohortData.configIdentity = "config";
+  extremeCohortData.runIdentity = "run";
+  extremeCohortData.focalFinalMargin = 12.5;
+  extremeCohortData.leaveOneOutMaxMargin = 9.0;
+  extremeCohortData.credit = 3.5;
+  extremeCohortData.rank = 1;
+  extremeCohortData.selected = true;
+  extremeCohortData.appliedWeight = 3.5;
+  addRowWith(ReanalysisData(),extremeCohortData,2.25f);
 
   int numGlobalChannels = 80;
   const float* row0 = buffers.globalTargetsNC.data + 0 * numGlobalChannels;
   const float* row1 = buffers.globalTargetsNC.data + 1 * numGlobalChannels;
-  testAssert(buffers.globalTargetsNC.getActualDataLen(2) == 2 * numGlobalChannels);
+  const float* row2 = buffers.globalTargetsNC.data + 2 * numGlobalChannels;
+  testAssert(buffers.globalTargetsNC.getActualDataLen(3) == 3 * numGlobalChannels);
 
   testAssert(row0[63] == 3.0f);
   testAssert(row0[64] == 0.0f);
@@ -153,7 +416,139 @@ static void runReanalysisRowChannelsTest() {
     testAssert(row1[c] == 0.0f);
   }
 
+  testAssert(row2[25] == 2.25f);
+  testAssert(row2[68] == 1.0f);
+  testAssert(row2[69] == 4.0f);
+  testAssert(row2[70] == 2.0f);
+  testAssert(row2[71] == 1.0f);
+  testAssert(row2[72] == 12.5f);
+  testAssert(row2[73] == 9.0f);
+  testAssert(row2[74] == 3.5f);
+  testAssert(row2[75] == 1.0f);
+  testAssert(row2[76] == 1.0f);
+  testAssert(row2[77] == 3.5f);
+  testAssert(row2[78] == 17.0f);
+  testAssert(row2[79] == 1.0f);
+
   cout << "Reanalysis row channels test passed" << endl;
+}
+
+static void runExtremeCohortWriterTest() {
+  cout << "Running extreme cohort writer test" << endl;
+
+  Board initialBoard(5,5);
+  Rules rules = Rules::getTrompTaylorish();
+  BoardHistory startHist(initialBoard,P_BLACK,rules,0);
+  Board board(initialBoard);
+  BoardHistory endHist(startHist);
+  endHist.makeBoardMoveAssumeLegal(board,Location::getLoc(0,0,board.x_size),P_BLACK,NULL);
+  endHist.makeBoardMoveAssumeLegal(board,Location::getLoc(1,0,board.x_size),P_WHITE,NULL);
+  endHist.makeBoardMoveAssumeLegal(board,Board::PASS_LOC,P_BLACK,NULL);
+  endHist.makeBoardMoveAssumeLegal(board,Board::PASS_LOC,P_WHITE,NULL);
+  endHist.isGameFinished = true;
+  endHist.isScored = true;
+  endHist.isNoResult = false;
+  endHist.isResignation = false;
+  endHist.finalWhiteMinusBlackScore = 6.0f;
+  endHist.winner = P_WHITE;
+
+  const vector<Player> movePlas = {P_BLACK,P_WHITE,P_BLACK,P_WHITE};
+  FinishedGameData* data = makeExtremeCohortTestGame(
+    1,16,0,P_WHITE,6.0,
+    "focal-writer-generation","opponent-writer-generation",
+    "writer-config","writer-run",
+    0.25,
+    movePlas
+  );
+  data->startBoard = initialBoard;
+  data->startHist = startHist;
+  data->endHist = endHist;
+  data->startPla = P_BLACK;
+  data->drawEquivalentWinsForWhite = 0.5;
+  data->playoutDoublingAdvantagePla = C_EMPTY;
+  data->playoutDoublingAdvantage = 0.0;
+  data->hasFullData = true;
+
+  for(int i = 0; i<4; i++) {
+    vector<PolicyTargetMove>* policy = new vector<PolicyTargetMove>();
+    policy->push_back(PolicyTargetMove(Board::PASS_LOC,1));
+    data->policyTargetsByTurn.emplace_back(policy,1);
+    data->policySurpriseByTurn.push_back(0.0);
+    data->policyEntropyByTurn.push_back(0.0);
+    data->searchEntropyByTurn.push_back(0.0);
+    data->whiteQValueTargetsByTurn.push_back(QValueTargets());
+    NNRawStats stats;
+    stats.whiteWinLoss = 1.0;
+    stats.whiteScoreMean = 6.0;
+    stats.policyEntropy = 0.0;
+    data->nnRawStatsByTurn.push_back(stats);
+  }
+  for(int i = 0; i<5; i++) {
+    ValueTargets targets;
+    targets.win = 1.0f;
+    targets.loss = 0.0f;
+    targets.noResult = 0.0f;
+    targets.score = 6.0f;
+    targets.hasLead = true;
+    targets.lead = 6.0f;
+    data->whiteValueTargetsByTurn.push_back(targets);
+  }
+
+  data->finalFullArea = new Color[Board::MAX_ARR_SIZE];
+  data->finalOwnership = new Color[Board::MAX_ARR_SIZE];
+  data->finalSekiAreas = new bool[Board::MAX_ARR_SIZE];
+  data->finalWhiteScoring = new float[Board::MAX_ARR_SIZE];
+  std::fill(data->finalFullArea,data->finalFullArea+Board::MAX_ARR_SIZE,C_EMPTY);
+  std::fill(data->finalOwnership,data->finalOwnership+Board::MAX_ARR_SIZE,C_EMPTY);
+  std::fill(data->finalSekiAreas,data->finalSekiAreas+Board::MAX_ARR_SIZE,false);
+  std::fill(data->finalWhiteScoring,data->finalWhiteScoring+Board::MAX_ARR_SIZE,0.0f);
+
+  vector<FinishedGameData*> cohort;
+  cohort.push_back(data);
+  string error;
+  testAssert(applyExtremeCohortCredits(cohort,error));
+  testAssert(data->targetWeightByTurn[0] == 0.0f);
+  testAssert(data->targetWeightByTurn[1] == 1.0f);
+  testAssert(data->targetWeightByTurn[2] == 0.0f);
+  testAssert(data->targetWeightByTurn[3] == 1.0f);
+  testAssert(data->trainingWeight == 0.25);
+
+  ostringstream debugOut;
+  TrainingDataWriter writer(&debugOut,3,8,1.0,5,5,1,"extreme-cohort-writer-test");
+  writer.writeGame(*data);
+  testAssert(writer.numRowsInBuffer() == 2);
+  testAssert(writer.numRowsWritten() == 2);
+  writer.flushIfNonempty();
+
+  const string output = debugOut.str();
+  size_t globalTargetsPos = output.find("globalTargetsNC\n");
+  testAssert(globalTargetsPos != string::npos);
+  istringstream globalTargetsIn(output.substr(globalTargetsPos));
+  string line;
+  std::getline(globalTargetsIn,line); //name
+  std::getline(globalTargetsIn,line); //numpy header
+  vector<float> rows(160,0.0f);
+  for(int i = 0; i<160; i++)
+    globalTargetsIn >> rows[i];
+
+  const float* row0 = rows.data();
+  const float* row1 = rows.data()+80;
+  testAssert(row0[25] == 0.25f);
+  testAssert(row0[26] == 1.0f);
+  //The next move belongs to the opponent and must not be used as a C28 policy target.
+  testAssert(row0[28] == 0.0f);
+  testAssert(row1[28] == 0.0f);
+  testAssert(row0[68] == 1.0f);
+  testAssert(row0[70] == 0.0f);
+  testAssert(row0[71] == 1.0f);
+  testAssert(row0[72] == 6.0f);
+  testAssert(row0[74] == 1.0f);
+  testAssert(row0[76] == 1.0f);
+  testAssert(row0[77] == 1.0f);
+  testAssert(row1[25] == 0.25f);
+
+  delete data;
+  cout << "Extreme cohort writer test passed" << endl;
 }
 
 void Tests::runTrainingWriteTests() {
@@ -164,7 +559,9 @@ void Tests::runTrainingWriteTests() {
   cout << "Running training write tests" << endl;
   NeuralNet::globalInitialize();
 
+  runExtremeCohortCreditTests();
   runReanalysisRowChannelsTest();
+  runExtremeCohortWriterTest();
 
   int maxRows = 256;
   double firstFileMinRandProp = 1.0;

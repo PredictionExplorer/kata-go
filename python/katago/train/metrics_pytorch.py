@@ -439,6 +439,7 @@ class Metrics:
         main_loss_scale,
         intermediate_loss_scale,
         include_model_norms=True,
+        extreme_score_only=False,
     ):
         results = self.metrics_dict_batchwise_single_heads_output(
             raw_model,
@@ -454,6 +455,7 @@ class Metrics:
             variance_time_loss_scale=variance_time_loss_scale,
             is_intermediate=False,
             include_model_norms=include_model_norms,
+            extreme_score_only=extreme_score_only,
         )
         if main_loss_scale is not None:
             results["loss_sum"] = main_loss_scale * results["loss_sum"]
@@ -480,6 +482,7 @@ class Metrics:
                     seki_loss_scale=seki_loss_scale,
                     variance_time_loss_scale=variance_time_loss_scale,
                     is_intermediate=True,
+                    extreme_score_only=extreme_score_only,
                 )
                 for key,value in iresults.items():
                     if key != "loss_sum":
@@ -509,6 +512,7 @@ class Metrics:
         variance_time_loss_scale,
         is_intermediate,
         include_model_norms=True,
+        extreme_score_only=False,
     ):
         (
             policy_logits,
@@ -557,6 +561,14 @@ class Metrics:
 
         target_weight_policy_player = target_global_nc[:, 26]
         target_weight_policy_opponent = target_global_nc[:, 28]
+        if extreme_score_only:
+            # Extreme-score rows are emitted only for the focal side. C68:C80
+            # is the cohort metadata envelope; zero-filled legacy rows are
+            # rejected by the data loader when this mode is enabled.
+            assert target_global_nc.shape[1] >= 80
+            target_weight_policy_opponent = torch.zeros_like(
+                target_weight_policy_opponent
+            )
 
         target_value = target_global_nc[:, 0:3]
         target_scoremean = target_global_nc[:, 3]
@@ -644,9 +656,20 @@ class Metrics:
             global_weight,
         ).sum()
 
-        if raw_model.config["version"] <= 11:
+        if raw_model.config["version"] <= 11 or extreme_score_only:
             target_weight_longoptimistic_policy = torch.zeros_like(global_weight)
-            loss_longoptimistic_policy = torch.zeros_like(loss_policy_player)
+            if raw_model.config["version"] <= 11:
+                loss_longoptimistic_policy = torch.zeros_like(loss_policy_player)
+            else:
+                # Keep the optimistic-policy output connected to autograd with
+                # an exact zero weight. This is DDP-safe while contributing no
+                # win-derived gradient.
+                loss_longoptimistic_policy = self.loss_policy_player_samplewise(
+                    policy_logits[:, 4, :],
+                    target_policy_player,
+                    target_weight_longoptimistic_policy,
+                    global_weight,
+                ).sum()
         elif disable_optimistic_policy:
             target_weight_longoptimistic_policy = target_weight_policy_player * 0.5
             loss_longoptimistic_policy = self.loss_policy_player_samplewise(
@@ -687,9 +710,17 @@ class Metrics:
         assert target_weight_longoptimistic_policy.shape[0] == n
         target_weight_longoptimistic_policy_sum = (global_weight * target_weight_longoptimistic_policy).sum()
 
-        if raw_model.config["version"] <= 11:
+        if raw_model.config["version"] <= 11 or extreme_score_only:
             target_weight_shortoptimistic_policy = torch.zeros_like(global_weight)
-            loss_shortoptimistic_policy = torch.zeros_like(loss_policy_player)
+            if raw_model.config["version"] <= 11:
+                loss_shortoptimistic_policy = torch.zeros_like(loss_policy_player)
+            else:
+                loss_shortoptimistic_policy = self.loss_policy_player_samplewise(
+                    policy_logits[:, 5, :],
+                    target_policy_player,
+                    target_weight_shortoptimistic_policy,
+                    global_weight,
+                ).sum()
         elif disable_optimistic_policy:
             target_weight_shortoptimistic_policy = target_weight_policy_player * 0.5
             loss_shortoptimistic_policy = self.loss_policy_player_samplewise(
@@ -735,10 +766,14 @@ class Metrics:
         loss_value = self.loss_value_samplewise(
             value_logits, target_value, target_weight_value, global_weight
         ).sum()
+        if extreme_score_only:
+            loss_value = loss_value * 0.0
 
         loss_td_value_unsummed = self.loss_td_value_samplewise(
             td_value_logits, target_td_value, target_weight_td_value, global_weight
         )
+        if extreme_score_only:
+            loss_td_value_unsummed = loss_td_value_unsummed * 0.0
         assert self.num_td_values == 3
         loss_td_value1 = loss_td_value_unsummed[:,0].sum()
         loss_td_value2 = loss_td_value_unsummed[:,1].sum()
@@ -834,6 +869,12 @@ class Metrics:
             target_weight_ownership,
             global_weight,
         ).sum()
+        if extreme_score_only:
+            # Both targets are derived from win/loss value trajectories rather
+            # than terminal score. Keep their graph connections for DDP, but
+            # remove every gradient contribution in score-only mode.
+            loss_variance_time = loss_variance_time * 0.0
+            loss_shortterm_value_error = loss_shortterm_value_error * 0.0
 
         if not predict_q_values:
             target_weight_qvalues = torch.zeros_like(global_weight)
@@ -852,6 +893,38 @@ class Metrics:
             )
             loss_qvalues_winloss = loss_qvalues_winloss.sum()
             loss_qvalues_score = loss_qvalues_score.sum()
+            if extreme_score_only:
+                loss_qvalues_winloss = loss_qvalues_winloss * 0.0
+
+        if extreme_score_only:
+            extreme_score_forbidden_loss = (
+                loss_policy_opponent
+                + loss_policy_opponent_soft
+                + loss_longoptimistic_policy
+                + loss_shortoptimistic_policy
+                + loss_value
+                + loss_td_value1
+                + loss_td_value2
+                + loss_td_value3
+                + loss_variance_time
+                + loss_shortterm_value_error
+                + loss_qvalues_winloss
+            )
+            extreme_score_policy_loss = (
+                loss_policy_player * policy_opt_loss_scale
+                + loss_policy_player_soft * soft_policy_weight_scale
+            )
+            extreme_score_score_loss = (
+                loss_td_score
+                + loss_scoring * 0.25
+                + loss_scoremean
+                + loss_scorebelief_cdf
+                + loss_scorebelief_pdf
+                + loss_scorestdev
+                + loss_lead
+                + loss_shortterm_score_error
+                + loss_qvalues_score
+            )
 
         loss_sum = (
             loss_policy_player * policy_opt_loss_scale
@@ -921,6 +994,15 @@ class Metrics:
             "pacc1_sum": policy_acc1,
             "vsquare_sum": square_value,
         }
+        if extreme_score_only:
+            # Audit metrics are effective loss contributions, not merely raw
+            # predictions. xsforbid must remain exactly zero; xspolicy and
+            # xsscore demonstrate that the two core allowed objectives remain
+            # present in loss_sum and therefore in backward().
+            results["xsforbid_sum"] = extreme_score_forbidden_loss
+            results["xspolicy_sum"] = extreme_score_policy_loss
+            results["xsscore_sum"] = extreme_score_score_loss
+            results["xsmode_batch"] = torch.ones_like(loss_sum)
 
         if is_intermediate:
             return results

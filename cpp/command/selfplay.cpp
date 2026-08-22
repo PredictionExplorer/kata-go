@@ -1,6 +1,7 @@
 #include "../core/global.h"
 #include "../core/datetime.h"
 #include "../core/fileutils.h"
+#include "../core/hash.h"
 #include "../core/makedir.h"
 #include "../core/config_parser.h"
 #include "../core/timer.h"
@@ -41,6 +42,7 @@ int MainCmds::selfplay(const vector<string>& args) {
 
   ConfigParser cfg;
   string modelsDir;
+  string opponentModelsDir;
   string outputDir;
   int64_t maxGamesTotal = ((int64_t)1) << 62;
   try {
@@ -49,14 +51,21 @@ int MainCmds::selfplay(const vector<string>& args) {
     cmd.addOverrideConfigArg();
 
     TCLAP::ValueArg<string> modelsDirArg("","models-dir","Dir to poll and load models from",true,string(),"DIR");
+    TCLAP::ValueArg<string> opponentModelsDirArg(
+      "","opponent-models-dir",
+      "Optional frozen opponent model directory for focal extreme cohorts",
+      false,string(),"DIR"
+    );
     TCLAP::ValueArg<string> outputDirArg("","output-dir","Dir to output files",true,string(),"DIR");
     TCLAP::ValueArg<string> maxGamesTotalArg("","max-games-total","Terminate after this many games",false,string(),"NGAMES");
     cmd.add(modelsDirArg);
+    cmd.add(opponentModelsDirArg);
     cmd.add(outputDirArg);
     cmd.add(maxGamesTotalArg);
     cmd.parseArgs(args);
 
     modelsDir = modelsDirArg.getValue();
+    opponentModelsDir = opponentModelsDirArg.getValue();
     outputDir = outputDirArg.getValue();
     string maxGamesTotalStr = maxGamesTotalArg.getValue();
     if(maxGamesTotalStr != "") {
@@ -107,25 +116,115 @@ int MainCmds::selfplay(const vector<string>& args) {
   const int64_t logGamesEvery = cfg.getInt64("logGamesEvery",1,1000000);
 
   const bool switchNetsMidGame = cfg.getBool("switchNetsMidGame");
-  const SearchParams baseParams = Setup::loadSingleParams(cfg,Setup::SETUP_FOR_OTHER);
+  const int extremeCohortSize =
+    cfg.contains("extremeCohortSize") ?
+    cfg.getInt("extremeCohortSize",0,64) :
+    0;
+  Player extremeCohortFocalPla = C_EMPTY;
+  if(cfg.contains("extremeCohortFocalColor")) {
+    if(!PlayerIO::tryParsePlayer(cfg.getString("extremeCohortFocalColor"),extremeCohortFocalPla))
+      throw StringError("extremeCohortFocalColor must be black or white");
+  }
+  if(extremeCohortSize > 0 && extremeCohortFocalPla == C_EMPTY)
+    throw StringError("extremeCohortFocalColor is required when extremeCohortSize is positive");
+  if(extremeCohortSize > 0 && switchNetsMidGame)
+    throw StringError("switchNetsMidGame must be false when extreme cohorts are enabled");
+  SearchParams baseParams = Setup::loadSingleParams(cfg,Setup::SETUP_FOR_OTHER);
+  if(extremeCohortSize > 0) {
+    if(opponentModelsDir.empty())
+      throw StringError("-opponent-models-dir is required when extreme cohorts are enabled");
+    if(!baseParams.useExpectedMaxScoreUtility || baseParams.useScoreMaximizingUtility)
+      throw StringError("extreme cohorts require only useExpectedMaxScoreUtility");
+    if(baseParams.extremeScoreGroupSize != extremeCohortSize)
+      throw StringError("extremeCohortSize must equal extremeScoreGroupSize");
+    if(baseParams.expectedMaxFocalPla != extremeCohortFocalPla)
+      throw StringError("expectedMaxFocalColor must match extremeCohortFocalColor");
+    if(maxDataQueueSize < extremeCohortSize || maxDataQueueSize % extremeCohortSize != 0) {
+      throw StringError(
+        "maxDataQueueSize must be a positive multiple of extremeCohortSize"
+      );
+    }
+  }
+
+  const string extremeCohortConfigIdentity =
+    extremeCohortSize > 0 ?
+    Global::uint64ToHexString(Hash::simpleHash(cfg.getAllKeyVals().c_str())) :
+    "";
+  const string extremeCohortRunIdentity =
+    extremeCohortSize > 0 ?
+    Global::uint64ToHexString(seedRand.nextUInt64()) :
+    "";
+  const ExtremeCohortSettings extremeCohortSettings(
+    extremeCohortSize,
+    extremeCohortFocalPla,
+    extremeCohortConfigIdentity,
+    extremeCohortRunIdentity
+  );
 
   //Initialize object for randomizing game settings and running games
   const bool isDistributed = false;
   PlaySettings playSettings = PlaySettings::loadForSelfplay(cfg, isDistributed);
   GameRunner* gameRunner = new GameRunner(cfg, playSettings, logger);
   bool autoCleanupAllButLatestIfUnused = true;
-  SelfplayManager* manager = new SelfplayManager(maxDataQueueSize, &logger, logGamesEvery, autoCleanupAllButLatestIfUnused);
+  SelfplayManager* manager = new SelfplayManager(
+    maxDataQueueSize, &logger, logGamesEvery, autoCleanupAllButLatestIfUnused, extremeCohortSettings
+  );
 
   const int minBoardXSizeUsed = gameRunner->getGameInitializer()->getMinBoardXSize();
   const int minBoardYSizeUsed = gameRunner->getGameInitializer()->getMinBoardYSize();
   const int maxBoardXSizeUsed = gameRunner->getGameInitializer()->getMaxBoardXSize();
   const int maxBoardYSizeUsed = gameRunner->getGameInitializer()->getMaxBoardYSize();
 
+  //All neural evaluators, including the frozen stop-gradient opponent, require
+  //the backend/session globals to exist before construction.
   Setup::initializeSession(cfg);
+
+  NNEvaluator* frozenOpponentNNEval = NULL;
+  string frozenOpponentModelName;
+  string frozenOpponentModelFile;
+  if(extremeCohortSettings.isEnabled()) {
+    string frozenOpponentModelDir;
+    time_t frozenOpponentModelTime;
+    bool foundOpponent = LoadModel::findLatestModel(
+      opponentModelsDir,
+      logger,
+      frozenOpponentModelName,
+      frozenOpponentModelFile,
+      frozenOpponentModelDir,
+      frozenOpponentModelTime
+    );
+    if(!foundOpponent || frozenOpponentModelFile == "/dev/null")
+      throw StringError("Could not load a frozen opponent model for extreme cohorts");
+
+    const int expectedConcurrentEvals = cfg.getInt("numSearchThreads") * numGameThreads;
+    const bool defaultRequireExactNNLen =
+      minBoardXSizeUsed == maxBoardXSizeUsed && minBoardYSizeUsed == maxBoardYSizeUsed;
+    const int defaultMaxBatchSize = -1;
+    const bool disableFP16 = false;
+    const string expectedSha256 = "";
+    Rand opponentRand;
+    frozenOpponentNNEval = Setup::initializeNNEvaluator(
+      frozenOpponentModelName,frozenOpponentModelFile,expectedSha256,cfg,logger,opponentRand,expectedConcurrentEvals,
+      maxBoardXSizeUsed,maxBoardYSizeUsed,defaultMaxBatchSize,defaultRequireExactNNLen,disableFP16,
+      Setup::SETUP_FOR_OTHER
+    );
+    logger.write(
+      "Loaded frozen extreme-cohort opponent " + frozenOpponentModelName +
+      " from: " + frozenOpponentModelFile
+    );
+  }
 
   //Done loading!
   //------------------------------------------------------------------------------------
   logger.write("Loaded all config stuff, starting self play");
+  if(extremeCohortSettings.isEnabled()) {
+    logger.write(
+      "Extreme cohorts enabled: N=" + Global::intToString(extremeCohortSettings.groupSize) +
+      " focal=" + PlayerIO::playerToString(extremeCohortSettings.focalPla) +
+      " config=" + extremeCohortSettings.configIdentity +
+      " run=" + extremeCohortSettings.runIdentity
+    );
+  }
   if(!logger.isLoggingToStdout())
     cout << "Loaded all config stuff, starting self play" << endl;
 
@@ -142,6 +241,8 @@ int MainCmds::selfplay(const vector<string>& args) {
   auto loadLatestNeuralNetIntoManager =
     [inputsVersion,&manager,maxRowsPerTrainFile,firstFileRandMinProp,dataBoardLen,
      &modelsDir,&outputDir,&logger,&cfg,numGameThreads,
+     &extremeCohortSettings,
+     &frozenOpponentModelName,&frozenOpponentModelFile,
      minBoardXSizeUsed,maxBoardXSizeUsed,minBoardYSizeUsed,maxBoardYSizeUsed](const string* lastNetName) -> bool {
 
     string modelName;
@@ -208,10 +309,39 @@ int MainCmds::selfplay(const vector<string>& args) {
       }
     }
 
+    const string selfplayConfigFile =
+      modelOutputDir + "/selfplay-" + Global::uint64ToHexString(rand.nextUInt64()) + ".cfg";
     {
       ofstream out;
-      FileUtils::open(out,modelOutputDir + "/" + "selfplay-" + Global::uint64ToHexString(rand.nextUInt64()) + ".cfg");
+      FileUtils::open(out,selfplayConfigFile);
       out << cfg.getContents();
+      out.close();
+    }
+    if(extremeCohortSettings.isEnabled()) {
+      ofstream out;
+      FileUtils::open(
+        out,
+        modelOutputDir + "/extreme-cohort-" + extremeCohortSettings.runIdentity + ".manifest.cfg"
+      );
+      out << "schemaVersion = " << ExtremeCohortData::METADATA_VERSION << "\n";
+      out << "mode = focal-extreme-leave-one-out\n";
+      out << "runIdentity = " << extremeCohortSettings.runIdentity << "\n";
+      out << "configIdentity = " << extremeCohortSettings.configIdentity << "\n";
+      out << "cohortGroupSize = " << extremeCohortSettings.groupSize << "\n";
+      out << "focalColor = " << PlayerIO::playerToStringShort(extremeCohortSettings.focalPla) << "\n";
+      out << "focalModelIdentity = " << modelName << "\n";
+      out << "opponentModelIdentity = " << frozenOpponentModelName << "\n";
+      out << "modelFile = " << modelFile << "\n";
+      out << "opponentModelFile = " << frozenOpponentModelFile << "\n";
+      out << "selfplayConfigFile = " << selfplayConfigFile << "\n";
+      out << "cohortIdScope = runIdentity\n";
+      out << "cohortIdStart = " << extremeCohortSettings.cohortIdStart() << "\n";
+      out << "assignmentOrder = launch-order-per-model-generation\n";
+      out << "scorePerspective = focal-color-final-margin\n";
+      out << "credit = N1:1;Ngt1:max(0,S_i-max_other_S)\n";
+      out << "singletonMaxOther = 0\n";
+      out << "incompleteCohortPolicy = drop\n";
+      out << "globalTargetsChannels = 68-79\n";
       out.close();
     }
 
@@ -252,7 +382,10 @@ int MainCmds::selfplay(const vector<string>& args) {
     &forkData,
     maxGamesTotal,
     &baseParams,
-    &gameSeedBase
+    &gameSeedBase,
+    &extremeCohortSettings,
+    &frozenOpponentNNEval,
+    &frozenOpponentModelName
   ](int threadIdx) {
     auto shouldStopFunc = []() noexcept {
       return shouldStop.load();
@@ -289,16 +422,47 @@ int MainCmds::selfplay(const vector<string>& args) {
       };
 
       FinishedGameData* gameData = NULL;
+      bool hasDataWriteReservation = false;
+      if(extremeCohortSettings.isEnabled()) {
+        hasDataWriteReservation =
+          manager->waitForDataToWriteCapacity(nnEval,shouldStopFunc);
+        if(!hasDataWriteReservation) {
+          manager->release(nnEval);
+          break;
+        }
+      }
 
       int64_t gameIdx = numGamesStarted.fetch_add(1,std::memory_order_acq_rel);
       if(gameIdx < maxGamesTotal) {
-        manager->countOneGameStarted(nnEval);
-        MatchPairer::BotSpec botSpecB;
-        botSpecB.botIdx = 0;
-        botSpecB.botName = nnEval->getModelName();
-        botSpecB.nnEval = nnEval;
-        botSpecB.baseParams = baseParams;
-        MatchPairer::BotSpec botSpecW = botSpecB;
+        MatchPairer::BotSpec focalBotSpec;
+        focalBotSpec.botIdx = 0;
+        focalBotSpec.botName = nnEval->getModelName();
+        focalBotSpec.nnEval = nnEval;
+        focalBotSpec.baseParams = baseParams;
+        MatchPairer::BotSpec botSpecB = focalBotSpec;
+        MatchPairer::BotSpec botSpecW = focalBotSpec;
+
+        if(extremeCohortSettings.isEnabled()) {
+          testAssert(frozenOpponentNNEval != NULL);
+          MatchPairer::BotSpec opponentBotSpec;
+          opponentBotSpec.botIdx = 1;
+          opponentBotSpec.botName = frozenOpponentModelName;
+          opponentBotSpec.nnEval = frozenOpponentNNEval;
+          opponentBotSpec.baseParams = baseParams;
+          if(extremeCohortSettings.focalPla == P_BLACK)
+            botSpecW = opponentBotSpec;
+          else
+            botSpecB = opponentBotSpec;
+        }
+
+        ExtremeCohortData extremeCohortAssignment;
+        if(extremeCohortSettings.isEnabled()) {
+          extremeCohortAssignment =
+            manager->countOneGameStartedAndGetCohort(nnEval,frozenOpponentModelName);
+        }
+        else {
+          manager->countOneGameStarted(nnEval);
+        }
 
         string seed = gameSeedBase + ":" + Global::uint64ToHexString(thisLoopSeedRand.nextUInt64());
         gameData = gameRunner->runGame(
@@ -309,14 +473,20 @@ int MainCmds::selfplay(const vector<string>& args) {
           nullptr,
           nullptr
         );
+        if(gameData != NULL && extremeCohortSettings.isEnabled())
+          gameData->extremeCohort = extremeCohortAssignment;
       }
 
       //NULL gamedata will happen when the game is interrupted by shouldStop, which means we should also stop.
       //Or when we run out of total games.
       bool shouldContinue = gameData != NULL;
       //Note that if we've gotten a newNNEval, we're actually pushing the game as data for the new one, rather than the old one!
-      if(gameData != NULL)
+      if(gameData != NULL) {
         manager->enqueueDataToWrite(nnEval,gameData);
+        hasDataWriteReservation = false;
+      }
+      if(hasDataWriteReservation)
+        manager->cancelDataToWriteReservation(nnEval);
 
       manager->release(nnEval);
 
@@ -383,6 +553,8 @@ int MainCmds::selfplay(const vector<string>& args) {
 
   //At this point, nothing else except possibly data write loops are running, within the selfplay manager.
   delete manager;
+  if(frozenOpponentNNEval != NULL)
+    delete frozenOpponentNNEval;
 
   //Overall self-play totals (per-model NN/data/moves breakdowns are logged above by the manager).
   logger.write("Total games: " + Global::int64ToString(numGamesStarted.load(std::memory_order_relaxed)));
